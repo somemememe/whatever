@@ -1,0 +1,71 @@
+# Audit Report
+
+**Total findings:** 3
+
+## High (3)
+
+### F-005: Underlying bridge-out flows use the requested amount instead of the amount actually received
+
+**Confidence:** high | **Locations:** `0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:256, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:257, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:258, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:274, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:275, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:276, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:290, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:291, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:292, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:379, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:380, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:381, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:400, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:401, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:402, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:428, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:429, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:430, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:473, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:474, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:475, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:494, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:495, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:496, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:522, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:523, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:524`
+
+All `Underlying` bridge and trade entrypoints transfer a nominal `amount` of the underlying into the anyToken contract and then immediately call `depositVault(amount, ...)` and burn/bridge the same nominal amount, without measuring how many units actually arrived. Fee-on-transfer, rebasing, or otherwise non-standard underlyings can therefore leave the vault underfunded while the router still bridges the full amount.
+
+**Impact:** Users can be credited on the destination chain for more value than was actually locked on the source chain, creating undercollateralized wrapped supply and eventual redemption shortfalls. The inverse user-facing effect is also possible: users may pay transfer fees on the source chain but still have the full nominal amount burned/bridged, overcharging them and pushing losses onto vault backing.
+
+**Paths:**
+
+- `anySwapOutUnderlying` transfers `amount`, then calls `depositVault(amount)` and `_anySwapOut(..., amount, ...)`
+
+- `anySwapOutUnderlyingWithPermit` and `anySwapOutUnderlyingWithTransferPermit` repeat the same nominal-amount accounting
+
+- `anySwapOutExactTokensForTokensUnderlying*` transfer underlying to `path[0]`, then deposit and burn the full `amountIn`
+
+- `anySwapOutExactTokensForNativeUnderlying*` transfer underlying to `path[0]`, then deposit and burn the full `amountIn`
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-004: Router ignores token and vault return values, so bridge events can be emitted after failed accounting
+
+**Confidence:** medium | **Locations:** `0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:245, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:257, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:275, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:291, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:303, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:316, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:325, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:332, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:333, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:366, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:380, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:381, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:402, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:430, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:460, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:475, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:496, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:524`
+
+The router calls external token methods that explicitly return status values or actual processed amounts (`mint`, `burn`, `depositVault`, `withdrawVault`) but never validates those return values. If a supported token reports failure or partial processing without reverting, the router still emits canonical bridge/trade events and continues execution as though the accounting step succeeded.
+
+**Impact:** A failed or short `burn`/`depositVault` on the source side can still emit `LogAnySwapOut` or trade events, enabling destination-side minting or swap settlement without full collateral being locked. Likewise, failed or partial `mint`/`withdrawVault` on the destination side can leave bridge state inconsistent, create silent insolvency, or strand users with incorrect assets.
+
+**Paths:**
+
+- `_anySwapOut` ignores the `burn` result before emitting `LogAnySwapOut`
+
+- `_anySwapIn` ignores the `mint` result before emitting `LogAnySwapIn`
+
+- All `Underlying` bridge-out functions ignore the `depositVault` return value
+
+- `anySwapInUnderlying`, `anySwapInAuto`, and `anySwapFeeTo` ignore `withdrawVault` return values
+
+- Trade entrypoints ignore `burn`/`depositVault` results before emitting bridge-trade events
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-006: Router has no on-chain allowlist for bridge assets, so arbitrary token contracts can generate canonical bridge logs
+
+**Confidence:** low | **Locations:** `0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:250, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:255, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:358, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:371, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:452, 0x6b7a87899490ece95443e979ca9485cbe7e71522/Contract.sol:465`
+
+The router accepts arbitrary `token` and `path[0]` addresses and never verifies that they belong to an approved bridge asset set. Any contract that exposes the loose `AnyswapV1ERC20` shape can therefore be used to drive `anySwapOut*` and trade-out events that look indistinguishable from legitimate bridge activity at the router level.
+
+**Impact:** If the off-chain relayer/MPC pipeline keys off router events without an independent token allowlist, an attacker can use a fake anyToken whose `burn`/`depositVault` semantics are non-binding to trigger destination-side minting or swaps backed by no real collateral. That can drain destination vaults or AMM liquidity.
+
+**Paths:**
+
+- Call `anySwapOut` with an attacker-controlled token contract implementing `burn`
+
+- Call `anySwapOutUnderlying` with a fake token whose `underlying`/`depositVault` logic is non-binding
+
+- Use trade-out entrypoints with `path[0]` set to a fake token so the router emits normal bridge-trade events
+
+*Round 1 | Agents: codex_1*
+
+---

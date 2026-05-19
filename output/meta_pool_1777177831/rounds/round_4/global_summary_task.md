@@ -1,0 +1,71 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- OpenZeppelin upgradeability stack: `ERC1967Upgrade`, `ERC1967Proxy`, `TransparentUpgradeableProxy`, `BeaconProxy`, `UpgradeableBeacon`, `Proxy`, `ProxyAdmin` — core focus remains upgrade execution, admin/fallback dispatch, beacon control, and delegatecall reachability
+- Supporting utilities/interfaces: `Address`, `StorageSlot`, `Ownable`, `IERC1967`, `IERC1822`, `IBeacon`, `Context` — mainly background context for slot correctness, ownership/admin invariants, and low-level call semantics rather than primary issue sources
+- Deployment/setup paths: payable proxy constructors and optional initializer payloads — repeatedly relevant to skipped initialization delegatecalls and possible deployment-time stranded ETH
+
+## Issue Directions Seen
+- Upgrade and initialization sequencing across ERC-1967 / transparent / beacon flows remains the dominant audit direction, especially where setup delegatecalls can shift authority or state assumptions
+- Transparent proxy admin vs non-admin dispatch is the clearest recurring hotspot: admin gating at the proxy layer does not by itself remove implementation-defined upgrade reachability for non-admin callers
+- ERC-1967 slot integrity and control invariants remain a steady review axis, covering implementation/admin/beacon slot handling and the ownership surface around `ProxyAdmin` and beacons
+- Beacon-based upgrade paths remain a monitored but so-far unretained direction, centered on implementation resolution, validation, and execution ordering during proxy calls
+- Payable deployment behavior remains a concrete concern: proxies can accept constructor ETH while empty initializer data skips setup, potentially leaving funds stranded
+- Broader selector-clash, delegatecall edge-case, and governance ownership-transition concerns remain background review directions, but have not matured into durable retained issues
+
+## Useful Context
+- Cross-round attention is still concentrated on upstream OpenZeppelin proxy mechanics rather than protocol-specific business logic
+- `TransparentUpgradeableProxy.sol` and `ERC1967Upgrade.sol` have drawn the most repeated scrutiny, with `BeaconProxy.sol`, `ERC1967Proxy.sol`, and `Proxy.sol` as the main follow-up surfaces
+- Support files such as `StorageSlot`, `IERC1967`, `IERC1822`, `IBeacon`, and `Context` consistently act as secondary context for core proxy-path analysis
+- Recent review continued to probe proxy dispatch, slot handling, beacon validation, and delegatecall flow without adding retained findings, reinforcing these as investigated-but-still-central audit surfaces
+- No meaningful cross-agent divergence is visible so far; the audit memory reflects a single consistent review thread centered on upgradeability plumbing and deployment-time fund handling
+
+
+## Latest Round Summary
+# Round 4 Summary
+
+## Agent: codex
+- files touched: `@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol`, `@openzeppelin/contracts/proxy/ERC1967/ERC1967Upgrade.sol`, `@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol`, `@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol`, `@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol`, `@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol`, `@openzeppelin/contracts/proxy/Proxy.sol`, `@openzeppelin/contracts/utils/Address.sol`, `@openzeppelin/contracts/utils/StorageSlot.sol`, `@openzeppelin/contracts/access/Ownable.sol`, `@openzeppelin/contracts/interfaces/IERC1967.sol`, `@openzeppelin/contracts/interfaces/draft-IERC1822.sol`, `@openzeppelin/contracts/proxy/beacon/IBeacon.sol`, `@openzeppelin/contracts/utils/Context.sol`
+- files revisited / highest-attention files: `TransparentUpgradeableProxy.sol`, `ERC1967Upgrade.sol`, `BeaconProxy.sol`, `UpgradeableBeacon.sol`, `ProxyAdmin.sol`, `Proxy.sol`, `ERC1967Proxy.sol`, `Address.sol`
+- main issue directions investigated: transparent proxy admin flow, ERC1967 upgrade helpers, delegatecall entrypoints, beacon upgrade/ownership paths, and proxy/beacon dispatch behavior; the log also shows explicit checks around payable admin behavior and upgrade hooks
+- promising but not retained directions: beacon ownership edge cases, transparent/UUPS-style upgrade interaction, payable admin function behavior, and delegatecall-triggered upgrade paths; the round concluded with no retained findings
+
+## Cross-Agent Status
+- main overlap in file/area attention: only one agent participated; attention concentrated on the OpenZeppelin proxy stack and related upgrade utilities
+- notable differences in attention: none across agents in this round; within the single log, attention was much heavier on proxy/upgrade contracts than on interfaces and small utilities
+- underexplored but suspicious files/functions if clearly supported by the logs: lighter-attention files included `IERC1967.sol`, `draft-IERC1822.sol`, `IBeacon.sol`, `Context.sol`, and parts of `StorageSlot.sol`; no specific underexplored hotspot was elevated into a retained issue by the round log
+
+## Retained Findings
+- None retained from this round after merge.
+
+
+Output only markdown.

@@ -1,0 +1,75 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `Staking.sol` — persistent hotspot; repeated focus on `deposit`, `withdraw`, `emergencyWithdraw`, `getInterest`, `manualEpochInit`, epoch/history helpers, pool-size reads, and Compound mint/redeem plus liquidity-sweep paths
+- Compound-facing stablecoin plumbing inside `Staking.sol` — recurring attention on cToken interactions, redeem/mint result handling, approval behavior, fixed token/cToken assumptions, and how redeemed stablecoin is classified as principal vs interest
+- epoch snapshot / lazy-init state inside `Staking.sol` — increasingly central surface; epoch-0 baselines, backfilled snapshots, and historical pool-size propagation are now a primary concern
+- embedded `SafeERC20.sol` / transfer helpers and token interfaces — lightly revisited for return-value / non-standard ERC-20 semantics that can amplify staking accounting or payout inconsistencies
+- referral/reward helpers (`processReferrals`, percentage-update state) — seen as adjacent surface but still secondary and comparatively underexplored versus withdrawal/liquidity logic
+- `Contract.sol` — mainly serves as the wrapper/container for the embedded staking system; useful for navigation more than as an independent logic surface
+
+## Issue Directions Seen
+- Token/accounting mismatch paths: internal stake or claim accounting can diverge from assets actually moved, especially with non-standard ERC-20 behavior, approval quirks, external integration failures, or balance-based accounting
+- Emergency/withdraw liveness fragility: exit flows remain sensitive to liquidity shortfalls, incomplete accounting cleanup, and epoch state that is stale, skipped, or backfilled
+- Epoch progression and snapshot integrity: historical pool-size views remain exposed to mutable or stale state, with epoch-0 initialization now specifically standing out as a forged-baseline risk that can propagate forward
+- Compound integration safety: weak coupling between staking bookkeeping and `mint` / `redeem` success, redeemable liquidity, or fixed address assumptions can propagate into withdrawal availability
+- Interest-sweep classification risk: publicly callable or loosely scoped interest-handling paths may transfer stablecoin based on raw balance deltas, including assets not actually produced as Compound yield
+- Non-stable pool valuation/snapshot risk: some accounting paths appear to trust raw balance views over tracked stake totals, leaving room for pool-size divergence
+
+## Useful Context
+- Audit attention stays concentrated on one effective contract surface, with the dominant theme being bookkeeping consistency under imperfect asset movement, mutable epoch state, and external liquidity constraints rather than classic privilege misuse
+- The same accounting surfaces recur across normal withdrawals, emergency exits, manual epoch initialization, historical snapshot reads, and interest handling, showing tight coupling between liveness and accounting correctness
+- Historical/epoch helpers are part of the practical attack surface because present-state mutations can influence both past-epoch reads and later lazy initialization behavior
+- A durable pattern is reliance on contract balance views to infer economic meaning; this affects both pool snapshots and interest sweeping, and creates room for misclassification of funds already held by the contract
+- Helper/library code has received only light review; durable risk continues to come mainly from how staking logic consumes token balances, approval outcomes, Compound availability assumptions, and lazily populated epoch history
+- Referral/reward logic has been inspected but remains a lower-confidence, less-explored branch relative to the much heavier focus on withdrawal, emergency, epoch, and Compound-backed stablecoin flows
+
+
+## Latest Round Summary
+# Round 6 Summary
+
+## Agent: codex
+- files touched: `Contract.sol` (used to inspect the embedded Solidity sources), with review centered on `Staking.sol`; also consulted `rounds/round_5/round_summary.md` and `global_summary.md`
+- files revisited / highest-attention files: `Staking.sol`, especially Compound/interest paths around `_transferToCompound`, `_redeemFromCompound`, `_getCompoundToken`, `checkInterestFromCompound`, `getInterestFromCompound`, and `getInterest`
+- main issue directions investigated: whether Compound-backed balances are classified correctly against tracked stablecoin principal; adjacent non-duplicate bugs around stablecoin/cToken handling and interest sweeps
+- promising but not retained directions: hardcoded mainnet token/cToken addresses without chain validation was surfaced as a candidate (`F-015`) but was not retained after merge
+
+## Cross-Agent Status
+- main overlap in file/area attention: only `codex` appears in this round’s logs, with attention concentrated on `Staking.sol` interest accounting and Compound integration
+- notable differences in attention: none visible from the logs because only one agent is recorded
+- underexplored but suspicious files/functions if clearly supported by the logs: supporting token/Compound wrapper files remained secondary while review stayed focused on the staking contract’s interest-handling flows
+
+## Retained Findings
+- retained finding `F-014`: direct transfers of `cUSDC`/`cUSDT`/`cDAI` into the staking contract can be misread as protocol yield, letting permissionless interest-sweep functions redeem and forward that value to `TEAM_ADDRESS`
+
+
+Output only markdown.

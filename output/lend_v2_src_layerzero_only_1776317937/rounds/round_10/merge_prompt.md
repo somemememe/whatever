@@ -1,0 +1,840 @@
+Below are findings and vulnerability signals from 2 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "First-time same-chain borrow bypasses collateral check",
+    "locations": [
+      "LayerZero/CoreRouter.sol:152",
+      "LayerZero/CoreRouter.sol:157",
+      "LayerZero/CoreRouter.sol:161",
+      "LayerZero/CoreRouter.sol:167"
+    ],
+    "claim": "`CoreRouter.borrow` computes `borrowAmount` as `0` when `currentBorrow.borrowIndex == 0`, then checks `collateral >= borrowAmount`. For first-time borrowers this always passes, yet the function still executes a real borrow and transfers underlying.",
+    "impact": "Any account can open an initial borrow without sufficient collateral, creating immediate bad debt and enabling pool drain up to available liquidity.",
+    "paths": [
+      "CoreRouter.borrow -> getBorrowBalance.borrowIndex == 0 -> borrowAmount = 0 -> collateral check trivially passes -> LErc20.borrow(_amount) -> underlying transferred to borrower"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Cross-chain borrow trusts stale source collateral snapshot (TOCTOU)",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:138",
+      "LayerZero/CrossChainRouter.sol:143",
+      "LayerZero/CrossChainRouter.sol:617",
+      "LayerZero/CrossChainRouter.sol:622"
+    ],
+    "claim": "`borrowCrossChain` sends a one-time collateral snapshot (`payload.collateral`) from source chain, and destination execution validates only against this stale value instead of current source-chain collateral at execution time.",
+    "impact": "A borrower can initiate a cross-chain borrow, then reduce/remove collateral on the source chain before message execution, resulting in undercollateralized remote debt and protocol insolvency risk.",
+    "paths": [
+      "Chain A: borrowCrossChain captures collateral and sends message",
+      "Before destination execution: borrower redeems/withdraws source collateral",
+      "Chain B: _handleBorrowCrossChainRequest checks stale payload.collateral and executes borrow"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Cross-chain debt is excluded from accounting due impossible EID condition",
+    "locations": [
+      "LayerZero/LendStorage.sol:495",
+      "LayerZero/LendStorage.sol:497",
+      "LayerZero/LendStorage.sol:499",
+      "LayerZero/CrossChainRouter.sol:617",
+      "LayerZero/CrossChainRouter.sol:227"
+    ],
+    "claim": "`LendStorage.borrowWithInterest` only counts `crossChainCollaterals` entries when both `destEid == currentEid` and `srcEid == currentEid`. Real cross-chain entries on destination chain have `srcEid != currentEid`, so they are skipped.",
+    "impact": "Borrow checks underestimate existing cross-chain debt (enabling repeated over-borrow), and cross-chain liquidation max-repay can collapse to zero, effectively preventing liquidation.",
+    "paths": [
+      "_handleBorrowCrossChainRequest -> getHypotheticalAccountLiquidityCollateral -> borrowWithInterest excludes existing cross-chain collateral debt -> new borrow allowed against understated debt",
+      "liquidateCrossChain -> getMaxLiquidationRepayAmount(false) -> borrowWithInterest returns 0 -> repayAmount check fails for real liquidations"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Source-chain cross-chain debt update drops accrued interest when refreshing borrow index",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:710",
+      "LayerZero/CrossChainRouter.sol:711",
+      "LayerZero/CrossChainRouter.sol:712"
+    ],
+    "claim": "When an existing cross-chain borrow is updated in `_handleValidBorrowRequest`, principal is set to `oldPrinciple + payload.amount` and borrowIndex is overwritten with a newer index, without first normalizing old principal to the new index.",
+    "impact": "Repeated borrows can under-account true debt versus accrued debt, weakening solvency checks and reducing liquidation effectiveness.",
+    "paths": [
+      "Existing crossChainBorrows record at old borrowIndex",
+      "New ValidBorrowRequest arrives with higher payload.borrowIndex",
+      "Contract writes principle += amount and borrowIndex = payload.borrowIndex without accruing old principal"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Public cross-chain operations are protocol-fee sponsored, enabling native fee griefing",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:113",
+      "LayerZero/CrossChainRouter.sol:156",
+      "LayerZero/CrossChainRouter.sol:172",
+      "LayerZero/CrossChainRouter.sol:794",
+      "LayerZero/CrossChainRouter.sol:820"
+    ],
+    "claim": "User-callable cross-chain functions trigger `_send`, which uses contract-native funds for LayerZero messaging (`_payNative` uses router balance and `_lzSend` is funded from contract balance) instead of caller-paid fees.",
+    "impact": "Attackers can spam cross-chain calls to burn router native balance and deny service for legitimate cross-chain operations until re-funded.",
+    "paths": [
+      "Attacker repeatedly calls borrowCrossChain / repayCrossChainBorrow / liquidateCrossChain",
+      "Each call sends LayerZero message funded by router-native balance",
+      "Router native reserve is depleted and later messages fail"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-006",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Cross-chain liquidation finalization uses inconsistent token identity and impossible lookup parameters",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:355",
+      "LayerZero/CrossChainRouter.sol:361",
+      "LayerZero/CrossChainRouter.sol:445",
+      "LayerZero/CrossChainRouter.sol:448",
+      "LayerZero/CrossChainRouter.sol:452",
+      "LayerZero/CrossChainRouter.sol:479"
+    ],
+    "claim": "`LiquidationSuccess/Failure` messages reuse `payload.destlToken` from the collateral chain, but receiving handlers treat it as a local token (`lTokenToUnderlying(payload.destlToken)`), and success lookup also hardcodes `destEid` to `0`. This causes mismatched lookups/reverts.",
+    "impact": "Cross-chain liquidation completion can fail deterministically, leaving cross-chain liquidation flow broken and creating unresolved debt/collateral state transitions or stuck message retries.",
+    "paths": [
+      "_handleLiquidationExecute sends LiquidationSuccess/LiquidationFailure with chain-A collateral lToken id",
+      "Receiver (_handleLiquidationSuccess/_handleLiquidationFailure) resolves local mappings using that id and/or destEid=0 lookup",
+      "findCrossChainCollateral/underlying resolution fails -> revert in finalization path"
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-007",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Cross-chain liquidation seizes collateral before repayment is enforced",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:312",
+      "LayerZero/CrossChainRouter.sol:330",
+      "LayerZero/CrossChainRouter.sol:355",
+      "LayerZero/CrossChainRouter.sol:443",
+      "LayerZero/CrossChainRouter.sol:464",
+      "LayerZero/CoreRouter.sol:483"
+    ],
+    "claim": "`_handleLiquidationExecute` transfers collateral value from borrower to liquidator/protocol on the collateral chain before destination-chain repayment is collected. Repayment is only attempted later in `_handleLiquidationSuccess`, so failure there does not roll back the prior seize.",
+    "impact": "A liquidator can end up with seized collateral while debt repayment is not completed, causing borrower loss and protocol bad debt/state inconsistency.",
+    "paths": [
+      "Chain B: liquidateCrossChain sends CrossChainLiquidationExecute",
+      "Chain A: _handleLiquidationExecute immediately updates borrower/liquidator balances and sends LiquidationSuccess",
+      "Chain B: _handleLiquidationSuccess -> repayCrossChainBorrowInternal -> CoreRouter.repayCrossChainLiquidation may revert (e.g., missing allowance/balance)",
+      "Seizure already happened on chain A and remains while repayment is unfulfilled"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-008",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Supply accounting over-credits deposits using pre-mint exchange rate",
+    "locations": [
+      "LayerZero/CoreRouter.sol:74",
+      "LayerZero/CoreRouter.sol:77",
+      "LayerZero/CoreRouter.sol:80",
+      "LayerZero/CoreRouter.sol:87"
+    ],
+    "claim": "`supply` computes credited lTokens from `exchangeRateStored()` before calling `mint()`. Since `mint()` can accrue interest and mint at a higher exchange rate, internal `mintTokens` credit can exceed actual lTokens received.",
+    "impact": "Users can be credited with more internal investment than the protocol actually minted, enabling value extraction at others’ expense and potential insolvency.",
+    "paths": [
+      "supply -> read exchangeRateStored (stale) -> mint accrues interest/updates rate -> actual minted lTokens < internal mintTokens -> inflated totalInvestment"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-009",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Same-chain liquidation shortfall check re-applies index growth to already-accrued borrow value",
+    "locations": [
+      "LayerZero/CoreRouter.sol:238",
+      "LayerZero/CoreRouter.sol:347",
+      "LayerZero/CoreRouter.sol:350"
+    ],
+    "claim": "`liquidateBorrow` passes `borrowed` from `getHypotheticalAccountLiquidityCollateral`, which already includes accrued borrow effects; `liquidateBorrowAllowedInternal` multiplies by `currentBorrowIndex / storedBorrowIndex` again, overstating debt in the shortfall test.",
+    "impact": "Accounts can be treated as undercollateralized earlier than intended, enabling premature/unfair liquidation.",
+    "paths": [
+      "liquidateBorrow -> getHypotheticalAccountLiquidityCollateral returns borrowed/collateral",
+      "liquidateBorrowAllowedInternal computes borrowedAmount = borrowed * currentIndex / borrowBalance.borrowIndex",
+      "borrowedAmount becomes inflated -> `borrowedAmount > collateral` may pass for positions that should not be liquidatable"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-010",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Cross-chain borrow aggregation can hard-revert when both direction records coexist",
+    "locations": [
+      "LayerZero/LendStorage.sol:83",
+      "LayerZero/LendStorage.sol:84",
+      "LayerZero/LendStorage.sol:485",
+      "LayerZero/CrossChainRouter.sol:641",
+      "LayerZero/CrossChainRouter.sol:718"
+    ],
+    "claim": "`borrowWithInterest` reverts if both `crossChainBorrows` and `crossChainCollaterals` are non-empty for a user/token. Opposite-direction cross-chain borrowing for the same underlying can populate both arrays on one chain, violating this assumption.",
+    "impact": "Borrow/liquidity/liquidation/repay flows that depend on borrow aggregation can revert, creating permissionless DoS and potentially locking user positions.",
+    "paths": [
+      "Direction A->B borrow creates `crossChainBorrows` on chain A for token X",
+      "Direction B->A borrow creates `crossChainCollaterals` on chain A for token X",
+      "Any call path invoking borrowWithInterest for that user/token reverts with invariant violation"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-011",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Unchecked ERC20 `transfer` can update protocol state without actual token payout",
+    "locations": [
+      "LayerZero/CoreRouter.sol:124",
+      "LayerZero/CoreRouter.sol:170",
+      "LayerZero/CoreRouter.sol:204"
+    ],
+    "claim": "Payout paths use raw `IERC20.transfer` and ignore its boolean return value. For non-standard ERC20s that return `false` instead of reverting, execution continues and state changes persist despite failed transfer.",
+    "impact": "Users can be debited/indebted without receiving tokens, and protocol accounting can diverge from real token balances.",
+    "paths": [
+      "redeem/borrow/borrowForCrossChain performs stateful actions and calls raw transfer",
+      "token returns false (no revert)",
+      "function continues, leaving accounting changed but payout not delivered"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-012",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Cross-chain repay lookup is ambiguous and keyed only by srcEid",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:397",
+      "LayerZero/CrossChainRouter.sol:406",
+      "LayerZero/CrossChainRouter.sol:539"
+    ],
+    "claim": "`_getBorrowDetails` selects a collateral position using only `srcEid` within `crossChainCollaterals[borrower][underlying]`. If multiple positions share the same source chain but differ by other identifiers (e.g., source token), repayment can update the wrong position.",
+    "impact": "Repayments can be misattributed, corrupting debt records and impairing liquidation/accounting correctness.",
+    "paths": [
+      "Borrower has multiple cross-chain collateral records for same borrowed underlying with identical srcEid",
+      "repayCrossChainBorrow -> _getBorrowDetails picks first srcEid match",
+      "_updateRepaymentState and DestRepay message mutate/propagate wrong position data"
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-013",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Cross-chain liquidation health check uses seize amount as synthetic new borrow",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:273",
+      "LayerZero/CrossChainRouter.sol:276",
+      "LayerZero/CrossChainRouter.sol:431",
+      "LayerZero/CrossChainRouter.sol:433"
+    ],
+    "claim": "When validating liquidation on the collateral chain, `_checkLiquidationValid` calls `getHypotheticalAccountLiquidityCollateral` with `borrowAmount = payload.amount`, but `payload.amount` is seizeTokens (collateral quantity), not pending debt. This distorts shortfall evaluation.",
+    "impact": "Liquidation eligibility can be misclassified, enabling liquidation of positions that are not actually underwater or causing inconsistent liquidation behavior.",
+    "paths": [
+      "Chain B computes seizeTokens and sends CrossChainLiquidationExecute with payload.amount = seizeTokens",
+      "Chain A _checkLiquidationValid treats payload.amount as hypothetical additional borrow",
+      "Borrowed-vs-collateral comparison is based on a wrong variable and can return true for otherwise healthy accounts"
+    ],
+    "round": 2,
+    "source_agents": [
+      "merge_layer",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-014",
+    "severity": "High",
+    "confidence": "high",
+    "title": "LEND rewards can be claimed repeatedly because accrued balances are never decremented",
+    "locations": [
+      "LayerZero/CoreRouter.sol:399",
+      "LayerZero/CoreRouter.sol:402",
+      "LayerZero/CoreRouter.sol:416",
+      "LayerZero/LendStorage.sol:76"
+    ],
+    "claim": "`claimLend` reads `lendStorage.lendAccrued(holder)` and transfers that amount via `grantLendInternal`, but never writes back a reduced accrued value. The same accrued balance remains claimable on repeated calls.",
+    "impact": "Any account with non-zero accrued rewards can repeatedly claim and drain LEND held by the router, including rewards attributable to other users.",
+    "paths": [
+      "User accrues positive `lendAccrued` once",
+      "User calls `claimLend` and receives full accrued amount",
+      "`lendAccrued[user]` is unchanged",
+      "User repeats claims until router LEND balance is exhausted"
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-015",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Liquidity checks accept zero oracle prices, creating fail-open borrow authorization",
+    "locations": [
+      "LayerZero/LendStorage.sol:431",
+      "LayerZero/LendStorage.sol:445",
+      "LayerZero/LendStorage.sol:460",
+      "LayerZero/CoreRouter.sol:152",
+      "LayerZero/CrossChainRouter.sol:617"
+    ],
+    "claim": "`getHypotheticalAccountLiquidityCollateral` uses oracle prices without validating `price > 0`. If a market price returns `0`, borrow-side effects for that asset become `0`, and collateral checks can pass despite real economic risk.",
+    "impact": "During oracle outages/misconfiguration returning zero, users can borrow assets with effectively no borrow value added in checks, potentially extracting pool liquidity and creating bad debt.",
+    "paths": [
+      "Oracle returns 0 price for borrow market",
+      "User calls same-chain or cross-chain borrow",
+      "Borrow value contribution is computed as zero in liquidity check",
+      "Borrow proceeds while true collateralization is insufficient"
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-016",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Borrow/redeem update accounting after external calls, leaving reentrancy window for callback-capable tokens",
+    "locations": [
+      "LayerZero/CoreRouter.sol:121",
+      "LayerZero/CoreRouter.sol:124",
+      "LayerZero/CoreRouter.sol:127",
+      "LayerZero/CoreRouter.sol:167",
+      "LayerZero/CoreRouter.sol:170",
+      "LayerZero/CoreRouter.sol:179"
+    ],
+    "claim": "`redeem` and `borrow` perform external protocol/token calls before updating internal accounting (`totalInvestment`, `borrowBalance`), and no reentrancy guard exists. Callback-capable listed tokens can reenter while state is stale.",
+    "impact": "If a callback-capable market token is listed, an attacker contract may chain nested operations against stale balances to over-redeem/over-borrow relative to intended single-call limits.",
+    "paths": [
+      "Attacker triggers `borrow` or `redeem` via contract",
+      "External token/protocol call executes before accounting update",
+      "Callback reenters router and passes checks using stale state",
+      "Nested operations extract excess value"
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-017",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Cross-chain repay path incorrectly mutates same-chain borrow storage",
+    "locations": [
+      "LayerZero/CoreRouter.sol:472",
+      "LayerZero/CoreRouter.sol:475",
+      "LayerZero/CoreRouter.sol:492",
+      "LayerZero/CoreRouter.sol:497",
+      "LayerZero/CrossChainRouter.sol:425"
+    ],
+    "claim": "Cross-chain repay flows call `CoreRouter.repayBorrowInternal(..., _isSameChain=false)`, but the function always writes to same-chain `borrowBalance` (`removeBorrowBalance`/`updateBorrowBalance`) after repayment. This mixes cross-chain repayment results into same-chain debt storage.",
+    "impact": "Debt accounting becomes inconsistent: liabilities can be double-counted (same-chain + cross-chain) causing false shortfall/DoS/unfair liquidation, and full cross-chain repay can erase same-chain borrow records for the same market if present.",
+    "paths": [
+      "repayCrossChainBorrowInternal -> _handleRepayment -> CoreRouter.repayCrossChainLiquidation",
+      "CoreRouter.repayBorrowInternal computes borrowedAmount from cross-chain path (`borrowWithInterest`)",
+      "function still updates/removes `borrowBalance[borrower][_lToken]` (same-chain slot)",
+      "Cross-chain state is also updated in `_updateRepaymentState`, creating divergent or duplicated debt state"
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-018",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Cross-chain liquidation uses seized-collateral quantity as debt repayment amount",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:274",
+      "LayerZero/CrossChainRouter.sol:276",
+      "LayerZero/CrossChainRouter.sol:355",
+      "LayerZero/CrossChainRouter.sol:464",
+      "LayerZero/CrossChainRouter.sol:467"
+    ],
+    "claim": "`_executeLiquidationCore` encodes `payload.amount = seizeTokens` for `CrossChainLiquidationExecute`. The same `payload.amount` is forwarded in `LiquidationSuccess` and later used by `_handleLiquidationSuccess` as the repay amount (`repayCrossChainBorrowInternal(..., payload.amount, ...)`).",
+    "impact": "Debt repayment diverges from intended `repayAmount`: liquidators can seize collateral priced for one value while paying a different debt amount, leaving residual bad debt or extracting value depending on price/exchange-rate relationships.",
+    "paths": [
+      "Chain B: liquidateCrossChain(repayAmount)",
+      "_executeLiquidationCore computes `seizeTokens` and sends as payload.amount",
+      "Chain A seizes collateral and returns LiquidationSuccess with same payload.amount",
+      "Chain B `_handleLiquidationSuccess` treats payload.amount as debt repay amount"
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-019",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Liquidation-failure refund attempts token payout without prior escrow",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:172",
+      "LayerZero/CrossChainRouter.sol:274",
+      "LayerZero/CrossChainRouter.sol:491",
+      "LayerZero/CrossChainRouter.sol:478",
+      "LayerZero/CrossChainRouter.sol:482"
+    ],
+    "claim": "`liquidateCrossChain` does not escrow repay tokens up front, yet failure handling performs `safeTransfer(payload.amount)` to the liquidator in `_handleLiquidationFailure`. The refund amount originates from computed `seizeTokens`, not deposited funds.",
+    "impact": "If the token lookup resolves and router holds balance, attackers can trigger failing liquidations and drain router-held tokens without having prepaid; otherwise this contributes to stuck/failing failure-handling messages.",
+    "paths": [
+      "Attacker calls `liquidateCrossChain` (no token transfer from liquidator)",
+      "Cross-chain execution reaches failure branch and sends `LiquidationFailure`",
+      "Destination `_handleLiquidationFailure` transfers `payload.amount` to liquidator from router balance"
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-020",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Borrowed-asset tracking can be cleared while debt still exists, hiding liabilities from liquidity checks",
+    "locations": [
+      "LayerZero/CoreRouter.sol:495",
+      "LayerZero/CrossChainRouter.sol:521",
+      "LayerZero/CrossChainRouter.sol:560",
+      "LayerZero/LendStorage.sol:395",
+      "LayerZero/LendStorage.sol:421"
+    ],
+    "claim": "Repayment paths remove `userBorrowedAssets` membership for an lToken based on a single ledger becoming empty, without verifying all debt ledgers for that asset are zero. Since liquidity checks iterate only `userBorrowedAssets`, remaining same-chain or cross-chain debt can be omitted from borrow/withdraw risk checks.",
+    "impact": "A borrower can retain real debt that is no longer counted in `getHypotheticalAccountLiquidityCollateral`, enabling excess borrowing or redemption and creating bad debt/insolvency risk.",
+    "paths": [
+      "User has same-chain and cross-chain debt for lToken X -> fully repays same-chain debt -> `CoreRouter.repayBorrowInternal` removes borrowed-asset entry -> cross-chain debt for X is skipped in liquidity loop.",
+      "User has same-chain debt and one cross-chain record for lToken X -> full cross-chain repay path (`_updateRepaymentState` or `_handleDestRepayMessage`) removes borrowed-asset entry when that array length is 1 -> same-chain debt remains but is no longer included in liquidity accounting."
+    ],
+    "round": 5,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-021",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Redeem pays users using stale pre-accrual exchange rate, causing systematic underpayment",
+    "locations": [
+      "LayerZero/CoreRouter.sol:115",
+      "LayerZero/CoreRouter.sol:121",
+      "LayerZero/CoreRouter.sol:124"
+    ],
+    "claim": "`redeem()` computes `expectedUnderlying` using `exchangeRateStored()` before calling `LErc20.redeem(_amount)`. `redeem` can accrue interest and realize a higher exchange rate, but the router transfers only the stale lower `expectedUnderlying` amount.",
+    "impact": "Redeemers can be consistently underpaid while surplus underlying remains trapped in router balances, creating direct user fund loss and accounting drift.",
+    "paths": [
+      "User calls `redeem(_amount, _lToken)` after accrual gap",
+      "Router snapshots stale exchange rate and computes `expectedUnderlying`",
+      "`LErc20.redeem` accrues and credits higher underlying to router",
+      "Router transfers only stale amount to user"
+    ],
+    "round": 6,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-022",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Liquidation credits seized collateral without registering liquidator supplied-asset membership",
+    "locations": [
+      "LayerZero/CoreRouter.sol:310",
+      "LayerZero/CoreRouter.sol:313",
+      "LayerZero/CrossChainRouter.sol:337",
+      "LayerZero/CrossChainRouter.sol:340"
+    ],
+    "claim": "Same-chain and cross-chain liquidation paths increase liquidator `totalInvestment` for seized collateral but do not call `addUserSuppliedAsset(liquidator, lTokenCollateral)`. Liquidity logic iterates `userSuppliedAssets`, so these seized positions can be invisible to collateral accounting.",
+    "impact": "Liquidators may be unable to redeem seized collateral or may face distorted liquidity checks unless they had already registered that market, weakening liquidation usability and incentives.",
+    "paths": [
+      "Liquidation seizes collateral and only updates `totalInvestment` for liquidator",
+      "`userSuppliedAssets` is not updated for the seized market",
+      "Subsequent `redeem`/liquidity checks omit seized market collateral for that liquidator"
+    ],
+    "round": 6,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-023",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Cross-chain liquidation can send unexecutable seize amount and revert on collateral-chain execution",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:268",
+      "LayerZero/CrossChainRouter.sol:274",
+      "LayerZero/CrossChainRouter.sol:333"
+    ],
+    "claim": "`_executeLiquidationCore` forwards computed `seizeTokens` without bounding against borrower collateral on source chain. `_handleLiquidationExecute` then subtracts `payload.amount` from borrower `totalInvestment`; if `seizeTokens` exceeds balance, subtraction underflows and reverts.",
+    "impact": "Cross-chain liquidation messages can become revert-only, blocking liquidation completion and creating retry/stuck-message DoS behavior for unhealthy positions.",
+    "paths": [
+      "Liquidator initiates cross-chain liquidation with repay that maps to large `seizeTokens`",
+      "Router sends `CrossChainLiquidationExecute` with `payload.amount = seizeTokens`",
+      "Collateral-chain handler subtracts `payload.amount` from borrower collateral and reverts on underflow"
+    ],
+    "round": 6,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-024",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Unbounded per-user asset-set iteration can gas-DoS risk checks and liquidation paths",
+    "locations": [
+      "LayerZero/LendStorage.sol:170",
+      "LayerZero/LendStorage.sol:180",
+      "LayerZero/LendStorage.sol:394",
+      "LayerZero/LendStorage.sol:421"
+    ],
+    "claim": "`userSuppliedAssets` and `userBorrowedAssets` have no enforced upper bound, while `getHypotheticalAccountLiquidityCollateral` iterates both sets with multiple external calls per item. Large user asset sets can push borrow/redeem/liquidation checks beyond practical gas limits.",
+    "impact": "Highly fragmented positions can become difficult or impossible to process, potentially preventing timely liquidation and increasing bad-debt risk for affected accounts.",
+    "paths": [
+      "User accumulates many supplied/borrowed markets",
+      "Any operation requiring liquidity checks calls `getHypotheticalAccountLiquidityCollateral`",
+      "Looped per-asset pricing/exchange-rate work exceeds gas budget and reverts"
+    ],
+    "round": 6,
+    "source_agents": [
+      "opencode_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-025",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Cross-chain debt accrual uses local-chain borrow index instead of debt-chain index",
+    "locations": [
+      "LayerZero/LendStorage.sol:491",
+      "LayerZero/LendStorage.sol:499",
+      "LayerZero/CrossChainRouter.sol:722"
+    ],
+    "claim": "Cross-chain borrow records persist `borrowIndex` captured from the remote debt market, but `borrowWithInterest` accrues those records with `LTokenInterface(_lToken).borrowIndex()` from the local-chain lToken passed by local accounting loops. For cross-chain borrows this can be a different market/index domain.",
+    "impact": "When the two chains’ borrow indices diverge, cross-chain liabilities are mispriced in risk checks. Under-accrual can allow excess borrowing/redeeming and create bad debt; over-accrual can cause unfair liquidations/DoS.",
+    "paths": [
+      "Source-chain `ValidBorrowRequest` stores `payload.borrowIndex` from destination debt market in `crossChainBorrows`.",
+      "Later, source-chain liquidity checks call `borrowWithInterest(account, localLToken)` via `getHypotheticalAccountLiquidityCollateral`.",
+      "`borrowWithInterest` multiplies by local `borrowIndex()` instead of the debt-chain market index basis of the stored record.",
+      "Computed debt deviates from true remote debt, breaking collateralization decisions."
+    ],
+    "round": 7,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-026",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Liquidation close-factor cap uses stale principal instead of accrued debt",
+    "locations": [
+      "LayerZero/CoreRouter.sol:341",
+      "LayerZero/CoreRouter.sol:353",
+      "LayerZero/CoreRouter.sol:354"
+    ],
+    "claim": "In `liquidateBorrowAllowedInternal`, the maximum repay (`maxClose`) is computed from `borrowBalance.amount` (stored principal snapshot) rather than the borrower’s current accrued debt amount used for solvency evaluation.",
+    "impact": "After interest accrual, liquidation can be artificially capped below intended close-factor of actual debt, slowing deleveraging and increasing residual bad-debt risk for unhealthy accounts.",
+    "paths": [
+      "Borrow accrues interest so real debt grows above stored principal.",
+      "Liquidator calls same-chain liquidation.",
+      "Function computes `maxClose = closeFactor * borrowBalance.amount` (stale principal), not closeFactor times current debt.",
+      "Allowed repay can be materially too low, requiring extra transactions and delaying risk reduction."
+    ],
+    "round": 7,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-027",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Cross-chain borrow compares collateral and debt under different chain-local oracle domains",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:138",
+      "LayerZero/CrossChainRouter.sol:147",
+      "LayerZero/CrossChainRouter.sol:617",
+      "LayerZero/CrossChainRouter.sol:622",
+      "LayerZero/LendStorage.sol:407",
+      "LayerZero/LendStorage.sol:431"
+    ],
+    "claim": "`borrowCrossChain` snapshots `payload.collateral` on source chain using source `priceOracle`, while destination validation computes `totalBorrowed` with destination `priceOracle`. The protocol does not normalize or attest valuation equivalence across chains before enforcing `payload.collateral >= totalBorrowed`.",
+    "impact": "If oracle configurations or freshness diverge between chains, borrowers can pass destination checks while being economically undercollateralized, creating cross-chain bad debt risk.",
+    "paths": [
+      "Source chain computes collateral value with source oracle and sends `payload.collateral`.",
+      "Destination computes borrow-side risk with its own oracle regime in `getHypotheticalAccountLiquidityCollateral`.",
+      "Mismatch in price domain allows `payload.collateral >= totalBorrowed` to pass under inconsistent valuations.",
+      "Borrow executes with weaker-than-intended collateralization."
+    ],
+    "round": 8,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-028",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Shared router borrower account can hit Comptroller market-membership cap via permissionless borrow market selection",
+    "locations": [
+      "LayerZero/CoreRouter.sol:164",
+      "LayerZero/CoreRouter.sol:431",
+      "LayerZero/CrossChainRouter.sol:133",
+      "LayerZero/CrossChainRouter.sol:678"
+    ],
+    "claim": "Borrow paths call `enterMarkets` for the router contract account (shared borrower in underlying markets), not per end-user. Since market membership has a finite cap, permissionless users can force the shared router into many markets and exhaust available membership slots.",
+    "impact": "After cap exhaustion, borrows that require adding a new market membership can fail for everyone, creating protocol-level availability degradation for additional markets.",
+    "paths": [
+      "Attacker performs dust borrows/cross-chain borrow flows across many listed markets.",
+      "Routers repeatedly call `enterMarkets` as the same router address.",
+      "Shared router membership set reaches Comptroller cap.",
+      "Subsequent borrow flows needing new market entry fail globally for that router."
+    ],
+    "round": 8,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  },
+  {
+    "id": "F-029",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Fixed LayerZero receive gas can make valid cross-chain messages unexecutable for large user state",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:405",
+      "LayerZero/CrossChainRouter.sol:544",
+      "LayerZero/CrossChainRouter.sol:581",
+      "LayerZero/CrossChainRouter.sol:818"
+    ],
+    "claim": "`_send` hardcodes `addExecutorLzReceiveOption(1_000_000, 0)` for all message types, while receive handlers include variable-cost loops over per-user arrays (e.g., `_getBorrowDetails`, `_handleBorrowCrossChainRequest`, and repayment handlers). No per-message gas adaptation exists.",
+    "impact": "As user cross-chain position arrays grow, otherwise valid messages can repeatedly run out of gas on destination execution, causing stuck/retry-only operations and cross-chain flow DoS.",
+    "paths": [
+      "User/account accumulates many cross-chain borrow/collateral records.",
+      "Protocol sends message with fixed 1,000,000 gas option.",
+      "Destination handler loop cost exceeds budget and reverts.",
+      "Operational borrow/repay/liquidation flow remains failed until state/gas assumptions change."
+    ],
+    "round": 8,
+    "source_agents": [
+      "codex_1",
+      "merge_layer"
+    ]
+  }
+]
+
+## This Round's Agent Outputs
+### Agent: codex_1
+```
+[
+  {
+    "id": "F-030",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Inbound cross-chain handlers hard-revert on state drift, enabling route-level message DoS",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:418",
+      "LayerZero/CrossChainRouter.sol:457",
+      "LayerZero/CrossChainRouter.sol:549"
+    ],
+    "claim": "Multiple receive-path handlers use strict `require(found, ...)` checks on mutable cross-chain position lookups; if state changed between send and receive (e.g., parallel repay/liquidation), the message reverts instead of being safely ignored/idempotently handled.",
+    "impact": "A single stale packet can become permanently unexecutable and may halt or severely degrade subsequent cross-chain operations on that lane, causing repayment/liquidation/borrow finalization failures.",
+    "paths": [
+      "User initiates cross-chain action A that sends packet P",
+      "Before P arrives, position is modified/removed by action B",
+      "P is received and lookup returns `found == false`",
+      "`require(found)` reverts and packet cannot complete"
+    ]
+  },
+  {
+    "id": "F-031",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Same-chain liquidation does not clear fully-seized collateral market membership",
+    "locations": [
+      "LayerZero/CoreRouter.sol:307",
+      "LayerZero/CoreRouter.sol:310"
+    ],
+    "claim": "When liquidation fully seizes a borrower’s collateral in `liquidateSeizeUpdate`, the code decreases `totalInvestment` but never removes the borrower’s lToken from `userSuppliedAssets` when balance reaches zero.",
+    "impact": "Stale supplied-asset entries accumulate and inflate future liquidity-check loops, increasing gas for borrow/redeem/liquidation paths and creating practical gas-DoS risk for affected accounts.",
+    "paths": [
+      "Borrower has collateral in market M",
+      "Liquidation seizes full `seizeTokens` so `totalInvestment(borrower, M)` becomes 0",
+      "Borrower remains in `userSuppliedAssets` for M",
+      "All future liquidity checks still iterate over zero-balance zombie market entries"
+    ]
+  },
+  {
+    "id": "F-032",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "Cross-chain liquidation message can be built with zero destination lToken and guaranteed fail on receiver",
+    "locations": [
+      "LayerZero/CrossChainRouter.sol:280",
+      "LayerZero/CrossChainRouter.sol:274",
+      "LayerZero/CrossChainRouter.sol:333"
+    ],
+    "claim": "Liquidation send path does not validate that `crossChainLTokenMap(params.lTokenToSeize, params.srcEid)` is non-zero before dispatching; a zero `destlToken` can later trigger failing accounting operations on receive.",
+    "impact": "Malformed liquidation packets become unexecutable and can repeatedly consume operational capacity, reducing reliability of cross-chain liquidation flow.",
+    "paths": [
+      "Operator/user triggers liquidation with an `lTokenToSeize` lacking `crossChainLTokenMap` entry for `srcEid`",
+      "`_executeLiquidationCore` sends packet with `destlToken = address(0)`",
+      "Receiver-side liquidation execution touches storage/accounting for zero-token key and reverts"
+    ]
+  },
+  {
+    "id": "F-033",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "Withdrawability helper can revert on zero denominator",
+    "locations": [
+      "LayerZero/LendStorage.sol:618",
+      "LayerZero/LendStorage.sol:621"
+    ],
+    "claim": "`getMaxWithdrawable` computes `tokensToDenom` and divides by it without guarding against zero (e.g., zero collateral factor and/or zero oracle price).",
+    "impact": "A user-facing risk/UX helper hard-reverts for some markets/states, breaking integrations or automation that depend on this function.",
+    "paths": [
+      "Market has `collateralFactor == 0` or oracle price returns 0",
+      "`tokensToDenom` becomes 0",
+      "`redeemableLTokens = (maxRedeemInUSD * 1e18) / tokensToDenom` reverts"
+    ]
+  }
+]
+
+```
+
+### Agent: opencode_1
+```
+I'll analyze the LayerZero contracts to identify security vulnerabilities. Let me start by reading the contract files.
+Now I'll compile my findings into the required JSON format. Based on my thorough analysis of the contracts, I found several new vulnerabilities not in the known findings list:
+[{"id":"F-030","severity":"Critical","confidence":"high","title":"Cross-chain borrow does not re-validate collateral at execution on destination chain","locations":["CrossChainRouter.sol:622","CrossChainRouter.sol:581-673"],"claim":"In _handleBorrowCrossChainRequest, the collateral amount from the source chain is passed in the payload but only checked once at line 622 against totalBorrowed. The actual collateral value is never re-fetched from source chain or re-validated against current market conditions.","impact":"User could borrow beyond actual collateral capacity when collateral state changes between message send and execution, potentially causing protocol insolvency.","paths":["1. User supplies collateral on Chain A","2. User initiates cross-chain borrow to Chain B","3. Collateral captured at message send time","4. On Chain B, only payload.collateral >= totalBorrowed is checked","5. Actual source chain collateral state never verified"]},{"id":"F-031","severity":"High","confidence":"medium","title":"Cross-chain liquidation validates health AFTER message sent, causing stale execution","locations":["CrossChainRouter.sol:197-233","CrossChainRouter.sol:772-777"],"claim":"In liquidateCrossChain, health validation happens when initiating but seize execution happens via message passing. The check _checkLiquidationValid is called AFTER message sent, using payload data that may be outdated.","impact":"Liquidators may execute siezes on positions no longer underwater, or borrower could restore position before execution.","paths":["1. Liquidator initiates liquidation on Chain B","2. Validation passes at that moment","3. Cross-chain message sent to Chain A","4. Before execution, borrower repays/adds collateral","5. On Chain A, check uses stale payload data"]}, {"id":"F-032","severity":"High","confidence":"medium","title":"Same-chain borrow calculation rounds to zero enabling collateral bypass","locations":["CoreRouter.sol:157-159","CoreRouter.sol:145-161"],"claim":"In borrow(), division (borrowed * borrowIndex) / currentBorrow.borrowIndex can round to zero when borrowIndex is small relative to current index, bypassing collateral check at line 161.","impact":"Users may borrow beyond collateral capacity when borrow index is small, creating undetected debt.","paths":["1. User has existing borrow with low borrowIndex","2. User calls borrow()","3. Line 157-159 calculates converted amount rounding to zero","4. Collateral check passes with borrowAmount = 0","5. New borrow added on zero-converted existing debt"]},{"id":"F-033","severity":"High","confidence":"high","title":"Full repayment clears borrow records before verifying repay success","locations":["CoreRouter.sol:493-496","CoreRouter.sol:459-503"],"claim":"In repayBorrowInternal, removeBorrowBalance called BEFORE repay success is fully verified. If LToken.repayBorrow reverts after line 494, state is inconsistent.","impact":"Borrow records deleted but repay may have failed, creating protocol state inconsistency.","paths":["1. Borrower repays full amount","2. removeBorrowBalance called at line 494","3. LToken.repayBorrow called at line 490","4. If repay fails, state already modified","5. Records cleared but debt exists"]},{"id":"F-034","severity":"Medium","confidence":"medium","title":"Supply uses stale exchange rate for lToken calculation allowing underminting","locations":["CoreRouter.sol:74-80","CoreRouter.sol:61-92"],"claim":"supply() fetches exchangeRateBefore at line 74 then calculates mintTokens at line 80 using that pre-mint rate. If rate changes during mint execution, users receive fewer lTokens than entitled.","impact":"Users supplying tokens receive less lTokens than their deposit value if exchange rate changes during transaction.","paths":["1. User calls supply()","2. exchangeRateBefore fetched","3. User transfers tokens, contract approves","4. LToken.mint() actual rate differs","5. mintTokens calculated with stale rate"]},{"id":"F-035","severity":"Medium","confidence":"medium","title":"Cross-chain liquidation doesn't verify collateral chain liquidity before sending","locations":["CrossChainRouter.sol:264-285","CrossChainRouter.sol:274-284"],"claim":"_executeLiquidationCore calculates seize amount and sends via _send without checking collateral chain has sufficient protocol cash for the seize transfer.","impact":"Liquidation fails on execution due to insufficient liquidity, leaving debt unsettled and potentially trapping escrowed tokens.","paths":["1. Liquidator triggers liquidation on Chain B","2. Seize calculated on Chain B","3. Message sent to Chain A","4. Insufficient cash on Chain A for seizeTokens","5. Liquidation fails or partial"]},{"id":"F-036","severity":"Medium","confidence":"low","title":"borrowForCrossChain missing zero address validation for borrower","locations":["CoreRouter.sol:195-205","CrossChainRouter.sol:625"],"claim":"borrowForCrossChain accepts any _borrower without checking address(0). Borrowed tokens sent to zero address are permanently lost.","impact":"If _borrower is address(0), borrowed tokens are burned permanently.","paths":["1. CrossChainRouter calls borrowForCrossChain","2. Passes _borrower = address(0)","3. borrow() succeeds on LToken","4. Transfer to address(0)","5. Tokens permanently lost"]},{"id":"F-037","severity":"Medium","confidence":"high","title":"repayBorrow accepts any lToken without underlying existence validation","locations":["CoreRouter.sol:212-214","CoreRouter.sol:459-503"],"claim":"repayBorrow accepts _lToken but never validates underlying mapping exists via lendStorage.lTokenToUnderlying. Invalid lToken causes funds lost or wrong token transfer.","impact":"Users repaying with invalid lToken lose funds or send to wrong addresses.","paths":["1. User calls repayBorrow with invalid _lToken","2. No validation of _lToken existence","3. lTokenToUnderlying returns address(0) or wrong token","4. IERC20 transfer uses wrong token","5. Funds lost or stuck"]},{"id":"F-038","severity":"Low","confidence":"medium","title":"LiquidateSeizeUpdate doesn't return actual seized amount to liquidator","locations":["CoreRouter.sol:278-318","CoreRouter.sol:230-244"],"claim":"liquidateBorrow calculates seize internally but doesn't return the actual seized amount to liquidator for verification.","impact":"Liquidators cannot verify correct seized amount was received, enabling value manipulation.","paths":["1. Liquidator calls liquidateBorrow","2. Repay amount seized","3. State updated internally","4. Event emitted without return value","5. No on-chain seizure verification"]},{"id":"F-039","severity":"Low","confidence":"low","title":"Constructors accept any storage/oracle without contract validation","locations":["CoreRouter.sol:39-44","CrossChainRouter.sol:74-89"],"claim":"Constructors accept arbitrary _lendStorage, _priceOracle, _lendtroller without verifying these are legitimate protocol contracts.","impact":"Deployment could initialize with malicious contracts stealing funds or manipulating prices.","paths":["1. Attacker front-runs deployment","2. Passes malicious _lendStorage/_priceOracle","3. Contract initialized with bad contracts","4. Fund transfers go to attacker","5. Oracle prices manipulatable"]}]
+
+```
+
+
+## Included Direct Audit Scope
+Only keep findings whose root cause location is inside files matching:
+- `LayerZero/**`
+
+Other files can still be read as context.
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

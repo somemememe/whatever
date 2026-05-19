@@ -1,0 +1,69 @@
+# Audit Report
+
+**Total findings:** 3
+
+## Critical (1)
+
+### F-001: Post-expiry stakes are miscounted as distributable rewards, creating undercollateralized sHATE
+
+**Confidence:** high | **Locations:** `0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:57, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:58, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:59, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:60, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:89, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:90, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:95`
+
+When an epoch has expired, `stake()` pulls `_amount` HATE into the contract before calling `rebase()`, but does not transfer the matching `_amount` sHATE to the user until after `rebase()` finishes. The rebase logic computes `epoch.distribute = HATE.balanceOf(this) - sHATE.circulatingSupply()`, so the freshly deposited HATE is counted in backing while the freshly owed sHATE is still excluded from circulating supply. This misclassifies the new stake principal as surplus rewards for the next epoch.
+
+**Impact:** A user can intentionally poison `epoch.distribute` and cause the next rebase to distribute part or all of their own principal across existing holders. After that rebase, the pool becomes undercollateralized: the attacker can withdraw more HATE than their net fair share while other sHATE holders are left partially or fully unredeemable.
+
+**Paths:**
+
+- Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
+
+- Call `stake(attacker, A)`, causing `A` HATE to be included in `balance` before the matching `A` sHATE is transferred out of the staking contract.
+
+- Let the next rebase execute, which distributes the artificially inflated `epoch.distribute`, then redeem the attacker position while honest holders absorb the shortfall.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (1)
+
+### F-002: If staking is multiple epochs behind, the fake reward can be realized immediately
+
+**Confidence:** high | **Locations:** `0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:57, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:59, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:79, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:82, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:89, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:95`
+
+`rebase()` only advances `epoch.end` by one `epoch.length` per call. If the contract is at least two epochs behind, a malicious `stake()` can first create the inflated `epoch.distribute` described in F-001, yet still leave `epoch.end <= block.timestamp` after the internal rebase. The attacker can then call `rebase()` again immediately to realize the fabricated reward without waiting for another real epoch to pass.
+
+**Impact:** The insolvency bug becomes a same-block or immediate exploit whenever upkeep lags far enough behind wall-clock time. That makes the accounting bug materially easier to weaponize in practice because the attacker does not need to leave the poisoned distribution pending for a full epoch.
+
+**Paths:**
+
+- Wait until `block.timestamp >= epoch.end + epoch.length`, so the staking contract is at least two epochs behind.
+
+- Call `stake(attacker, A)`, which inflates `epoch.distribute` during the internal rebase while only moving `epoch.end` forward once.
+
+- Call `rebase()` again immediately, then redeem the attacker position against the now-undercollateralized HATE backing.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## Medium (1)
+
+### F-003: Raw ERC20 interactions assume strict no-fee, full-return token semantics
+
+**Confidence:** medium | **Locations:** `0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:58, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:60, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:70, 0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol:72`
+
+The contract uses raw `transferFrom`/`transfer` calls and never checks return values or balance deltas. Staking and redemption therefore assume that both `HATE` and `sHATE` always transfer exactly `_amount` and revert on failure. If either token instead returns `false`, silently short-transfers, or applies transfer fees, the contract still accounts against the nominal `_amount`.
+
+**Impact:** With non-standard token behavior, `stake()` can issue too much sHATE for too little HATE, `unstake()` can pay too much HATE for too little sHATE returned, or outbound transfers can fail silently and leave users unpaid after their counter-asset has already been moved. That can create unbacked claims, pool insolvency, or direct user fund loss.
+
+**Paths:**
+
+- If `HATE.transferFrom()` transfers less than `_amount` but does not revert, `stake()` still releases `_amount` sHATE.
+
+- If `sHATE.transferFrom()` transfers less than `_amount` but does not revert, `unstake()` can still send `_amount` HATE out.
+
+- If either outbound `transfer()` returns `false` instead of reverting, the function continues without detecting the failed payment.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---

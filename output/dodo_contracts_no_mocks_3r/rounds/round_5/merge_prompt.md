@@ -1,0 +1,619 @@
+Below are findings and vulnerability signals from 2 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "User-controlled swap params can spend arbitrary token balances held by gateway contracts",
+    "locations": [
+      "GatewayCrossChain.sol:373",
+      "GatewayCrossChain.sol:492",
+      "GatewayTransferNative.sol:414",
+      "GatewayTransferNative.sol:453",
+      "GatewayTransferNative.sol:574",
+      "GatewaySend.sol:199",
+      "GatewaySend.sol:245",
+      "GatewaySend.sol:366"
+    ],
+    "claim": "The contracts decode `MixSwapParams` from attacker-controlled payloads and use `params.fromToken` / `params.fromTokenAmount` in approvals and `mixSwap` without enforcing that they match the token and net amount actually received in the current execution path.",
+    "impact": "Attackers can spend unrelated token balances already held by these contracts (fees, stranded balances, prior user funds) and route swap outputs to attacker-controlled recipients, causing direct theft.",
+    "paths": [
+      "Craft payload/swapData with `params.fromToken` set to a valuable token currently held by the contract and `params.fromTokenAmount` set to the desired drain amount.",
+      "Trigger `onCall`, `withdrawToNativeChain`, or `depositAndCall` with cheap/unrelated input.",
+      "Contract approves DODO for attacker-chosen token and `mixSwap` pulls/spends contract inventory for attacker benefit."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Refunds for non-20-byte recipients are claimable by anyone",
+    "locations": [
+      "GatewayCrossChain.sol:607",
+      "GatewayCrossChain.sol:612",
+      "GatewayTransferNative.sol:685",
+      "GatewayTransferNative.sol:689"
+    ],
+    "claim": "In both `claimRefund` implementations, when `walletAddress.length != 20`, `receiver` remains `msg.sender`; the caller check then trivially passes for arbitrary callers.",
+    "impact": "Refunds intended for non-EVM recipients (e.g., Bitcoin/Solana-style addresses) can be front-run and stolen by any observer.",
+    "paths": [
+      "A failed cross-chain call stores refund info with non-20-byte `walletAddress`.",
+      "Attacker observes `externalId` and calls `claimRefund(externalId)` first.",
+      "Authorization passes trivially and funds are transferred to attacker."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Bitcoin/non-EVM revert recipient is truncated to 20 bytes, misdirecting refunds",
+    "locations": [
+      "GatewayCrossChain.sol:318",
+      "GatewayCrossChain.sol:550",
+      "GatewayTransferNative.sol:319",
+      "GatewayTransferNative.sol:631"
+    ],
+    "claim": "`withdraw` encodes revert recipient as `bytes20(sender)`, truncating non-20-byte addresses. `onRevert` then interprets the 52-byte revert payload as an EVM address refund target.",
+    "impact": "Failed non-EVM withdrawals can refund to unintended EVM addresses (or unusable addresses), causing permanent user fund loss.",
+    "paths": [
+      "User initiates withdrawal with a non-20-byte recipient format.",
+      "Withdrawal fails and gateway calls `onRevert` with truncated 20-byte recipient bytes.",
+      "Contract refunds to that truncated EVM address instead of the intended non-EVM recipient."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "withdrawToNativeChain trusts nominal input amount and can execute underfunded withdrawals from contract reserves",
+    "locations": [
+      "GatewayTransferNative.sol:549",
+      "GatewayTransferNative.sol:554",
+      "GatewayTransferNative.sol:555",
+      "GatewayTransferNative.sol:570",
+      "GatewayTransferNative.sol:574",
+      "GatewayTransferNative.sol:577",
+      "GatewayTransferNative.sol:599",
+      "GatewayTransferNative.sol:477"
+    ],
+    "claim": "`withdrawToNativeChain` uses caller-supplied `amount` as the accounting source for fee/swap/withdraw flows, but does not verify actual token balance delta. The ETH sentinel path skips transfer-in entirely, and ERC20 paths only check a boolean `transferFrom` return.",
+    "impact": "Attackers can trigger withdrawals of real `decoded.targetZRC20` from contract-held inventory without providing equivalent funding, enabling direct theft of pooled assets.",
+    "paths": [
+      "Call `withdrawToNativeChain(_ETH_ADDRESS_, amount, message)` to bypass token pull, then route to valuable `targetZRC20`.",
+      "Or use a malicious/deflationary token that returns success while transferring less than `amount`.",
+      "Contract computes output from nominal `amount` and executes gateway withdrawal using existing target-token balances."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "GatewaySend destination onCall trusts payload amount/token data and can drain contract reserves",
+    "locations": [
+      "GatewaySend.sol:347",
+      "GatewaySend.sol:354",
+      "GatewaySend.sol:359",
+      "GatewaySend.sol:363",
+      "GatewaySend.sol:370",
+      "GatewaySend.sol:372"
+    ],
+    "claim": "`GatewaySend.onCall` trusts `amount`, `fromToken`, and `toToken` decoded from attacker-controlled payload bytes instead of reconciling to assets delivered by gateway for that call. The function can skip funding pulls (`fromToken == ETH sentinel`) and also ignores ERC20 transfer return values.",
+    "impact": "Crafted cross-chain payloads can force ETH/ERC20 payouts from pre-existing contract balances to attacker-controlled recipients, causing direct theft.",
+    "paths": [
+      "Send cross-chain call with payload encoding inflated `amount` and attacker-chosen token mode.",
+      "Destination `onCall` computes `outputAmount` from payload values, not reconciled balances.",
+      "Contract transfers ETH/ERC20 reserves to attacker recipient."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-006",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Reentrancy in `GatewayTransferNative.claimRefund` allows repeated refund claims",
+    "locations": [
+      "GatewayTransferNative.sol:691",
+      "GatewayTransferNative.sol:692"
+    ],
+    "claim": "`claimRefund` performs external token transfer before deleting `refundInfos[externalId]`, enabling reentrancy on malicious refund tokens.",
+    "impact": "A malicious token can reenter and claim the same refund multiple times in one transaction, draining additional token balance held by the contract.",
+    "paths": [
+      "Create refund entry where `refundInfo.token` is a reentrant token.",
+      "Call `claimRefund(externalId)`; token transfer reenters before storage deletion.",
+      "Repeated claims execute until balance is exhausted or reentrancy stops."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-007",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Balance-based pair existence check can be dust-poisoned into swap-path DoS",
+    "locations": [
+      "GatewayCrossChain.sol:234",
+      "GatewayCrossChain.sol:245",
+      "GatewayTransferNative.sol:235",
+      "GatewayTransferNative.sol:246",
+      "libraries/UniswapV2Library.sol:44"
+    ],
+    "claim": "`_existsPairPool` infers pair existence by token balances at computed pair address rather than verifying deployed pair code/reserves.",
+    "impact": "Attackers can dust non-pair addresses so routing selects nonexistent direct pools, causing reserve lookups/swaps to revert and denying service for affected routes.",
+    "paths": [
+      "For a token pair without a real direct pool, send dust of both tokens to computed pair address.",
+      "`_existsPairPool` returns true and route selection chooses 2-hop direct path.",
+      "Subsequent `getReserves`/swap calls revert on non-pair target, blocking those swaps."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-008",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Public `withdraw` can be abused when residual gateway allowances remain",
+    "locations": [
+      "GatewayTransferNative.sol:305",
+      "GatewayTransferNative.sol:319",
+      "GatewayTransferNative.sol:416",
+      "GatewayTransferNative.sol:477",
+      "GatewayTransferNative.sol:496"
+    ],
+    "claim": "`GatewayTransferNative.withdraw` is publicly callable. Other flows approve `outputAmount + gasFee` when gas token equals output token, but gateway spends only `outputAmount`, leaving residual allowance under some conditions.",
+    "impact": "If residual approval and contract balance exist (notably after gas-fee changes), arbitrary callers may consume leftover allowance to trigger unauthorized withdrawals to attacker-chosen recipients.",
+    "paths": [
+      "A prior withdrawal path leaves nonzero residual allowance from `GatewayTransferNative` to gateway.",
+      "Attacker calls public `withdraw` with attacker-controlled recipient bytes and amount that fits remaining allowance conditions.",
+      "Gateway pulls contract tokens via leftover allowance and emits withdrawal to attacker destination."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-009",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Empty `swapDataZ` path allows cross-asset withdrawals without performing conversion",
+    "locations": [
+      "GatewayCrossChain.sol:369",
+      "GatewayCrossChain.sol:492",
+      "GatewayCrossChain.sol:495",
+      "GatewayCrossChain.sol:517",
+      "GatewayTransferNative.sol:449",
+      "GatewayTransferNative.sol:414",
+      "GatewayTransferNative.sol:574",
+      "GatewayTransferNative.sol:577",
+      "GatewayTransferNative.sol:599"
+    ],
+    "claim": "When `swapDataZ` is empty, `_doMixSwap` returns the input `amount` directly. Callers can still set arbitrary `decoded.targetZRC20`, and withdrawal/payout logic proceeds as if a real conversion occurred.",
+    "impact": "Attackers can provide one asset but withdraw/receive a different, more valuable token from contract-held reserves, causing direct reserve theft.",
+    "paths": [
+      "Send message/call with `targetZRC20 != input zrc20` and empty `swapDataZ`.",
+      "`_doMixSwap` returns nominal input amount without any token conversion proof.",
+      "Contract executes withdraw/transfer in `targetZRC20` using its own inventory."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-010",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "GatewaySend source flow does not bind bridged asset to swap output asset",
+    "locations": [
+      "GatewaySend.sol:245",
+      "GatewaySend.sol:257",
+      "GatewaySend.sol:266",
+      "GatewaySend.sol:170",
+      "GatewaySend.sol:186"
+    ],
+    "claim": "`depositAndCall(fromToken,...)` computes a numeric `outputAmount` from `_doMixSwap`, then deposits whichever `asset` the caller supplied, without verifying that this asset was actually produced/received from the swap.",
+    "impact": "If the contract holds balances of another token/ETH, attackers can swap one asset but bridge out a different asset from pooled reserves.",
+    "paths": [
+      "Call `depositAndCall(fromToken, amount, swapData, ..., asset, ...)` with swap output token different from `asset`.",
+      "Obtain nonzero `outputAmount` (or force it via crafted swap data).",
+      "Contract deposits `outputAmount` of attacker-chosen `asset` to gateway, consuming contract reserves."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-011",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "GatewayTransferNative refund records are overwriteable for the same externalId",
+    "locations": [
+      "GatewayTransferNative.sol:642",
+      "GatewayTransferNative.sol:648",
+      "GatewayTransferNative.sol:664",
+      "GatewayTransferNative.sol:670"
+    ],
+    "claim": "`onRevert`/`onAbort` in `GatewayTransferNative` write `refundInfos[externalId]` without checking whether an entry already exists.",
+    "impact": "If duplicate/colliding callbacks occur for the same `externalId`, earlier refund metadata can be replaced, leading to refund loss, misdirection, or permanent unclaimability for the original claimant.",
+    "paths": [
+      "First callback stores refund info for `externalId = X`.",
+      "Second callback with same `X` stores different wallet/token/amount and overwrites prior data.",
+      "Original user can no longer claim intended refund entry."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1",
+      "opencode_1"
+    ]
+  },
+  {
+    "id": "F-012",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "AccountEncoder.decompressAccounts builds invalid memory layout for `Account[]`",
+    "locations": [
+      "libraries/AccountEncoder.sol:28",
+      "libraries/AccountEncoder.sol:33",
+      "libraries/AccountEncoder.sol:48",
+      "GatewayCrossChain.sol:425",
+      "GatewayCrossChain.sol:454",
+      "GatewayTransferNative.sol:505",
+      "GatewayTransferNative.sol:534"
+    ],
+    "claim": "`decompressAccounts` stores pointers in array slots where static `Account` structs are expected inline, so later ABI encoding reads corrupted struct fields.",
+    "impact": "Solana-targeted payloads can be malformed and fail downstream decoding/calls, causing persistent route-level DoS/refund churn for affected transfers.",
+    "paths": [
+      "Use Solana path (`dstChainId == SOLANA_EDDY`) with compressed accounts data.",
+      "`decompressAccounts` produces malformed `Account[]` memory representation.",
+      "Encoded payload becomes invalid for downstream processing and withdraw-and-call fails."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-013",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Recipient bytes are silently truncated/padded into EVM addresses in payout paths",
+    "locations": [
+      "GatewayTransferNative.sol:390",
+      "GatewaySend.sol:356"
+    ],
+    "claim": "Both payout paths cast dynamic recipient bytes to `bytes20/address` without requiring exact 20-byte length.",
+    "impact": "Malformed or non-20-byte recipient payloads can be irreversibly misinterpreted, causing payouts to unintended EVM addresses and user fund loss.",
+    "paths": [
+      "Provide recipient bytes longer than 20 bytes with attacker-controlled first 20 bytes (or shorter bytes that get padded).",
+      "Contract truncates/pads and derives an EVM address without validation.",
+      "Funds are transferred to the derived address, not the intended recipient."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-014",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "GatewaySend direct ERC20 source deposit uses nominal amount and can spend reserves on underfunded transfer-in",
+    "locations": [
+      "GatewaySend.sol:317",
+      "GatewaySend.sol:320",
+      "GatewaySend.sol:186"
+    ],
+    "claim": "In `depositAndCall(address targetContract, uint256 amount, address asset, ...)`, ERC20 intake checks only `transferFrom` boolean success and never reconciles actual balance delta before approving/depositing the full nominal `amount` to the gateway.",
+    "impact": "With fee-on-transfer/deflationary ERC20s, the contract may receive less than `amount` but still bridge `amount`; any deficit is covered from pre-existing contract balances, enabling reserve drain and insolvency over repeated calls.",
+    "paths": [
+      "Call `depositAndCall(targetContract, amount, asset, ...)` using a taxed ERC20.",
+      "Contract receives `< amount` but still approves/deposits full `amount` to gateway.",
+      "Gateway pull succeeds using contract-held inventory to cover the shortfall, transferring value to attacker-controlled cross-chain flow."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-015",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "GatewaySend destination finalizes success even when ERC20 payout transfer fails softly",
+    "locations": [
+      "GatewaySend.sol:372",
+      "GatewaySend.sol:385"
+    ],
+    "claim": "`onCall` executes `IERC20(toToken).transfer(...)` without checking the returned boolean and then returns success to the gateway.",
+    "impact": "If a token returns `false` (instead of reverting), cross-chain delivery is marked successful while recipient payment never happens, causing silent non-delivery and potential fund lockup in the contract.",
+    "paths": [
+      "Process destination message where payout token's `transfer` returns `false`.",
+      "`onCall` does not revert and still returns success.",
+      "No revert/refund path is triggered, while recipient remains unpaid."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-016",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "GatewaySend ETH payout uses `.transfer` and can DoS smart-contract recipients",
+    "locations": [
+      "GatewaySend.sol:370"
+    ],
+    "claim": "ETH delivery uses Solidity `.transfer`, forwarding only 2300 gas to the recipient.",
+    "impact": "Many contract wallets/proxies cannot receive ETH under 2300 gas; affected cross-chain deliveries deterministically revert, reducing liveness for those recipients.",
+    "paths": [
+      "Set destination recipient to a contract with non-trivial `receive`/`fallback` logic.",
+      "`onCall` executes `payable(recipient).transfer(outputAmount)`.",
+      "Transfer reverts and delivery path fails for that recipient class."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-017",
+    "severity": "High",
+    "confidence": "high",
+    "title": "GatewaySend revert handler lacks native-asset refund path and can strand reverted ETH",
+    "locations": [
+      "GatewaySend.sol:393",
+      "GatewaySend.sol:396"
+    ],
+    "claim": "`onRevert` always calls ERC20-style `TransferHelper.safeTransfer(context.asset, ...)` and has no branch for native refunds. For gas-token reverts where `context.asset` is empty/zero-address, this call does not transfer ETH back to the user.",
+    "impact": "Failed ETH-origin cross-chain calls can be finalized without refunding the sender, leaving reverted value stranded in `GatewaySend` (and exposed to secondary reserve-drain bugs).",
+    "paths": [
+      "User submits ETH `depositAndCall` through `GatewaySend`.",
+      "Destination execution fails and gateway triggers `onRevert` with gas-token context.",
+      "Handler attempts token transfer using `context.asset` instead of native ETH transfer, so sender is not refunded."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-018",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Swap output asset is not bound to target payout token before withdrawal/transfer",
+    "locations": [
+      "GatewayCrossChain.sol:376",
+      "GatewayCrossChain.sol:492",
+      "GatewayCrossChain.sol:432",
+      "GatewayTransferNative.sol:414",
+      "GatewayTransferNative.sol:422",
+      "GatewayTransferNative.sol:456",
+      "GatewayTransferNative.sol:541",
+      "GatewayTransferNative.sol:574"
+    ],
+    "claim": "Both contracts execute DODO swaps using `params.toToken` but later withdraw/transfer `decoded.targetZRC20` without enforcing `params.toToken == decoded.targetZRC20` (or proving that the swapped asset matches the payout asset).",
+    "impact": "Attackers can route swaps into a different/cheap token while forcing payout/withdrawal in a valuable reserve token, draining contract-held inventories.",
+    "paths": [
+      "Craft swap payload where `params.toToken` is not `decoded.targetZRC20` and yields a controllable `outputAmount`.",
+      "Trigger `GatewayCrossChain.onCall`, `GatewayTransferNative.withdrawToNativeChain`, or `GatewayTransferNative.onCall` swap branch.",
+      "Contract treats numeric `outputAmount` as amount of `decoded.targetZRC20` and transfers/withdraws that token from reserves."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex_1"
+    ]
+  },
+  {
+    "id": "F-022",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "`amountInMax`-based post-swap check can cause avoidable withdrawal reverts",
+    "locations": [
+      "GatewayTransferNative.sol:338",
+      "GatewayTransferNative.sol:352",
+      "GatewayTransferNative.sol:357"
+    ],
+    "claim": "`_swapAndSendERC20Tokens` computes `amountInMax` with slippage buffer, executes the swap, but then checks `targetAmount - amountInMax > 0` instead of `targetAmount - amounts[0] > 0`. This can revert even when actual spent input leaves a positive withdrawable remainder.",
+    "impact": "Valid withdrawal flows can fail unnecessarily, causing cross-chain execution failures/refunds and enabling practical route-level liveness degradation (economic DoS) when quotes are pushed near threshold.",
+    "paths": [
+      "Increase quote pressure (or rely on high configured slippage) so `amountInMax >= targetAmount` while actual `amounts[0] < targetAmount`.",
+      "`swapTokensForExactTokens` succeeds, but the subsequent `require(targetAmount - amountInMax > 0)` reverts.",
+      "User-facing withdrawal path fails despite sufficient actual post-swap balance."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex_1"
+    ]
+  }
+]
+
+## This Round's Agent Outputs
+### Agent: codex_1
+```
+[
+  {
+    "id": "F-101",
+    "severity": "High",
+    "confidence": "high",
+    "title": "GatewayTransferNative onCall uses pre-fee amount for swap path, letting users externalize fees to reserves",
+    "locations": [
+      "GatewayTransferNative.sol:389",
+      "GatewayTransferNative.sol:414"
+    ],
+    "claim": "In `onCall`, platform fees are transferred out first, but `amount` is not reduced before calling `_doMixSwap` in the `decoded.targetZRC20 != zrc20` branch, so swaps can still consume the full pre-fee amount from contract balances.",
+    "impact": "Attackers can repeatedly avoid paying effective platform fees and make the contract subsidize swaps from its own reserves, causing reserve depletion and eventual insolvency/DoS for later users.",
+    "paths": [
+      "GatewayTransferNative.onCall -> _handleFeeTransfer(zrc20, amount) -> _doMixSwap(decoded.swapData, amount, params)"
+    ]
+  },
+  {
+    "id": "F-102",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Revert callback handlers trust revertMessage length and can self-revert on malformed payloads",
+    "locations": [
+      "GatewaySend.sol:394",
+      "GatewaySend.sol:395",
+      "GatewayTransferNative.sol:628",
+      "GatewayTransferNative.sol:629",
+      "GatewayTransferNative.sol:661",
+      "GatewayTransferNative.sol:662"
+    ],
+    "claim": "`onRevert`/`onAbort` in these contracts slice `revertMessage` (`[0:32]`, `[32:]`) without first checking minimum length, so short messages cause callback reverts.",
+    "impact": "Malformed callback payloads can make refund handlers fail, potentially stranding reverted assets or creating unresolvable refund flows.",
+    "paths": [
+      "Gateway callback with short revertMessage -> onRevert/onAbort slice out-of-bounds -> callback reverts before refund logic"
+    ]
+  },
+  {
+    "id": "F-103",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "GatewayCrossChain refund collision guard is bypassable for externalId = 0x0",
+    "locations": [
+      "GatewayCrossChain.sol:561",
+      "GatewayCrossChain.sol:585"
+    ],
+    "claim": "Duplicate protection checks `refundInfos[externalId].externalId == bytes32(0)`. For key `externalId == 0`, a populated record still has `externalId == 0`, so overwrite protection is ineffective.",
+    "impact": "Refund entries at key zero can be overwritten/griefed, breaking refund integrity assumptions and potentially orphaning claimable balances.",
+    "paths": [
+      "Create refund with externalId=0 -> trigger another onRevert/onAbort with externalId=0 -> previous refund record replaced"
+    ]
+  },
+  {
+    "id": "F-104",
+    "severity": "High",
+    "confidence": "low",
+    "title": "GatewaySend.onCall returns 0x00000000 success code, risking callback status mismatch",
+    "locations": [
+      "GatewaySend.sol:385"
+    ],
+    "claim": "`onCall` is declared `returns (bytes4)` but returns `\"\"` (zero selector). If the upstream gateway expects a specific magic return value, successful execution may be interpreted as failure.",
+    "impact": "A status mismatch can lead to inconsistent cross-chain finality (e.g., destination payout plus source-side revert/refund), creating double-accounting or fund-loss conditions.",
+    "paths": [
+      "GatewaySend.onCall executes payout -> returns 0x00000000 -> gateway-level success check (if enforced) fails -> revert handling triggers"
+    ]
+  },
+  {
+    "id": "F-105",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "onCall handlers do not authenticate source contract/chain in MessageContext",
+    "locations": [
+      "GatewayCrossChain.sol:469",
+      "GatewaySend.sol:341",
+      "GatewayTransferNative.sol:376"
+    ],
+    "claim": "These `onCall` handlers only require `msg.sender == gateway` but never verify `context.sender` (or an allowlisted source chain/contract), so any gateway-routed caller can supply protocol-formatted messages.",
+    "impact": "If the intended trust model is counterpart-only messaging, forged cross-chain senders can bypass source-side controls, spoof metadata, and invoke sensitive flows directly.",
+    "paths": [
+      "Arbitrary gateway user routes message to target contract -> onlyGateway passes -> business logic executes without source allowlist checks"
+    ]
+  },
+  {
+    "id": "F-106",
+    "severity": "Informational",
+    "confidence": "high",
+    "title": "GatewayTransferNative.claimRefund emits zeroed token/amount after deleting storage",
+    "locations": [
+      "GatewayTransferNative.sol:692",
+      "GatewayTransferNative.sol:696",
+      "GatewayTransferNative.sol:697"
+    ],
+    "claim": "`claimRefund` deletes `refundInfos[externalId]` before emitting fields read through the same storage reference, so event values become zeroed.",
+    "impact": "Off-chain monitoring and accounting can be misled because `EddyCrossChainRefundClaimed` does not report the actual refunded token/amount.",
+    "paths": [
+      "claimRefund -> safeTransfer(refundInfo...) -> delete refundInfos[externalId] -> emit using cleared storage fields"
+    ]
+  }
+]
+
+```
+
+### Agent: opencode_1
+```
+Let me start by reading the main contract files to audit for security vulnerabilities.
+Let me continue reading the library files to find more vulnerabilities:
+Let me read the remaining files to get a complete picture:
+Now I'll analyze these contracts carefully to identify additional security vulnerabilities beyond the known findings. Let me search for issues that are distinct from F-001 through F-018 and F-022.
+Based on my comprehensive analysis of all the contracts, let me compile the JSON array with new security vulnerabilities I've identified that are distinct from the known findings (F-001 to F-018 and F-022):
+[{"id":"F-019","severity":"Critical","confidence":"high","title":"Slippage parameter is configurable but never enforced on swaps","locations":["GatewayCrossChain.sol:338-356","GatewayCrossChain.sol:159-163","GatewayTransferNative.sol:325-358","GatewayTransferNative.sol:175-178"],"claim":"The slippage parameter can be set by the owner (up to 50%) but is never actually applied when performing Uniswap swaps in _swapAndSendERC20Tokens. The contract only uses the nominal amountInMax calculated from slippage, but never validates that the actual swap output meets the slippage requirement.","impact":"Users can suffer up to 50% slippage loss (or whatever the owner configured slippage to) on their cross-chain swaps because the slippage protection is not enforced against actual swap results. The owner can set slippage to a high value (e.g., 50%) but the swap can execute at any rate, allowing MEV extractors or the protocol to extract value from users.","paths":["User calls withdrawToNativeChain with swap data","Contract performs swap via UniswapV2Router01.swapTokensForExactTokens","Swap executes with no validation that output meets slippage requirement","User receives less than expected due to slippage"]},{"id":"F-020","severity":"High","confidence":"high","title":"GatewaySend.depositAndCall lacks slippage and minimum output validation","locations":["GatewaySend.sol:218-285"],"claim":"The depositAndCall function performs a swap via DODO Router but does not validate that the output amount meets any minimum return or slippage requirement. The swap is executed using user-specified params.minReturnAmount without validation that the actual output meets this threshold.","impact":"Users can receive significantly less than expected from their swap due to price impact or MEV extraction. The minReturnAmount parameter is passed to the router but never validated after the swap completes.","paths":["User calls depositAndCall with swapData including minReturnAmount","Contract calls DODO Router swap","No validation that outputAmount >= minReturnAmount","User receives less than minReturnAmount"]},{"id":"F-021","severity":"High","confidence":"medium","title":"Platform fee can be set to zero, enabling owner fund extraction","locations":["GatewayCrossChain.sol:154-157","GatewayTransferNative.sol:154-158"],"claim":"The owner can set feePercent to any value between 0 and 1000 basis points. While there's an upper bound check, there's no minimum fee requirement. A malicious or compromised owner could set feePercent to 0 to remove platform fees, then artificially inflate amounts to extract value from protocol reserves.","impact":"Owner can set fee to 0 and potentially exploit the protocol through other means, or the ability to set arbitrary fees (even if bounded) creates economic manipulation opportunities.","paths":["Owner calls setFeePercent(0)","Owner initiates a swap with inflated amounts","Platform receives no fees but swap executes","Value extracted from protocol reserves"]},{"id":"F-023","severity":"Medium","confidence":"high","title":"GatewaySend.onCall lacks access control allowing anyone to drain user tokens","locations":["GatewaySend.sol:341-386"],"claim":"The onCall function can be invoked by any address (onlyGateway modifier), but it attempts to transfer tokens from msg.sender using transferFrom without verifying that msg.sender has approved the contract. Additionally, there's no validation that the caller is the intended sender from the message context.","impact":"If the gateway allows arbitrary callers to invoke onCall (which defeats the onlyGateway purpose), anyone could trigger token transfers. The function also doesn't validate that the decoded sender matches msg.sender.","paths":["Gateway invokes onCall with crafted message","transferFrom attempts to take tokens from msg.sender","If approval exists, tokens stolen"]},{"id":"F-024","severity":"Medium","confidence":"medium","title":"GatewayTransferNative.withdrawToNativeChain uses nominal amount for fee calculation before swap","locations":["GatewayTransferNative.sol:570-571"],"claim":"The platform fee is calculated on the nominal input amount BEFORE the swap operation. This means if the swap produces less than expected due to unfavorable rates, the platform still takes the full fee percentage on the original amount, making the actual output even smaller.","impact":"Users pay fees on the nominal input amount regardless of actual swap output, causing effective fee to be higher than advertised and user gets less than expected.","paths":["User calls withdrawToNativeChain with amount","Fee calculated on input amount before swap","Swap executes with remaining amount","If swap produces less, user suffers double loss"]},{"id":"F-025","severity":"Medium","confidence":"medium","title":"GatewayCrossChain.onCall deducts platform fee before swap, reducing swap efficiency","locations":["GatewayCrossChain.sol:488-492"],"claim":"Similar to F-024, the platform fee is deducted from the input amount BEFORE the swap operation in onCall. This reduces the capital available for the swap, potentially causing worse exchange rates and less output for users.","impact":"Users get suboptimal swap results because fee is taken before swap rather than after, reducing capital efficiency.","paths":["Gateway calls onCall with amount","Fee deducted from amount","Remaining amount used for swap","Smaller swap output due to reduced capital"]},{"id":"F-026","severity":"Low","confidence":"low","title":"GatewaySend.depositAndCall does not bind output token to destination chain asset","locations":["GatewaySend.sol:218-285"],"claim":"The depositAndCall function allows users to specify any fromToken, toToken (asset), and dstChainId without validation that the destination chain supports or expects the specified asset. This could lead to lost funds if the asset doesn't exist on the destination chain.","impact":"User funds could be lost if they specify an asset that doesn't exist or isn't supported on the destination chain.","paths":["User specifies unsupported asset for dstChainId","Deposit executes cross-chain","Funds lost or stuck on destination"]}]
+
+```
+
+
+
+## Excluded From Direct Audit Scope
+Do not keep findings whose reportable root cause exists solely in files matching:
+- `mocks/**`
+
+Those files may still be read as context for in-scope implementation code.
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

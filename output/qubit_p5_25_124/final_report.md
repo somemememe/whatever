@@ -1,0 +1,27 @@
+# Audit Report
+
+**Total findings:** 1
+
+## High (1)
+
+### F-002: Transparent proxy may expose an implementation-controlled upgrade path outside ProxyAdmin
+
+**Confidence:** low | **Locations:** `onchain_auto/0x20e5e35ba29dc3b540a1aee781d0814d5c77bce6/@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol:39, onchain_auto/0x20e5e35ba29dc3b540a1aee781d0814d5c77bce6/@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol:91, onchain_auto/0x20e5e35ba29dc3b540a1aee781d0814d5c77bce6/@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol:102, onchain_auto/0x20e5e35ba29dc3b540a1aee781d0814d5c77bce6/_etherscan_meta.json:5`
+
+The deployed contract is a `TransparentUpgradeableProxy`, whose `ifAdmin` modifier forwards non-admin calls to the implementation even when the calldata matches proxy admin selectors such as `upgradeTo` and `upgradeToAndCall`. If the live implementation at `0xcd2cd343cfbe284220677c78a08b1648bfa39865` also exposes those selectors (for example via UUPS-style upgrade functions), non-admin callers can reach implementation-defined upgrade logic through the proxy instead of being constrained to the proxy admin path. The implementation source is not present in this bundle, so exploitability cannot be confirmed here.
+
+**Impact:** If the implementation behind this transparent proxy exposes a misconfigured or weaker upgrade entrypoint, an attacker could bypass the intended `ProxyAdmin`-only control plane, replace the implementation, and then steal funds, seize privileged behavior, or brick the protocol.
+
+**Paths:**
+
+- Attacker calls `upgradeTo(attackerImpl)` or `upgradeToAndCall(attackerImpl, data)` on the transparent proxy from a non-admin address
+
+- `TransparentUpgradeableProxy.ifAdmin()` routes the call into `_fallback()` instead of executing the proxy's admin-only branch
+
+- The proxy delegates the call to the current implementation at `0xcd2cd343cfbe284220677c78a08b1648bfa39865`
+
+- If that implementation defines matching upgrade selectors, its own authorization logic—not `ProxyAdmin` ownership—decides whether the upgrade succeeds
+
+*Round 1 | Agents: codex_1*
+
+---

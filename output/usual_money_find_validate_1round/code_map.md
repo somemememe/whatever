@@ -1,0 +1,52 @@
+# Scope
+
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/access/Ownable.sol (100 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/interfaces/IERC1967.sol (24 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Proxy.sol (40 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Utils.sol (193 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/Proxy.sol (69 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/beacon/IBeacon.sol (16 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/transparent/ProxyAdmin.sol (45 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/proxy/transparent/TransparentUpgradeableProxy.sol (116 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/utils/Address.sol (159 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/utils/Context.sol (28 LOC) — TODO
+- 0x35d8949372d46b7a3d5a56006ae77b215fc69bc0/lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol (135 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/access/IAccessControl.sol (98 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/access/extensions/IAccessControlDefaultAdminRules.sol (192 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/interfaces/IERC5267.sol (28 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/interfaces/draft-IERC6093.sol (161 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol (79 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol (26 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Permit.sol (90 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol (118 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/Address.sol (159 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/Strings.sol (94 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/cryptography/ECDSA.sol (174 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/cryptography/MessageHashUtils.sol (86 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/math/Math.sol (415 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts/contracts/utils/math/SignedMath.sol (43 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/proxy/utils/Initializable.sol (228 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/ERC20Upgradeable.sol (341 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/extensions/ERC20PausableUpgradeable.sol (40 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/token/ERC20/extensions/ERC20PermitUpgradeable.sol (88 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/utils/ContextUpgradeable.sol (34 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/utils/NoncesUpgradeable.sol (66 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/utils/PausableUpgradeable.sol (140 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/utils/ReentrancyGuardUpgradeable.sol (105 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/lib/openzeppelin-contracts-upgradeable/contracts/utils/cryptography/EIP712Upgradeable.sol (210 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/constants.sol (249 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/errors.sol (142 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/IDaoCollateral.sol (259 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/registry/IRegistryAccess.sol (18 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/registry/IRegistryContract.sol (28 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IRTUsd0.sol (32 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IUsd0.sol (62 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IUsd0PP.sol (235 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IUsual.sol (63 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol (597 LOC) — TODO
+- 0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/utils/CheckAccessControl.sol (19 LOC) — TODO
+
+# Notes
+
+- Auto-generated file-level map.
+- Descriptions are placeholders and can be edited later.

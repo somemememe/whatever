@@ -1,0 +1,25 @@
+# Global Audit Memory
+
+## Scope Touched
+- `src/protocol/pair/ResupplyPairCore.sol` / `src/protocol/ResupplyPair.sol` — enduring audit center for borrow/collateral/liquidation/redemption/repayment accounting, debt-share lifecycle, fee paths, external handler + swapper settlement, Convex transitions, and solvency enforcement around exchange-rate refreshes
+- Convex collateral management in `src/protocol/ResupplyPair.sol` — persistent risk surface around credited collateral vs actual asset location, plus pool/pid compatibility and migration/state-transition safety
+- Oracle and rate-calculator integration around pair refresh/admin paths — protocol-wide dependency for price normalization, inversion/decimals handling, freshness/sanity assumptions, zero-price availability, and invalid dependency addresses
+- `src/protocol/RewardDistributorMultiEpoch.sol` with `src/dependencies/EpochTracker.sol` — recurring liveness/accounting boundary around checkpoint/integral/claim behavior, reward invalidation, and epoch-length assumptions that affect fee/reward withdrawals
+- `src/protocol/WriteOffToken.sol` plus redemption/writeoff flows — durable dependency where token validity or borrower writeoff state affects loss attribution, debt-offset behavior, and remaining-collateral accounting
+- `src/interfaces/ICore.sol`, `src/dependencies/CoreOwnable.sol`, `src/libraries/VaultAccount.sol`, `src/interfaces/*`, and initialization/admin setters — supporting governance/configuration surface for max-LTV, fee and minimum-borrow parameters, oracle/rate-calculator wiring, and constructor/runtime invariants
+
+## Issue Directions Seen
+- Configuration and initialization enforcement is a firmly recurring direction: unsafe parameter values, invalid module addresses, bad epoch settings, or mismatched Convex pool identifiers can overcharge, brick, or misconfigure core operation
+- Oracle math and refresh behavior remain central: decimal mismatches, inversion logic, weak freshness/sanity assumptions, stale cached rates across multi-step flows, zero-price availability, and bad dependency addresses can break solvency guarantees
+- Internal accounting vs real asset state is still the strongest recurring theme, especially where redemptions, writeoffs, migrations, fees, or external integrations let balances diverge from recoverable collateral
+- Debt/interest accrual and debt-share lifecycle remain live: boundary behavior near caps, full-redemption/reset cleanup, and borrow-parameter constraints can understate debt growth or trap borrowers in unhealthy states
+- Redemption/writeoff accounting remains a cross-round direction: borrower writeoff handling, skipped-loss tracking, debt-offset mechanics, and writeoff-token state can misallocate losses or misstate remaining collateral
+- Reward/fee distribution remains a recurring secondary direction: zero-share/integral edge cases, reward invalidation, misbehaving reward tokens, or bad epoch configuration can strand balances or break checkpointing/claims
+
+## Useful Context
+- The stable audit picture still radiates from `ResupplyPairCore` plus the wrapper pair contract; external modules mostly amplify mistakes in accounting, pricing, liveness, or configuration validation
+- A repeated cross-round pattern is state drift: internal debt, share, collateral, reward, or writeoff state can advance in ways that do not cleanly match attributable debt, withdrawable value, or recoverable assets
+- External-call sequences are a durable stress point: leverage/repay/swapper-assisted paths can validate safety using pre-call snapshots while asset composition or oracle state changes before final settlement
+- Redemption is a recurring desynchronization point, not just a settlement path; borrower-specific writeoff state, debt-offset logic, reward-side behavior, handler mediation, and global debt/share cleanup can interact unexpectedly
+- Governance/admin surfaces deserve the same scrutiny as arithmetic paths because constructor-time settings and live setters have repeatedly appeared able to evade safety assumptions or install bricking states
+- Safe-parameter bounds remain a protocol theme: minimum borrow thresholds, epoch length, Convex pool selection, and related limits materially shape whether positions remain operable and accurately accounted for

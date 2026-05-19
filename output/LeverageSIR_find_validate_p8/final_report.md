@@ -1,0 +1,55 @@
+# Audit Report
+
+**Total findings:** 3
+
+## Critical (3)
+
+### F-001: Funded vault can be initialized by anyone with attacker-chosen market parameters
+
+**Confidence:** high | **Locations:** `LeverageSIR.sol:52, LeverageSIR.sol:60, LeverageSIR.sol:74, LeverageSIR.sol:85`
+
+The PoC successfully creates an attacker-controlled market around two fake tokens, manipulates that market, and then calls `vault.initialize` on the live vault with those attacker-chosen token addresses and leverage tier. Because the call succeeds against the funded vault, the vault's initial market configuration is effectively permissionless and can be set to arbitrary assets chosen by the attacker.
+
+**Impact:** An attacker can take over an uninitialized funded vault's market configuration, point it at worthless or malicious tokens, and corrupt all downstream pricing, accounting, and callback logic. This opens the door to full theft of assets already sitting in the vault.
+
+**Paths:**
+
+- Deploy attacker-controlled debt/collateral tokens -> create and skew a Uniswap V3 pool for them -> call `vault.initialize(attackerDebt, attackerCollateral, 0)` on the funded vault -> continue into mint/callback flows that drain real assets
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-002: Attacker-controlled token return data is reused as privileged transient callback state
+
+**Confidence:** medium | **Locations:** `LeverageSIR.sol:91, LeverageSIR.sol:92, LeverageSIR.sol:103, LeverageSIR.sol:202, LeverageSIR.sol:211`
+
+During `vault.mint`, the malicious collateral token's `mint()` implementation returns an arbitrary `amount` equal to `uint160(address(this))`. The exploit then relies on that value being promoted into privileged transient state (`SLOT 1` per the PoC comments), and proves control by deploying code at the exact address encoded by that value via CREATE2 before using that newly installed contract in the next phase. This indicates untrusted external return data is being interpreted as an internal authority or callback address.
+
+**Impact:** A malicious token can forge the transient identity the vault later trusts for privileged execution. Once that authority is poisoned, the attacker can install code at the chosen address and use the vault's own internal callback/settlement paths to move funds out.
+
+**Paths:**
+
+- Call `vault.mint(...)` with a malicious collateral token -> token `mint()` returns attacker-chosen integer data -> vault stores that value as transient privileged state -> attacker deploys code at the corresponding CREATE2 address -> attacker uses the forged authority in subsequent drain steps
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-003: `uniswapV3SwapCallback` can be driven with crafted data to drain arbitrary vault-held tokens
+
+**Confidence:** high | **Locations:** `LeverageSIR.sol:121, LeverageSIR.sol:123, LeverageSIR.sol:135, LeverageSIR.sol:146, LeverageSIR.sol:148, LeverageSIR.sol:160`
+
+After the transient-state poisoning step, the attacker directly calls `vault.uniswapV3SwapCallback` with self-crafted callback data and arbitrary positive deltas, and the vault pays out its WBTC and WETH balances. The callback data embeds the settlement token address, and the PoC swaps only that field to pivot the same primitive from USDC to WBTC and WETH. This shows callback execution is not rigidly bound to the canonical Uniswap V3 pool and vault token pair, but instead can be steered by attacker-controlled calldata once the expected callback context is forged.
+
+**Impact:** An attacker can make the vault settle swaps that never occurred and exfiltrate any ERC20 balance held by the vault, not just the configured debt/collateral pair. In the demonstrated exploit this is enough to drain the vault's remaining WBTC and WETH.
+
+**Paths:**
+
+- Poison the vault's expected callback authority -> craft callback payload naming WBTC as the settlement token -> call `uniswapV3SwapCallback(0, int256(wbtcBal), data)` -> vault transfers out WBTC
+
+- Repeat with WETH encoded in the callback data -> call `uniswapV3SwapCallback(0, int256(wethBal), data)` -> vault transfers out WETH
+
+*Round 1 | Agents: codex*
+
+---

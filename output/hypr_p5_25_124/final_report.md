@@ -1,0 +1,69 @@
+# Audit Report
+
+**Total findings:** 3
+
+## Critical (1)
+
+### F-001: L1StandardBridge can be reinitialized repeatedly to replace the trusted messenger and seize bridge funds
+
+**Confidence:** high | **Locations:** `0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/L1/L1StandardBridge.sol:81, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/L1/L1StandardBridge.sol:90, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/lib/openzeppelin-contracts/contracts/proxy/utils/Initializable.sol:62, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:109`
+
+`initialize()` is protected by `reinitializer(2)`, but its preceding `clearLegacySlot` modifier unconditionally executes `sstore(0, 0)`. In this inheritance layout, OpenZeppelin `Initializable` stores `_initialized` and `_initializing` in slot 0, so every call resets the initialization guard before the reinitializer check runs. Any caller can therefore invoke `initialize()` again and overwrite `messenger` with an attacker-controlled contract.
+
+**Impact:** Once `messenger` is replaced, the attacker can satisfy `onlyOtherBridge` with a fake messenger that reports `OTHER_BRIDGE` as `xDomainMessageSender()`. That lets the attacker call `finalizeETHWithdrawal` and `finalizeERC20Withdrawal` to release arbitrary ETH and escrowed ERC20s from the bridge, resulting in full bridge takeover and fund drain.
+
+**Paths:**
+
+- Call `L1StandardBridge.initialize(attackerMessenger)` after deployment; `clearLegacySlot` zeroes slot 0, allowing `reinitializer(2)` to pass again and store the attacker messenger.
+
+- Have `attackerMessenger.xDomainMessageSender()` return `address(OTHER_BRIDGE)` and call `finalizeETHWithdrawal(...)` or `finalizeERC20Withdrawal(...)` from `attackerMessenger`.
+
+- `onlyOtherBridge` now accepts the forged call because it only checks `msg.sender == address(messenger)` and `messenger.xDomainMessageSender() == address(OTHER_BRIDGE)`, so escrowed funds can be withdrawn to attacker-chosen recipients.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (1)
+
+### F-002: ERC20 deposits over-credit fee-on-transfer and deflationary tokens, creating insolvent bridge accounting
+
+**Confidence:** high | **Locations:** `0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:280, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:281, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:347, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:348`
+
+For non-mintable tokens, `_initiateBridgeERC20` calls `safeTransferFrom(_from, address(this), _amount)` and then blindly increments `deposits[_localToken][_remoteToken]` by `_amount`. The bridge never measures how many tokens actually arrived, so fee-on-transfer, burn-on-transfer, or otherwise deflationary tokens can leave the bridge holding less than the amount credited and bridged to the remote chain.
+
+**Impact:** The token pair becomes undercollateralized. The remote chain can mint or account for the full nominal deposit while the local bridge only holds the post-fee amount, so later withdrawals eventually fail once redemptions exceed real escrow. Users are left with unredeemable bridged assets and the pair becomes insolvent.
+
+**Paths:**
+
+- Deposit a token with transfer fees or burn mechanics for nominal amount `N`; the bridge receives only `N - fee` but records `deposits += N` and sends a cross-chain message for `N`.
+
+- The remote bridge finalizes the deposit for the full `N`, creating `N` units of bridged supply backed by less than `N` real tokens.
+
+- When withdrawals return, `finalizeBridgeERC20` attempts to release the full recorded amount from escrow and starts reverting once the shortfall is reached, permanently stranding some holders.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## Medium (1)
+
+### F-003: Unsupported mutable-balance or blocklist-controlled ERC20s can permanently lock bridged withdrawals
+
+**Confidence:** high | **Locations:** `0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/L1/L1StandardBridge.sol:16, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:42, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:280, 0xe468b43b4ae4d750cd6a5d7edacc1a751302c99c/src/universal/StandardBridge.sol:281`
+
+The bridge permissionlessly accepts arbitrary ERC20s but assumes the escrowed balance remains intact and transferable until withdrawal. For tokens with negative rebases, confiscation hooks, blocklists, allowlists, or similar admin-controlled transfer restrictions, the bridge's actual token balance or transferability can change after deposit while the bridge still treats the nominal deposit as withdrawable.
+
+**Impact:** Withdrawals for the affected token pair can become permanently unfinalizable because `finalizeBridgeERC20` will keep reverting when the bridge no longer has enough balance or the token refuses transfers from/to the relevant addresses. This strands escrowed value and leaves corresponding bridged supply unredeemable.
+
+**Paths:**
+
+- Users bridge a token whose issuer can rebase balances, confiscate funds, or blocklist addresses; the bridge records the nominal deposit.
+
+- After deposit, the token reduces the bridge balance or blocks transfers involving the bridge or recipient.
+
+- A later withdrawal reaches `finalizeBridgeERC20`, and the token transfer keeps reverting because the escrow is no longer available or transferable, so the message cannot complete and funds remain stuck.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---

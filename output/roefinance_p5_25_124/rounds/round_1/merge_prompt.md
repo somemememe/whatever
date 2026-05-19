@@ -1,0 +1,173 @@
+Below are findings and vulnerability signals from 2 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex_1
+```
+[
+  {
+    "id": "F-001",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Whitelisted position managers can steal collateral from any healthy user via the `tx.origin` bypass",
+    "locations": [
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:482",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:487",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:488",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:499",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/tokenization/AToken.sol:191",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/tokenization/AToken.sol:198"
+    ],
+    "claim": "`PMTransfer` skips the health-factor check whenever `tx.origin == user`, so any whitelisted PM contract can ask a user to call it once and then confiscate arbitrary aTokens from that user without approval or liquidation checks.",
+    "impact": "A compromised or malicious whitelisted PM can drain a healthy user’s collateral and later withdraw the underlying, causing direct user fund loss. Because the transfer path uses `transferOnLiquidation`, the usual aToken transfer safety checks are bypassed.",
+    "paths": [
+      "Pool admin whitelists a PM contract with `PMSet`.",
+      "Victim directly calls that PM contract for any reason, making `tx.origin == victim`.",
+      "The PM calls `LendingPool.PMTransfer(aToken, victim, amount)`.",
+      "The PM receives the victim’s aTokens and withdraws the underlying assets."
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Soft-liquidation PMs can seize unlimited collateral without repaying debt, creating bad debt",
+    "locations": [
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:488",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:497",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:499",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/tokenization/AToken.sol:191",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/tokenization/AToken.sol:198",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/libraries/logic/ValidationLogic.sol:447"
+    ],
+    "claim": "Even when `tx.origin != user`, `PMTransfer` only checks that the user is near the soft-liquidation threshold; it never limits `amount`, never requires any debt repayment, and uses `transferOnLiquidation` to bypass the normal post-transfer health-factor validation.",
+    "impact": "Any whitelisted PM can strip most or all collateral from a soft-liquidatable account while leaving its debt untouched, pushing the account deep underwater and externalizing losses to the protocol. This turns the PM role into an unbounded collateral seizure primitive rather than a constrained unwind mechanism.",
+    "paths": [
+      "A user’s health factor falls below `softLiquidationThreshold` but remains above 1.",
+      "A whitelisted PM calls `PMTransfer` for an arbitrary large amount.",
+      "The PM receives the user’s aTokens without repaying any debt.",
+      "The PM withdraws the collateral, leaving the user undercollateralized and the protocol exposed to bad debt."
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "A zero oracle price makes a reserve borrowable for free",
+    "locations": [
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/misc/AaveOracle.sol:88",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/misc/AaveOracle.sol:93",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/misc/AaveOracle.sol:100",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:963",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/libraries/logic/ValidationLogic.sol:176",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/libraries/logic/ValidationLogic.sol:180"
+    ],
+    "claim": "`AaveOracle.getAssetPrice` can return `0` for a listed asset when no source is set or the fallback oracle returns `0`, and `_executeBorrow` feeds that value directly into borrow validation; this makes `amountInETH` and the required collateral for that borrowed asset equal to zero.",
+    "impact": "If any listed borrowable reserve resolves to a zero price, an attacker can borrow its entire available liquidity while the protocol records no incremental debt value, resulting in immediate reserve drain and protocol insolvency.",
+    "paths": [
+      "A listed reserve has no active oracle source, or both primary and fallback oracles return `0`.",
+      "An attacker supplies minimal valid collateral in another asset.",
+      "The attacker borrows the zero-priced asset; `amountInETH` becomes `0`.",
+      "Borrow validation passes and the attacker drains the reserve."
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Oracle staleness is ignored, so frozen Chainlink prices can be used to overborrow or evade liquidation",
+    "locations": [
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/interfaces/IChainlinkAggregator.sol:5",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/interfaces/IChainlinkAggregator.sol:7",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/misc/AaveOracle.sol:96",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/lendingpool/LendingPool.sol:961",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/libraries/logic/GenericLogic.sol:186",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/protocol/libraries/logic/GenericLogic.sol:200"
+    ],
+    "claim": "The oracle only reads `latestAnswer()` and never checks `latestTimestamp()` or any round-completeness signal before that price is used in collateral, debt, borrow, and liquidation calculations.",
+    "impact": "If a Chainlink feed halts on an inflated collateral price or a deflated debt price, attackers can overborrow against stale valuations and leave the protocol with uncollectible bad debt until governance intervenes. The same stale pricing can also suppress liquidations that should happen.",
+    "paths": [
+      "A feed stops updating but keeps its last favorable price.",
+      "The oracle still returns that stale price because only `latestAnswer()` is read.",
+      "Borrow and health-factor calculations continue to trust the frozen valuation.",
+      "An attacker overborrows or avoids liquidation using stale prices."
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Same-asset flash liquidations can revert because leftover flash-loan principal is paid out to the liquidator",
+    "locations": [
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:120",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:123",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:126",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:150",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:155",
+      "onchain_auto/0x574ff39184dee9e46f6c3229b95e0e0938e398d0/contracts/adapters/FlashLiquidationAdapter.sol:159"
+    ],
+    "claim": "When `collateralAsset == borrowedAsset`, the adapter assumes the whole flash-loaned amount was consumed by `liquidationCall` and sets `remainingTokens = diffCollateralBalance - premium`, even though `liquidationCall` may repay less than `flashBorrowedAmount` because of close-factor caps or smaller actual debt.",
+    "impact": "If the liquidator flash-borrows more than the debt that is actually repaid, the adapter transfers part of the flash-loan principal to `initiator` and then cannot return the full flash-loan debt. Same-asset liquidations through this adapter therefore become spuriously unexecutable in common capped-liquidation scenarios.",
+    "paths": [
+      "A caller requests a same-asset flash liquidation with `flashBorrowedAmount > actualDebtToLiquidate`.",
+      "The lending pool only consumes `actualDebtToLiquidate` during `liquidationCall`.",
+      "The adapter computes leftovers only from seized collateral and transfers them to the initiator.",
+      "The contract no longer holds enough tokens to settle `flashBorrowedAmount + premium`, so the flash loan reverts."
+    ]
+  }
+]
+
+```
+
+### Agent: opencode_1
+```
+<invoke name="bash">
+<parameter name="command">ls -la /Users/zhanglongqin/AuditHoundV2/cases/roefinance/src/onchain_auto/</parameter>
+<parameter name="description">List onchain_auto directory</parameter>
+</invoke>
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

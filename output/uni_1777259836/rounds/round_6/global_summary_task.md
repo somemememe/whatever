@@ -1,0 +1,75 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `FlawVerifier.sol` — dominant audit surface; `executeOnOpportunity()` remains the key path for execution control, external-call sequencing, unwrap behavior, and end-of-run profit gating
+- `FlawVerifier.sol` custody/accounting paths — repeated focus on trapped or misinterpreted value, especially native ETH/WETH already held by the contract and how balances are reused across runs
+- `FlawVerifier.sol` balance/profit checks — persistent hotspot; attention now includes both prefunded/donated balance contamination and the retained “ratcheting baseline” effect from trapped ETH profits across successive executions
+- `FlawVerifier.sol` external transfer/call segment (`_safeTransferFrom()` and surrounding flow) — examined as a possible balance-distortion surface, but not yet a retained issue
+- `FlawVerifier.sol` hardcoded exploit flow / address assumptions — recurring review area around permissionless triggering, timing control, and fixed-counterparty coupling
+- `Counter.sol` — lightly revisited for unrestricted mutability/integrity concerns, but remains a secondary and underexplored surface
+
+## Issue Directions Seen
+- Value custody and accounting is the clearest cross-round theme, spanning trapped funds, stray ERC20/native assets, and profit inference from raw balances
+- Denial-of-service or griefing via balance-dependent execution/profit checks remains a durable direction
+- Profit-gating in `FlawVerifier.sol` is vulnerable to balance contamination, including pre-existing assets being mistaken for fresh profit and historical profits skewing future eligibility
+- Retained direction: trapped ETH profits can accumulate into a rising internal baseline, eventually causing otherwise-profitable future runs to fail
+- Permissionless triggering/front-running of the hardcoded execution path remains a standing direction tied to loss of operator timing control
+- Hardcoded external-address trust and environment coupling continues to look suspicious, though chain-mismatch/inoperability concerns have not matured into retained issues
+- `Counter.sol` public mutability/authorization concerns recur intermittently but remain low-confidence due to limited depth
+
+## Useful Context
+- Cross-round attention is still overwhelmingly concentrated in `FlawVerifier.sol`, especially `executeOnOpportunity()` and the unwrap-plus-final-balance-check path
+- The most stable risk pattern is the contract’s reliance on balance deltas as a proxy for successful execution, both within a single transaction and across repeated runs
+- Review threads increasingly connect custody, profitability checks, and long-lived contract state: retained profits are not neutral bookkeeping, but part of the future execution condition
+- The `_safeTransferFrom()` / external-call portion has been treated more as a hypothesis-generation area than a confirmed bug source
+- `Counter.sol` remains only lightly covered, so absence of retained issues there still reflects limited audit attention rather than strong assurance
+
+
+## Latest Round Summary
+# Round 6 Summary
+
+## Agent: codex
+- files touched: `FlawVerifier.sol`, `Counter.sol`
+- files revisited / highest-attention files: primary attention on `FlawVerifier.sol`; `Counter.sol` received a brief secondary review
+- main issue directions investigated: state-changing flow tracing; edge-case trust assumptions around hardcoded external addresses / chain context in `FlawVerifier.sol`; unrestricted public state mutation in `Counter.sol`
+- promising but not retained directions: proposed a low-confidence issue around mainnet-only hardcoded dependencies in `FlawVerifier.sol`; proposed unrestricted mutability of `Counter.number` as a low-severity integrity issue
+
+## Cross-Agent Status
+- main overlap in file/area attention: only one agent log is present; attention centered on `FlawVerifier.sol` with a smaller pass over `Counter.sol`
+- notable differences in attention: no cross-agent differences are visible in this round
+- underexplored but suspicious files/functions if clearly supported by the logs: current logs show concentrated attention on `FlawVerifier.sol` external dependency assumptions, with no clearly supported additional hotspot called out separately
+
+## Retained Findings
+- None retained from this round after merge.
+
+
+Output only markdown.

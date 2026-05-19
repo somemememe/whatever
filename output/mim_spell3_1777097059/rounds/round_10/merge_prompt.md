@@ -1,0 +1,497 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "`cook()` solvency enforcement can be cleared by `ACTION_ACCRUE` or any unsupported action",
+    "locations": [
+      "cauldrons/CauldronV4.sol:369",
+      "cauldrons/CauldronV4.sol:456",
+      "cauldrons/CauldronV4.sol:488",
+      "cauldrons/CauldronV4.sol:527",
+      "cauldrons/CauldronV4.sol:538"
+    ],
+    "claim": "`cook()` sets `status.needsSolvencyCheck = true` after `ACTION_BORROW` and `ACTION_REMOVE_COLLATERAL`, but any unhandled action falls through to `_additionalCookAction()`. In `CauldronV4` that hook has an empty implementation and does not revert, yet `cook()` blindly replaces the current `status` with its return value. Because `ACTION_ACCRUE` is declared but never handled, and arbitrary unsupported action IDs also route there, a user can append one of those actions after borrowing or removing collateral to reset `needsSolvencyCheck` to `false` and skip the final insolvency check entirely.",
+    "impact": "An attacker can borrow MIM or withdraw collateral and finish the transaction undercollateralized, creating immediate bad debt and potentially draining the cauldron's available MIM.",
+    "paths": [
+      "Call `cook()` with `ACTION_BORROW` followed by `ACTION_ACCRUE`; the borrow succeeds, the empty hook returns a zeroed `CookStatus`, and the final solvency check is skipped.",
+      "Call `cook()` with `ACTION_REMOVE_COLLATERAL` followed by any unsupported action ID; collateral is removed, `needsSolvencyCheck` is cleared, and the transaction can end insolvent."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Cauldron hardcodes 18-decimal oracle precision and ignores `IOracle.decimals()`",
+    "locations": [
+      "interfaces/IOracle.sol:5",
+      "cauldrons/CauldronV4.sol:110",
+      "cauldrons/CauldronV4.sol:201",
+      "cauldrons/CauldronV4.sol:226",
+      "cauldrons/CauldronV4.sol:583"
+    ],
+    "claim": "The protocol exposes `IOracle.decimals()`, but CauldronV4 never reads or normalizes oracle output and instead assumes every rate is scaled by `EXCHANGE_RATE_PRECISION = 1e18`. If a cauldron is configured with any compatible oracle that reports rates at a different precision, all solvency checks and liquidation seize calculations are distorted by that scale mismatch.",
+    "impact": "A mis-scaled oracle can let users borrow far more MIM than intended or cause liquidations to seize materially too little collateral, leaving the protocol with large bad debt.",
+    "paths": [
+      "Deploy or initialize a cauldron with an oracle whose `get()` rate uses 8 decimals; `_isSolvent()` compares debt against a rate that is off by `1e10`, allowing undercollateralized borrowing.",
+      "Liquidations on the same market reuse the same bad scale in `liquidate()`, so even liquidators cannot recover enough collateral to cover the debt."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Critical",
+    "confidence": "medium",
+    "title": "Zero oracle rates are accepted and make any borrower with nonzero collateral appear solvent",
+    "locations": [
+      "cauldrons/CauldronV4.sol:158",
+      "cauldrons/CauldronV4.sol:201",
+      "cauldrons/CauldronV4.sol:227",
+      "cauldrons/CauldronV4.sol:230",
+      "cauldrons/CauldronV4.sol:578"
+    ],
+    "claim": "Neither `init()` nor `updateExchangeRate()` validates that the oracle returned success or that the returned rate is nonzero before storing or using it. If the cached `exchangeRate` becomes zero, `_isSolvent()` reduces the debt side of the solvency inequality to zero, so any account with positive collateral passes solvency checks, and `liquidate()` also stops treating those borrowers as insolvent.",
+    "impact": "During a zero-rate oracle event, users can post dust collateral, borrow out the cauldron's MIM, and remain effectively unliquidatable until a valid price is restored.",
+    "paths": [
+      "At initialization, `oracle.get()` can return `(false, 0)` or another zero rate and the clone stores `exchangeRate = 0` without reverting.",
+      "Later, a user borrows through `borrow()` or `cook(ACTION_BORROW, ...)`; the post-action solvency check uses the zero cached rate, so the position is accepted despite being deeply undercollateralized."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Oracle failures fall back to an unbounded stale price across borrowing, withdrawals, and liquidations",
+    "locations": [
+      "cauldrons/CauldronV4.sol:216",
+      "cauldrons/CauldronV4.sol:226",
+      "cauldrons/CauldronV4.sol:232",
+      "cauldrons/CauldronV4.sol:329",
+      "cauldrons/CauldronV4.sol:567"
+    ],
+    "claim": "`updateExchangeRate()` silently reuses the cached `exchangeRate` whenever `oracle.get()` reports `updated == false`, and there is no freshness bound on how old that cached price may be. The same fallback is consumed by the `solvent` modifier used for `borrow()` and `removeCollateral()`, as well as by `liquidate()`, so the market keeps operating indefinitely on stale pricing during oracle outages.",
+    "impact": "After a collateral price drop, borrowers can continue borrowing or withdraw collateral against an obsolete favorable price and leave bad debt; conversely, if the stale price is too low, healthy users can be liquidated unfairly.",
+    "paths": [
+      "The oracle stops updating after a sharp collateral selloff; `borrow()` still succeeds because the `solvent` modifier receives the old cached exchange rate from `updateExchangeRate()`.",
+      "During the same outage, `removeCollateral()` and `liquidate()` use that same stale rate, either blocking needed liquidations or liquidating solvent users depending on the stale price direction."
+    ],
+    "round": 1,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Permissionless `withdrawFees()` can send accrued fees to an unset `feeTo` address",
+    "locations": [
+      "cauldrons/CauldronV4.sol:633",
+      "cauldrons/CauldronV4.sol:635",
+      "cauldrons/CauldronV4.sol:638",
+      "cauldrons/CauldronV4.sol:647"
+    ],
+    "claim": "`withdrawFees()` is callable by anyone and never checks that `masterContract.feeTo()` is nonzero before transferring accrued MIM shares there. Because `feeTo` starts unset until the master owner configures it on the master contract, any caller can force fee withdrawal while the destination is still `address(0)`.",
+    "impact": "Accrued protocol fees can be irrecoverably misdirected before fee configuration, destroying revenue and reducing the cauldron's usable MIM liquidity by the amount withdrawn.",
+    "paths": [
+      "Allow interest or liquidation fees to accrue while the master contract's `feeTo` is still unset, then call `withdrawFees()` on a clone before the owner configures the recipient."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-006",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Stranded assets held directly by the cauldron can be drained through `cook(ACTION_CALL)`",
+    "locations": [
+      "cauldrons/CauldronV4.sol:427",
+      "cauldrons/CauldronV4.sol:444",
+      "cauldrons/CauldronV4.sol:446",
+      "cauldrons/CauldronV4.sol:465",
+      "cauldrons/CauldronV4.sol:510"
+    ],
+    "claim": "`cook()` exposes an arbitrary-call primitive whose only hard blacklist is the cauldron itself, BentoBox, and whatever addresses governance manually blacklists. `_call()` therefore lets any caller make the cauldron invoke arbitrary external contracts as the holder of whatever assets sit directly on the cauldron address. Because `cook()` is payable and never accounts for the caller's supplied ETH, and because direct ERC-20 transfers to the cauldron are also possible outside BentoBox, any native ETH or ERC-20 balances stranded on the cauldron can be permissionlessly swept out via `ACTION_CALL`.",
+    "impact": "Any assets accidentally left on the cauldron outside BentoBox become stealable by arbitrary users. This includes user overpayments to payable `cook()` calls, ETH force-sent via `selfdestruct`, and direct transfers of MIM, collateral, reward tokens, or other ERC-20s to the cauldron address.",
+    "paths": [
+      "Get ETH into the cauldron, for example by overpaying a prior payable `cook()` call or by force-sending ETH, then call `cook()` with `ACTION_CALL` targeting an attacker-controlled contract and set `values[i]` to the stranded ETH balance.",
+      "Accidentally transfer an ERC-20 directly to the cauldron address, then call `cook()` with `ACTION_CALL` targeting that token contract and calldata for `transfer(attacker, amount)` to sweep the balance out."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-008",
+    "severity": "High",
+    "confidence": "low",
+    "title": "Checkpoint-token reentrancy before state updates can corrupt privileged liquidation accounting",
+    "locations": [
+      "cauldrons/CauldronV4.sol:580",
+      "cauldrons/CauldronV4.sol:581",
+      "cauldrons/CauldronV4.sol:591",
+      "cauldrons/CauldronV4.sol:592",
+      "cauldrons/CauldronV4.sol:607",
+      "cauldrons/PrivilegedCheckpointCauldronV4.sol:23",
+      "cauldrons/PrivilegedCheckpointCauldronV4.sol:29"
+    ],
+    "claim": "`PrivilegedCheckpointCauldronV4` overrides `_beforeUserLiquidated()` to make an external `user_checkpoint()` call on the collateral token before `liquidate()` updates `userBorrowPart`, `userCollateralShare`, and global borrow totals. Because `liquidate()` caches `availableBorrowPart`, `borrowPart`, and `borrowAmount` before that hook and there is no reentrancy guard, a reentrant checkpoint token can liquidate the same user again against stale outer-call state.",
+    "impact": "A malicious or compromised checkpoint token can desynchronize per-user debt from `totalBorrow`, over-process liquidation state, or force liquidations to revert, causing bad debt or making insolvent accounts difficult to liquidate.",
+    "paths": [
+      "Use `PrivilegedCheckpointCauldronV4` with a collateral token whose `user_checkpoint()` reenters `liquidate()` on the same victim during the outer liquidation hook.",
+      "Have the reentrant liquidation process a smaller `borrowPart` first, then let the outer call resume with its stale cached `availableBorrowPart` and `borrowAmount`, causing inconsistent user and global accounting."
+    ],
+    "round": 2,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-009",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Privileged owner can force debt onto users and withdraw the backing MIM",
+    "locations": [
+      "cauldrons/PrivilegedCauldronV4.sol:15",
+      "cauldrons/CauldronV4.sol:654"
+    ],
+    "claim": "`PrivilegedCauldronV4.addBorrowPosition()` increases `totalBorrow` and a chosen user's `userBorrowPart` without transferring any MIM to that user, while `reduceSupply()` lets the same master owner withdraw the still-idle MIM balance from the cauldron. The owner can therefore convert a victim's remaining collateral headroom into owner-withdrawable MIM or later-liquidatable debt.",
+    "impact": "A privileged operator can saddle users with debt they never received, extract the corresponding MIM liquidity to themselves, and/or push victims into liquidation. This is a direct theft/backdoor vector, not merely a bookkeeping inconsistency.",
+    "paths": [
+      "The master owner calls `addBorrowPosition(victim, amount)` up to the victim's solvency limit.",
+      "Because `addBorrowPosition()` does not transfer MIM out, the cauldron still holds the same BentoBox MIM balance.",
+      "The owner then calls `reduceSupply(amount)` to withdraw that idle MIM to themselves, leaving the victim with debt but no proceeds.",
+      "Alternatively, the owner can wait for price movement or interest accrual and liquidate the victim against the fabricated debt."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-010",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Privileged debt injections accrue retroactive interest from before the debt existed",
+    "locations": [
+      "cauldrons/PrivilegedCauldronV4.sol:15",
+      "cauldrons/CauldronV4.sol:164"
+    ],
+    "claim": "`addBorrowPosition()` mutates `totalBorrow` without first calling `accrue()`. On the next `accrue()`, the full elapsed time since `lastAccrued` is applied to the newly added borrow amount as though that debt had existed for the entire interval.",
+    "impact": "Freshly assigned debt can be inflated immediately by past interest, unexpectedly overcharging users and potentially making them insolvent or liquidatable. Any migration or administrative flow that uses `addBorrowPosition()` can therefore mint more debt than intended.",
+    "paths": [
+      "Let time pass without calling `accrue()`.",
+      "The master owner calls `addBorrowPosition(user, amount)`.",
+      "The next `accrue()` charges elapsed-time interest on both the pre-existing debt and the newly inserted amount."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-011",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Public skim buckets let anyone steal non-atomic staged collateral or MIM",
+    "locations": [
+      "cauldrons/CauldronV4.sol:252",
+      "cauldrons/CauldronV4.sol:270",
+      "cauldrons/CauldronV4.sol:344"
+    ],
+    "claim": "The skim paths do not pull assets from a caller-scoped pending balance. `addCollateral(..., skim=true)` credits any excess collateral shares already sitting on the cauldron's BentoBox balance, and `_repay(..., skim=true)` pulls MIM from BentoBox's own shared holding bucket via `address(bentoBox)`. Any assets pre-positioned into those public buckets for a later second-step transaction can therefore be consumed by whichever caller gets there first.",
+    "impact": "Users or integrators that split a skim-based workflow across multiple transactions can lose staged collateral or MIM to front-runners, who can mint themselves collateral credit or repay their own debt with the victim's shares.",
+    "paths": [
+      "A user transfers collateral shares to the cauldron address in BentoBox and plans to call `addCollateral(..., true, share)` later; an attacker front-runs with `addCollateral(attacker, true, share)` and captures the staged collateral.",
+      "An integrator deposits MIM shares to BentoBox's shared holding bucket for a later `repay(..., true, part)`; an attacker calls `repay(attacker, true, part)` first and consumes that shared MIM balance to pay down their own debt."
+    ],
+    "round": 3,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-012",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Unbounded collateralization-rate updates can turn the market into free-borrow or mass-liquidation mode",
+    "locations": [
+      "cauldrons/CauldronV4.sol:192",
+      "cauldrons/CauldronV4.sol:204",
+      "cauldrons/CauldronV4.sol:705"
+    ],
+    "claim": "`setCollateralizationRate()` accepts arbitrary values, and `_isSolvent()` directly multiplies collateral by the raw `COLLATERIZATION_RATE` without checking that it stays below `COLLATERIZATION_RATE_PRECISION`. If the owner sets the rate above the precision denominator, accounts are credited with more collateral value than they actually have; if the owner sets it near zero, even conservatively collateralized borrowers fail solvency checks.",
+    "impact": "A single mistaken or compromised owner update can create an immediately exploitable market state: attackers can borrow far more MIM than intended while still passing solvency checks, or third parties can liquidate otherwise healthy users.",
+    "paths": [
+      "Owner sets `COLLATERIZATION_RATE` above `1e5`, a borrower posts modest collateral, and `_isSolvent()` overcredits that collateral enough to support draining the cauldron's idle MIM.",
+      "Owner sets `COLLATERIZATION_RATE` to `0` or a very small value, causing accounts with debt to fail solvency checks and become liquidatable despite previously healthy collateralization."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-013",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Missing interest-rate cap lets a single update brick `accrue()` and freeze core operations",
+    "locations": [
+      "cauldrons/CauldronV4.sol:104",
+      "cauldrons/CauldronV4.sol:180",
+      "cauldrons/CauldronV4.sol:662"
+    ],
+    "claim": "`changeInterestRate()` imposes no sanity bound even though `ONE_PERCENT_RATE` is defined. A sufficiently large `INTEREST_PER_SECOND` makes `extraAmount` exceed `uint128` in `accrue()`, causing the `.to128()` cast to revert. Because most core paths call `accrue()` first, that single configuration update can render the market unusable until governance intervenes.",
+    "impact": "Once `accrue()` starts reverting, `borrow()`, `repay()`, `removeCollateral()`, `liquidate()`, and `withdrawFees()` stop working, trapping positions and preventing liquidations. Even lower but extreme rates can still spike debt fast enough to trigger avoidable mass liquidations.",
+    "paths": [
+      "Owner sets an extreme `INTEREST_PER_SECOND`; the next `accrue()` overflows at `.to128()`, and every accrue-gated path reverts.",
+      "Owner sets a confiscatory but non-overflowing rate; debt jumps sharply before borrowers can react, allowing opportunistic liquidations."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-014",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "`reduceSupply()` can withdraw MIM that `withdrawFees()` still counts as earned protocol fees",
+    "locations": [
+      "cauldrons/CauldronV4.sol:633",
+      "cauldrons/CauldronV4.sol:636",
+      "cauldrons/CauldronV4.sol:637",
+      "cauldrons/CauldronV4.sol:638",
+      "cauldrons/CauldronV4.sol:654",
+      "cauldrons/CauldronV4.sol:655"
+    ],
+    "claim": "`reduceSupply()` computes its withdrawable amount from the cauldron's full BentoBox MIM balance and never reserves the shares implicitly backing `accrueInfo.feesEarned`, even though `withdrawFees()` later assumes those fees remain present on the cauldron. The master owner can therefore remove MIM that the accounting still considers owed to `feeTo`.",
+    "impact": "Accrued protocol revenue can be confiscated or made temporarily unwithdrawable. If `feeTo` is a treasury distinct from the owner, this is direct revenue theft; otherwise it still breaks fee accounting and can cause fee withdrawals to revert until new MIM flows back in.",
+    "paths": [
+      "Interest or liquidation fees accrue so `accrueInfo.feesEarned` grows.",
+      "Before `withdrawFees()` is called, the owner uses `reduceSupply()` to withdraw the cauldron's idle MIM balance, including the shares backing those accrued fees.",
+      "A later `withdrawFees()` attempts to transfer shares that are no longer present on the cauldron balance and either fails or pays less than accounting expected."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-017",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Unbounded liquidation-multiplier updates can brick liquidations or over-seize collateral",
+    "locations": [
+      "cauldrons/CauldronV4.sol:613",
+      "cauldrons/CauldronV4.sol:614",
+      "cauldrons/CauldronV4.sol:689"
+    ],
+    "claim": "`setLiquidationMultiplier()` accepts arbitrary values. `liquidate()` later assumes `LIQUIDATION_MULTIPLIER >= LIQUIDATION_MULTIPLIER_PRECISION` when it computes `distributionAmount = (allBorrowAmount * LIQUIDATION_MULTIPLIER / PRECISION).sub(allBorrowAmount) ...`; if the owner sets the multiplier below the precision denominator, this subtraction underflows and every liquidation reverts. Conversely, setting an excessively high multiplier inflates `collateralShare` linearly and can force liquidations to seize far more collateral than intended or revert on collateral underflow.",
+    "impact": "A single bad admin update can freeze liquidations during insolvency events, allowing bad debt to accumulate, or can make liquidations confiscatory and externally exploitable against borrowers.",
+    "paths": [
+      "Owner sets `LIQUIDATION_MULTIPLIER` below `1e5`; the next `liquidate()` underflows when computing `distributionAmount`, so insolvent accounts cannot be liquidated.",
+      "Owner sets `LIQUIDATION_MULTIPLIER` extremely high; liquidators can seize disproportionately large collateral amounts from borrowers, or liquidation attempts revert because the computed collateral exceeds user balances."
+    ],
+    "round": 4,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-018",
+    "severity": "High",
+    "confidence": "high",
+    "title": "A reverting oracle hard-freezes borrowing, collateral withdrawals, and liquidations",
+    "locations": [
+      "cauldrons/CauldronV4.sol:218",
+      "cauldrons/CauldronV4.sol:226",
+      "cauldrons/CauldronV4.sol:539",
+      "cauldrons/CauldronV4.sol:567"
+    ],
+    "claim": "`updateExchangeRate()` makes a raw external call to `oracle.get(oracleData)` without any `try/catch`, so an oracle revert bubbles into every path that relies on a fresh solvency or liquidation price. This also contradicts `liquidate()`'s inline assumption that liquidations should still be allowed when the oracle fails.",
+    "impact": "Any oracle-side revert—whether from a broken feed, transient upstream outage, or a malicious oracle implementation—blocks `borrow()`, `removeCollateral()`, `cook()` flows that reach the final solvency check, and `liquidate()`. Users can be trapped in the market while insolvent accounts remain unliquidatable and bad debt accumulates.",
+    "paths": [
+      "`removeCollateral()` finishes its state changes, then the `solvent` modifier calls `updateExchangeRate()`, and an oracle revert aborts the transaction.",
+      "`borrow()` or `cook()` with borrow/remove-collateral reaches the post-action solvency check, where `updateExchangeRate()` reverts.",
+      "`liquidate()` begins by calling `updateExchangeRate()`, so any oracle revert prevents liquidations entirely."
+    ],
+    "round": 5,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-021",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Missing borrow-opening-fee cap can make new borrows confiscatory or unborrowable",
+    "locations": [
+      "cauldrons/CauldronV4.sol:304",
+      "cauldrons/CauldronV4.sol:305",
+      "cauldrons/CauldronV4.sol:697"
+    ],
+    "claim": "`setBorrowOpeningFee()` accepts arbitrary values, and `_borrow()` directly adds `amount * BORROW_OPENING_FEE / BORROW_OPENING_FEE_PRECISION` onto the user's debt without any sanity bound that keeps the fee at or below 100% or any other expected limit. A mis-set or maliciously set fee therefore scales debt linearly with no cap.",
+    "impact": "A single owner update can make every new borrow immediately owe far more than the amount received, pushing users into near-instant insolvency or causing all new borrowing to fail the post-borrow solvency check. This can effectively freeze borrowing or create confiscatory debt terms exploitable against unsuspecting users.",
+    "paths": [
+      "Owner sets `BORROW_OPENING_FEE` above `1e5`; a borrower requests `amount`, receives only `amount`, but `_borrow()` books debt for `amount + feeAmount`, which can exceed the user's remaining collateral headroom.",
+      "Owner sets an extreme borrow-opening fee; subsequent `borrow()` and `cook(ACTION_BORROW, ...)` calls revert at the final solvency check for ordinary users, effectively disabling new borrowing."
+    ],
+    "round": 5,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-022",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Deeply underwater positions become permanently unliquidatable and leave irrecoverable bad debt",
+    "locations": [
+      "cauldrons/CauldronV4.sol:584",
+      "cauldrons/CauldronV4.sol:593"
+    ],
+    "claim": "`liquidate()` computes the collateral to seize from the requested `borrowPart` and then blindly subtracts that `collateralShare` from `userCollateralShare[user]` without capping it to the borrower's remaining collateral. Once a position is so underwater that the required collateral exceeds the collateral left on the account, the subtraction reverts instead of seizing all remaining collateral and recognizing the shortfall.",
+    "impact": "After sufficiently adverse price moves, borrowers can be left with positive debt that no liquidator can clear through the protocol's liquidation path. That bad debt remains embedded in `totalBorrow`, can render the market insolvent, and any liquidation batch that includes such an account reverts wholesale.",
+    "paths": [
+      "A user borrows near the limit and the collateral price later falls sharply.",
+      "Liquidators partially liquidate until the remaining debt still outstanding would require more collateral than the user has left.",
+      "The next liquidation attempt reaches `userCollateralShare[user].sub(collateralShare)` with `collateralShare > userCollateralShare[user]` and reverts.",
+      "The account keeps residual `userBorrowPart` that cannot be fully cleaned up through `liquidate()`."
+    ],
+    "round": 6,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-024",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "Fee withdrawals can permanently discard protocol fees through round-down dust",
+    "locations": [
+      "cauldrons/CauldronV4.sol:636",
+      "cauldrons/CauldronV4.sol:637",
+      "cauldrons/CauldronV4.sol:639"
+    ],
+    "claim": "`withdrawFees()` converts `accrueInfo.feesEarned` from amount to BentoBox share with `roundUp = false`, transfers only the rounded-down share amount, and then unconditionally zeroes `accrueInfo.feesEarned`. Any earned amount smaller than one share, or any non-share-aligned remainder, is therefore dropped from accounting instead of being carried forward to a later withdrawal.",
+    "impact": "Permissionless callers can repeatedly crystallize and erase fee dust, causing small but permanent protocol revenue loss whenever BentoBox share accounting is not exactly 1:1 with token amounts.",
+    "paths": [
+      "Fees accrue to an amount that is not an exact multiple of one BentoBox share.",
+      "A caller invokes `withdrawFees()` before enough additional fees arrive to bridge the remainder.",
+      "`toShare(..., false)` rounds the transfer down, but `feesEarned` is reset to zero, so the omitted dust is no longer claimable by `feeTo`."
+    ],
+    "round": 6,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-025",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Batch liquidations can undercharge repeated partial liquidations through duplicate-user round-down",
+    "locations": [
+      "cauldrons/CauldronV4.sol:576",
+      "cauldrons/CauldronV4.sol:583",
+      "cauldrons/CauldronV4.sol:607"
+    ],
+    "claim": "`liquidate()` does not enforce unique `users` entries and computes each slice's `borrowAmount` with `totalBorrow.toElastic(borrowPart, false)` and each slice's `collateralShare` with `toBase(..., false)` before any aggregate total is applied back to `totalBorrow`. Repeating the same insolvent account across many small `maxBorrowPart` entries accumulates floor-rounding error, so the batch can clear more `borrowPart` than the summed MIM repayment and collateral seizure should allow.",
+    "impact": "An insolvent borrower can self-liquidate in many tiny slices to retire debt while retaining excess collateral. The underpayment per slice is individually dust-sized, but it compounds across a large batch and can become material when collateral share value is high.",
+    "paths": [
+      "A borrower becomes liquidatable.",
+      "The liquidator submits `liquidate()` with the same borrower repeated many times and tiny `maxBorrowPart` values.",
+      "Each iteration rounds `borrowAmount` and `collateralShare` down against the same pre-update totals, then `totalBorrow` is only reduced once at the end of the loop."
+    ],
+    "round": 8,
+    "source_agents": [
+      "codex"
+    ]
+  },
+  {
+    "id": "F-026",
+    "severity": "High",
+    "confidence": "low",
+    "title": "Fresh clones are first-caller-wins because `init()` has no authorized initializer",
+    "locations": [
+      "cauldrons/CauldronV4.sol:146"
+    ],
+    "claim": "`init()` is `public` and only checks that `collateral` is still unset, while `onlyClones` merely verifies the call is hitting a clone rather than the master. Any first caller on a newly deployed but uninitialized clone can permanently choose the collateral token, oracle, oracle data, interest rate, liquidation multiplier, collateralization rate, and borrow opening fee.",
+    "impact": "If deployment and initialization are ever separated, observable, or retried, an attacker can frontrun market creation and permanently install malicious parameters. That can brick the market immediately or route later activity through attacker-controlled oracle and risk settings.",
+    "paths": [
+      "A clone is deployed but not initialized atomically.",
+      "An attacker calls `init()` first with malicious parameters.",
+      "The intended deployer can no longer recover the clone because subsequent `init()` calls revert as already initialized."
+    ],
+    "round": 8,
+    "source_agents": [
+      "codex"
+    ]
+  }
+]
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

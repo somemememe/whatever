@@ -1,0 +1,143 @@
+# Audit Report
+
+**Total findings:** 6
+
+## High (3)
+
+### F-001: Redemption write-off shortfalls are silently discarded on undercollateralized borrowers
+
+**Confidence:** medium | **Locations:** `0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:162, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:225, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:599, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:604, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:610, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:906, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:965`
+
+`redeemCollateral()` removes real collateral from the pair immediately and only mints non-claimable `redemptionWriteOff` rewards to socialize that loss later. When a borrower is eventually synced, `_syncUserRedemptions()` converts their accrued write-off into a collateral deduction but caps the result at zero. If a borrower has less remaining collateral than the write-off allocated to their borrow shares, the uncovered portion is simply erased instead of being preserved as bad debt or charged elsewhere.
+
+**Impact:** After a redemption against a pool that already contains undercollateralized borrowers, aggregate user collateral accounting can stay above the pair's real collateral balance. That accounting hole lets earlier withdrawers/liquidations consume collateral that should have absorbed the missing write-off, pushing losses onto later users or protocol insurance and creating hidden insolvency.
+
+**Paths:**
+
+- A borrower becomes undercollateralized before liquidation, so their `_userCollateralBalance` is already smaller than the collateral haircut implied by their debt share.
+
+- A redemption executes and transfers collateral out of the pair, then mints `redemptionWriteOff` instead of debiting each borrower inline.
+
+- When the undercollateralized borrower is later checkpointed, `_calcRewardIntegral()` allocates write-off rewards by borrow shares and `_syncUserRedemptions()` computes `rTokens`.
+
+- If `rTokens` exceeds that account's remaining collateral, `_userCollateralBalance` is floored to zero and the excess write-off disappears.
+
+- The pair's summed user collateral balances now exceed actual collateral by the discarded amount, enabling over-withdrawal until the shortfall surfaces as protocol bad debt.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-004: Convex pool migration can hide live collateral and freeze withdrawals/redemptions
+
+**Confidence:** high | **Locations:** `onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/ResupplyPair.sol:382, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/ResupplyPair.sol:399, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/ResupplyPair.sol:406, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/ResupplyPair.sol:421`
+
+Convex migration keys all staking/accounting behavior off `convexPid != 0`, but `_updateConvexPool()` only withdraws and re-deposits the balance currently staked in the old rewards contract. Any collateral already sitting on the pair itself is ignored during migration, yet once `convexPid` is changed `totalCollateral()` and `_unstakeUnderlying()` start looking only at the staking contract. The same routine also still calls `deposit(_pid, ...)` when switching to `_pid == 0`, so using `0` as the unstaked sentinel is inconsistent with the migration logic.
+
+**Impact:** A normal activation, migration, or deactivation of Convex staking can make existing collateral disappear from pair accounting and leave removal/redemption/liquidation paths looking in the wrong place. Users can remain recorded as collateralized while the pair can no longer unstake or account for those funds, creating a withdrawal freeze and solvency drift until privileged recovery.
+
+**Paths:**
+
+- Users deposit collateral while `convexPid == 0`, so collateral remains on the pair contract.
+
+- The owner later calls `setConvexPool(validPid)` to enable or migrate Convex staking.
+
+- `_updateConvexPool()` migrates only `stakedBalance` from the old rewards contract, leaving the pair's local collateral untouched, then sets `convexPid = validPid`.
+
+- Afterward `totalCollateral()` reports only the staked balance and `_unstakeUnderlying()` withdraws only from the rewards contract, so removals, redemptions, and liquidations can revert or operate on incomplete accounting.
+
+- Similarly, attempting to switch back to `_pid == 0` still calls `deposit(0, stakedBalance, true)`, which conflicts with treating `0` as the unstaked mode.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-005: Invalidating the write-off reward disables redemption loss socialization
+
+**Confidence:** medium | **Locations:** `onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:177, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:125, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:129, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:599, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:965`
+
+The internal `redemptionWriteOff` token is registered in the same generic reward list as external incentive tokens and is not protected from `invalidateReward()`. If the reward manager invalidates it, redemptions still mint new write-off supply, but `_calcRewardIntegral()` skips the token entirely, so `_syncUserRedemptions()` no longer charges borrowers for redeemed collateral. If the token is later revived, the accumulated backlog is distributed against the then-current borrow-share set instead of the borrowers who actually caused the loss.
+
+**Impact:** Collateral can be redeemed out of the pair while recorded borrower collateral stays artificially high, creating false solvency, distorted liquidations, and hidden insolvency. A later revival can also misallocate historic write-offs onto current borrowers while prior borrowers escape their share of the redemption loss.
+
+**Paths:**
+
+- The reward manager calls `invalidateReward(address(redemptionWriteOff))`.
+
+- Subsequent `redeemCollateral()` calls continue transferring collateral out and minting `redemptionWriteOff` supply.
+
+- Borrowers interact normally, but `_syncUserRedemptions()` sees no newly accrued write-off rewards and stops reducing their collateral balances.
+
+- If the token is revived later, the skipped supply is integrated using the current epoch/share distribution rather than the historical borrower set.
+
+*Round 1 | Agents: codex*
+
+---
+
+## Medium (3)
+
+### F-003: Oracle prices are inverted without decimal normalization or zero checks
+
+**Confidence:** low | **Locations:** `0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/ResupplyPair.sol:176, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:163, 0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:573`
+
+The pair stores an arbitrary oracle address and `_updateExchangeRate()` blindly computes `1e36 / getPrices(collateral)` without consulting `IOracle.decimals()` or checking that the returned price is non-zero. Any oracle that reports prices in a non-18-decimal scale, or transiently returns zero, will produce a materially wrong exchange rate or revert the update entirely.
+
+**Impact:** A mis-scaled oracle can make positions appear much safer or riskier than they are, leading to overborrowing, wrongful liquidations, or redemptions at the wrong collateral price. A zero price return causes `_updateExchangeRate()` to revert, which can freeze borrow, liquidation, redemption, leveraged-position, and collateral-removal flows that refresh the exchange rate.
+
+**Paths:**
+
+- The pair is deployed with, or later switched to, an oracle whose `getPrices()` output is not already 1e18-scaled or can return zero.
+
+- A state-changing path calls `_updateExchangeRate()`, which inverts the raw oracle output as `1e36 / price`.
+
+- If the price scale is wrong, solvency and redemption math use a corrupted exchange rate; if the price is zero, the call reverts and blocks the affected operation.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-006: Reverting reward hook or reward `balanceOf` can brick checkpointed core operations
+
+**Confidence:** high | **Locations:** `onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:158, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:185, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:224, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:226, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/RewardDistributorMultiEpoch.sol:247, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:300, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:322, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:1005`
+
+Every checkpoint unconditionally calls the external registry reward hook and then iterates all registered rewards, calling each token's `balanceOf`. There is no try/catch or per-reward isolation, so a reverting `claimRewards()` implementation or any registered reward token that reverts on `balanceOf` makes `_checkpoint()` revert everywhere it is used. Separately, a reward token that reverts on `transfer` will brick reward claims even if non-claiming checkpoints still succeed.
+
+**Impact:** Any operation that relies on `_syncUserRedemptions()` or `isSolvent` can become unavailable pair-wide until governance invalidates the offending reward or fixes the external hook. In practice this can block borrow, collateral removal, liquidations, leveraged positions, repay-with-collateral, and user reward/accounting queries; claims are additionally blocked if a reward token reverts on transfer.
+
+**Paths:**
+
+- The registry's `claimRewards(address(this))` starts reverting, or a registered reward token begins reverting on `balanceOf(address(this))`.
+
+- A user calls a path that reaches `_checkpoint()` through `_syncUserRedemptions()` or reward accounting.
+
+- `_checkpoint()` reverts before user collateral sync or solvency checks can complete.
+
+- Operations gated by those checkpoints fail until the reward manager invalidates the broken reward or the external reward hook is repaired.
+
+- If the failure is only on `transfer`, core non-claiming checkpoints continue to work but `getReward()` and any claiming path still revert.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-007: Interest accrual past the `uint128` debt cap silently skips the elapsed period
+
+**Confidence:** low | **Locations:** `onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:481, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:485, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:492, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:533, onchain_auto/0x6e90c85a495d54c6d7e1f3400fef1f6e59f86bd6/src/protocol/pair/ResupplyPairCore.sol:537`
+
+When `_calculateInterest()` computes a positive `interestEarned` but adding it to `totalBorrow.amount` would exceed `uint128.max`, the function silently resets `interestEarned` to zero instead of reverting or saturating. `_addInterest()` still accepts that result and advances `lastTimestamp`, permanently discarding interest for the entire elapsed period.
+
+**Impact:** If total debt approaches the accounting ceiling and accrual is delayed long enough, borrowers can skip a full period of interest while protocol fee accrual also stops for that interval. The issue is configuration- and scale-dependent, but once reached it silently undercharges debt and distorts total-borrow accounting.
+
+**Paths:**
+
+- The pair's debt grows near the `uint128` accounting limit, potentially aided by a high configured borrow limit.
+
+- Enough time passes, or rates are high enough, that the next accrual would make `totalBorrow.amount + interestEarned` exceed `uint128.max`.
+
+- `_calculateInterest()` zeroes `interestEarned` in the overflow branch instead of reverting or clamping.
+
+- `_addInterest()` still updates `lastTimestamp`, so the elapsed period cannot be charged later.
+
+*Round 1 | Agents: codex*
+
+---

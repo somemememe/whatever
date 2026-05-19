@@ -1,0 +1,103 @@
+# Audit Report
+
+**Total findings:** 4
+
+## Critical (1)
+
+### F-001: Project funds can be permanently locked because refund progress is compared against NFT count instead of bid-record count
+
+**Confidence:** high | **Locations:** `onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:463, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:466, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:518, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:537, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:608, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:616`
+
+`totalBids` tracks the total number of NFTs sold, while `refundProgress` advances once per bidder record in `allBids`. Because repeated bids from the same address are aggregated into a single record, any address whose cumulative `bidsPlaced` exceeds 1 makes the maximum reachable `refundProgress` smaller than `totalBids`. As a result, `claimProjectFunds()` can remain permanently unreachable even after every bid record has been processed.
+
+**Impact:** ETH that should become project proceeds can be trapped in the auction contract forever, creating a permanent lockup of sale funds.
+
+**Paths:**
+
+- A bidder purchases multiple NFTs, either in one call (`bid(2)` / `bid(3)`) or across multiple calls from the same address.
+
+- `totalBids` increases by the NFT quantity, but the bidder still occupies only one `allBids` record.
+
+- `processRefunds()` can only increment `refundProgress` once per record until it reaches `bidIndex - 1`.
+
+- If any record represents more than one NFT, `refundProgress` finishes below `totalBids`.
+
+- `claimProjectFunds()` keeps reverting with `Refunds not yet processed`, permanently locking the remaining ETH.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+## High (3)
+
+### F-002: Any bidder can permanently block refund processing by reverting on ETH receipt
+
+**Confidence:** high | **Locations:** `onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:591, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:599, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:601, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:602, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:611`
+
+`processRefunds()` uses a low-level ETH transfer to the current bidder and reverts the entire batch if that transfer fails. A malicious bidder contract whose `receive()` or fallback reverts can therefore cause every attempt to process its record to revert, preventing `refundProgress` from advancing past that index.
+
+**Impact:** Refund processing for all later bidders can be permanently DoSed, and project withdrawals are also blocked because the contract can no longer advance refund settlement.
+
+**Paths:**
+
+- The attacker bids through a contract with a `receive()`/fallback that always reverts.
+
+- After the auction ends, anyone calls `processRefunds()`.
+
+- When the loop reaches the attacker's record, the refund transfer fails and `require(sent)` reverts the whole transaction.
+
+- Because the transaction reverts, neither `finalProcess` nor `refundProgress` is advanced.
+
+- Every future `processRefunds()` attempt fails again at the same bidder, permanently stalling settlement.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-003: Emergency withdrawal can refund bidders in full even after they already received NFTs
+
+**Confidence:** medium | **Locations:** `onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:569, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:572, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:574, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:576, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:577`
+
+`emergencyWithdraw()` becomes available 3 days after auction expiry whenever the caller's bid record still has `finalProcess == 0`, but it never checks whether the caller has already received their NFTs. If the NFT airdrop is partially complete while some refund records remain unprocessed, an already-served bidder can keep the NFTs and still reclaim their entire payment.
+
+**Impact:** Bidders can obtain free NFTs and drain escrowed sale proceeds, potentially making the auction insolvent and preventing later refunds or settlements.
+
+**Paths:**
+
+- The auction ends and NFT distribution begins, but not all records have been processed in `processRefunds()`.
+
+- A bidder receives their NFT(s), yet their auction record still has `finalProcess == 0` because refunds are incomplete or stalled.
+
+- Once `block.timestamp > expiresAt + 3 days`, that bidder calls `emergencyWithdraw()`.
+
+- The contract returns `bidData.price * bidData.bidsPlaced` without checking whether NFTs were already delivered.
+
+- The bidder keeps both the NFT(s) and the full ETH refund, reducing funds available for everyone else.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-004: Zero-amount bids create dummy records that can satisfy the withdrawal gate before all real refunds are processed
+
+**Confidence:** high | **Locations:** `onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:493, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:501, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:518, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:535, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:538, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:539, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:608, onchain_auto/0xf42c318dbfbaab0eee040279c6a2588fa01a961d/Contract.sol:616`
+
+`bid(0)` is permitted and, for a first-time caller, still creates a new `allBids` record and increments `bidIndex` even though `totalBids` does not increase. Since `processRefunds()` advances `refundProgress` per record while `claimProjectFunds()` only checks `refundProgress >= totalBids`, enough zero-amount dummy records can make the withdrawal gate pass before later real bidder records are ever processed.
+
+**Impact:** Outstanding refunds owed to later real bidders can be stranded when the owner withdraws the contract balance after the false completion condition is met, causing underpayment or non-payment of legitimate refunds.
+
+**Paths:**
+
+- An attacker uses many fresh addresses to call `bid(0)` during the auction.
+
+- Each zero bid creates a new bidder record and increments `bidIndex`, but leaves `totalBids` unchanged.
+
+- After expiry, `processRefunds()` advances through records one-by-one, including the dummy entries.
+
+- Once `refundProgress` reaches `totalBids`, `claimProjectFunds()` becomes callable even if `refundProgress < bidIndex` and real bidder records remain later in the array.
+
+- If the owner withdraws at that point, the remaining ETH can be removed before those later bidders receive their refunds.
+
+*Round 1 | Agents: codex_1*
+
+---

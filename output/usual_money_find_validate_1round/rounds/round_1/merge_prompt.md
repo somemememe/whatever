@@ -1,0 +1,125 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Unprotected V3 reinitializer lets any caller seize the `rtusd0` dependency",
+    "locations": [
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:151",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:158",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:459",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:577"
+    ],
+    "claim": "`initializeV3` is a public `reinitializer(4)` with no access control or code validation, so if a proxy is upgraded to this implementation without atomically executing the reinitializer, any external account can set `$.rtusd0` to an attacker-chosen address and permanently alter how minting and reconstruction work.",
+    "impact": "An attacker can brick the upgrade, point `rtusd0` at a malicious contract, or even at an EOA/non-compliant target so later `mint`/`reconstruct` calls no longer enforce the intended rt-USD0 mint/burn invariant. This can collapse the bond split, strand users, or let bUSD0 holders bypass the intended redemption-right token after a bad upgrade sequence.",
+    "paths": [
+      "Proxy is upgraded to this implementation without `upgradeToAndCall` data -> attacker calls `initializeV3(attackerControlledRt)` first -> all future `mint`/`reconstruct` flows trust the attacker-controlled `rtusd0` endpoint"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "bUSD0 holders can unilaterally consume collateral without burning matching rt-USD0",
+    "locations": [
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:232",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:259",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:313",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:343",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:582",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:459"
+    ],
+    "claim": "The contract mints two separable claims (`bUSD0` and `rtUSD0`) but every exit path except `reconstruct` burns only `bUSD0` and releases USD0 collateral without also burning the paired `rtUSD0` that was minted for the same bond.",
+    "impact": "If the two tokens are split across different holders, the `bUSD0` holder can redeem some or all of the backing first, leaving the `rtUSD0` holder with an orphaned, economically worthless token. This is a direct value-extraction bug against redemption-right holders and breaks the accounting invariant that each bond position should require both legs until the protocol explicitly says otherwise.",
+    "paths": [
+      "User mints with `bAssetRecipient = Alice` and `rAssetRecipient = Bob` -> Alice calls `unlockUSD0ppWithUsual` or `unlockUsd0ppFloorPrice` -> Alice receives USD0 while Bob still holds unbacked `rtUSD0`",
+      "After any secondary-market split of `bUSD0` and `rtUSD0`, the `bUSD0` holder can call `unwrap`, `unwrapWithCap`, or `unwrapPegMaintainer` and consume collateral without presenting the paired rt token"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "The 'burn USUAL' early-unlock path does not burn USUAL at all",
+    "locations": [
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:343",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:358",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:361",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:397",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:407",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IUsd0PP.sol:156"
+    ],
+    "claim": "Despite the interface and comments repeatedly describing this flow as 'burning USUAL', `unlockUSD0ppWithUsual` only transfers USUAL into the contract, records it in `accumulatedFees`, and later `sweepFees` forwards it to another module instead of burning it.",
+    "impact": "If the protocol's solvency or pricing model assumes early redemption permanently destroys USUAL supply, the implemented fee is materially weaker than advertised. The fee can be recycled back into circulation, lowering the real cost of unlocking bUSD0 early and making collateral extraction cheaper than the documented design.",
+    "paths": [
+      "`unlockUSD0ppWithUsual` collects USUAL into `accumulatedFees` -> `sweepFees` forwards the same tokens to `CONTRACT_DISTRIBUTION_MODULE` -> the supposed burn sink never happens"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "Minting is allowed before `bondStart` even though `bondStart` is documented as the mint gate",
+    "locations": [
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/interfaces/token/IUsd0PP.sol:100",
+      "0x9f2bd21bf8012fce0d5845537c1deff3a89bc85b/src/token/Usd0PP.sol:565"
+    ],
+    "claim": "`getStartTime()` is documented as the timestamp used to determine whether the bond can be minted, but `_deconstruct` never checks `block.timestamp >= bondStart`; it only blocks minting after `bondStart + BOND_DURATION_FOUR_YEAR`.",
+    "impact": "Anyone can mint bUSD0/rtUSD0 before the intended bond start, which enables premature issuance, front-runs any launch schedule tied to `bondStart`, and can create pre-start secondary-market positions the protocol may not be prepared to honor.",
+    "paths": [
+      "Before `bondStart`, call `mint` or `mintWithPermit` -> `_deconstruct` succeeds because only the end-of-bond check is enforced"
+    ]
+  }
+]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

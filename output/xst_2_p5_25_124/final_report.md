@@ -1,0 +1,99 @@
+# Audit Report
+
+**Total findings:** 5
+
+## Critical (3)
+
+### F-001: Upgradeable deployment has no initialization path, leaving owner and core state permanently unset
+
+**Confidence:** high | **Locations:** `onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:18, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:23, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:39, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:42, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:45, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol:27`
+
+`XStable2` inherits `Initializable` and `OwnableUpgradeable` but exposes no constructor or initializer, and the codebase contains no assignment path for `_owner`, `_presaleCon`, `_largeTotal`, `_liquidityReserve`, `_stabilizer`, or `_mainPool`. A proxy deployment therefore leaves all of these storage slots at their zero defaults forever: `owner()` remains `address(0)`, `onlyOwner` administration is unreachable, `mint()` cannot be called by any real presale contract because `_presaleCon` stays zero, and the post-presale rebase factor would become unusable if `_presaleDone` were ever flipped because `getFactor()` would then divide by the uninitialized `_largeTotal` of zero.
+
+**Impact:** The protocol can be deployed into an unrecoverable state with no privileged recovery path and no working presale mint authority. Even if another upgrade later forces `_presaleDone = true`, balance reads and transfer math would fail because the live rebase state was never initialized.
+
+**Paths:**
+
+- Deploy behind a proxy -> no initializer exists -> `owner()` stays `address(0)` -> every `onlyOwner` function is permanently inaccessible
+
+- Attempt presale minting -> `onlyPresale` compares caller to zero `_presaleCon` -> no legitimate presale contract can ever call `mint()`
+
+- Any later attempt to activate post-presale mode -> `getFactor()` uses zero `_largeTotal` -> balance-dependent flows revert or become unusable
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+### F-003: Spot-balance rebase logic is flash-loan manipulable and applies an uncapped quadratic mint on buys
+
+**Confidence:** high | **Locations:** `onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/Setters2.sol:33, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/Getters2.sol:93, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:142, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:167, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:331, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:337`
+
+On buys from a supported pool, `_transfer()` calls `syncPair(sender)` before classifying the transfer. `syncPair()` snapshots raw `IERC20(...).balanceOf(pool)` balances instead of manipulation-resistant pricing or finalized AMM reserves, so transient flash-loaned/sandwiched token balances are fed directly into `getMintValue()`. That function computes `expansionR` from those spot balances and, once above the threshold, applies `mintFactor = expansionR * expansionR` with no cap. The resulting `totalMint` is added to `_totalSupply` during the same buy, lowering the rebase factor and immediately inflating the attacker's freshly received XST balance.
+
+**Impact:** An attacker can use transient capital to manufacture an oversized positive rebase during their own buy, then dump the inflated XST back into the pool for excess paired assets. This can drain liquidity and catastrophically distort supply with a single flash-loan-assisted transaction.
+
+**Paths:**
+
+- Flash-loan the pair token -> execute an oversized buy through a supported pool -> pool-to-user transfer triggers `syncPair()` on manipulated spot balances -> `getMintValue()` mints an outsized quadratic rebase -> attacker sells the inflated XST back out for profit
+
+- Sandwich a victim buy to temporarily distort pair balances before the pool sends XST -> the same uncapped mint logic amplifies the attacker's exit value
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-005: No code path can ever mark the presale as finished, so all transfers remain permanently disabled
+
+**Confidence:** high | **Locations:** `onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:45, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/Getters2.sol:65, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:127, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:133`
+
+Every token movement goes through `_transfer()`, which unconditionally requires `isPresaleDone()` to be true. However, `_presaleDone` is only declared in storage and read by getters; the codebase contains no function that ever sets it to `true`. As a result, the transfer gate remains false forever.
+
+**Impact:** Even if presale minting succeeds, holders can never transfer their tokens, liquidity cannot be bootstrapped through router-mediated token moves, and trading can never start. The token is permanently locked in presale mode.
+
+**Paths:**
+
+- Any user calls `transfer` or `transferFrom` -> `_transfer()` executes `require(isPresaleDone(), "Presale yet to close")` -> revert forever because `_presaleDone` is never written
+
+- Owner attempts to create a pool -> router eventually calls token transfer logic -> the same presale guard reverts, preventing launch
+
+*Round 1 | Agents: opencode_1*
+
+---
+
+## High (1)
+
+### F-002: Unassigned `_mainPool` makes ordinary transfers revert via zero-address pool sync
+
+**Confidence:** high | **Locations:** `onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/State.sol:23, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:147, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:361, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/Setters2.sol:41, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/Getters2.sol:93`
+
+`_mainPool` is declared but never assigned anywhere in the codebase. Whenever neither `sender` nor `recipient` is a supported pool, `_transfer()` calls `silentSyncPair(_mainPool)`, which becomes `silentSyncPair(address(0))`. That code then calls `getUpdatedPoolCounters(address(0), _poolCounters[address(0)].pairToken)`, causing high-level ERC20 calls such as `IERC20(pool).totalSupply()` and `IERC20(pairToken).balanceOf(pool)` against zero addresses or uninitialized pair tokens and reverting. The same unset `_mainPool` is also used in `getBurnValues()` for unsupported-transfer burn calculations.
+
+**Impact:** Normal wallet-to-wallet transfers and transfers to unsupported contracts are denied even after trading is supposed to be live, creating a protocol-wide denial of service for ordinary ERC20 movement outside explicitly supported pools.
+
+**Paths:**
+
+- User transfers tokens to another wallet -> `_transfer()` enters the non-pool branch -> `silentSyncPair(_mainPool)` -> external ERC20 call on `address(0)` reverts
+
+- User transfers to any unsupported contract/address -> same fallback sync on zero `_mainPool` -> transfer reverts before settlement
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## Medium (1)
+
+### F-004: Liquidity reserve migration burns and skims treasury funds because it is not performed taxlessly
+
+**Confidence:** high | **Locations:** `onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:156, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:195, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:300, onchain_auto/0xb276647e70cb3b81a1ca302cf8de280ff0ce5799/C/Crypto/Projects/xstable/contracts/XST2.sol:305`
+
+`setLiquidityReserve()` clears the old reserve's taxless-setter status before moving its balance and does not use the `taxlessTx` modifier. If the old reserve holds XST, `_transfer(_liquidityReserve, reserve, oldBalance)` runs through the normal taxable sell path, which burns part of the balance and redirects the utility fee instead of performing a 1:1 treasury migration. The analogous `setStabilizer()` function does use `taxlessTx`, confirming this reserve path is inconsistent.
+
+**Impact:** Routine reserve rotation irreversibly destroys part of accumulated treasury assets and siphons another part through the fee path, turning an administrative balance migration into real protocol loss.
+
+**Paths:**
+
+- Old liquidity reserve accrues fees -> owner calls `setLiquidityReserve(newReserve)` -> old reserve loses taxless status first -> `_transfer(oldReserve, newReserve, oldBalance)` is treated as a taxable sell -> burn and utility-fee deductions reduce the migrated balance
+
+*Round 1 | Agents: codex_1*
+
+---

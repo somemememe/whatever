@@ -1,0 +1,76 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `src/protocol/pair/ResupplyPairCore.sol` / `src/protocol/ResupplyPair.sol` — enduring audit center for borrow/collateral/liquidation/redemption accounting, solvency + exchange-rate refresh, fee paths, external handler settlement, Convex transitions, and deployment/runtime parameter consistency
+- Convex collateral management in `src/protocol/ResupplyPair.sol` — persistent risk surface where credited collateral can diverge from asset location across staking, pool-switch, migration, or sentinel/state transitions
+- Oracle integration around `src/interfaces/IOracle.sol` and pair refresh paths — protocol-wide dependency for price normalization, inversion/decimals handling, freshness/sanity assumptions, and zero-price availability
+- `src/protocol/RewardDistributorMultiEpoch.sol` — recurring liveness/accounting boundary; checkpoint/integral/claim behavior and reward-manager actions can leak into borrower-facing flows
+- `src/protocol/WriteOffToken.sol` — durable writeoff/redemption accounting dependency, especially where token state or validity affects loss attribution
+- `src/interfaces/ICore.sol` and pair initialization paths — supporting scope for governance/risk-parameter assumptions, especially max-LTV bounds at construction vs runtime
+
+## Issue Directions Seen
+- Oracle math and refresh behavior remain a core direction: decimal mismatches, inversion logic, weak freshness/sanity assumptions, and zero-price availability failures
+- Internal accounting vs real asset state is still the strongest recurring theme, especially where redemptions, writeoffs, migrations, or external integrations let balances diverge from recoverable collateral
+- Redemption/writeoff accounting is now a firm cross-round direction: borrower writeoff handling, skipped-loss tracking, and writeoff-token state can misallocate losses or misstate remaining collateral
+- Reward distribution remains a recurring secondary direction in two forms: zero-borrow-share/integral edge cases can strand rewards, and reward-manager or claim-path failures can disrupt lending/redemption flows
+- Full-redemption/reset logic remains live: when debt is fully cleared, stale debt/share state can survive and contaminate later borrowing cycles
+- Convex integration remains live beyond staking-success assumptions: pool-management edge cases and state encoding can orphan or live-lock collateral
+- Configuration-bound enforcement is an emerging durable direction: constructor-time assignments can bypass runtime setter guards, creating unsafe deployment states such as over-cap LTV
+- Handler-mediated redemption/liquidation settlement assumptions remain background suspicion, but lower-confidence than the core accounting/oracle directions
+
+## Useful Context
+- The most stable audit picture still radiates from `ResupplyPairCore` plus the wrapper pair contract; external modules mostly amplify mistakes in accounting, pricing, liveness, or configuration enforcement
+- A repeated cross-round pattern is state drift: internal debt, share, collateral, reward, or writeoff state can advance in ways that do not cleanly match attributable debt or recoverable assets
+- Redemption is a recurring desynchronization point, not just a settlement path; borrower-specific writeoff state, reward-side behavior, and global debt/share cleanup can interact unexpectedly
+- Reward-side components are not isolated from core lending behavior: checkpointing, claiming, invalidation, or token-state changes can affect value accounting as well as flow liveness
+- Low-confidence but retained background context includes handler ordering/trust assumptions, fee handling, and bounded-integer debt edge cases for future correlation
+
+
+## Latest Round Summary
+# Round 6 Summary
+
+## Agent: codex
+- files touched: `src/protocol/pair/ResupplyPairCore.sol`, `src/protocol/ResupplyPair.sol`, `src/protocol/RewardDistributorMultiEpoch.sol`, `src/protocol/WriteOffToken.sol`, `src/libraries/VaultAccount.sol`
+- files revisited / highest-attention files: `src/protocol/pair/ResupplyPairCore.sol` and `src/protocol/RewardDistributorMultiEpoch.sol`
+- main issue directions investigated: pair state-transition/accounting paths; reward checkpoint and claim liveness; trust in redemption/liquidation handler settlement; oracle-dependent solvency/redemption math
+- promising but not retained directions: unverified redemption settlement in `redeemCollateral()`; liquidation flow settling debt after collateral release; missing oracle freshness/sanity protections across borrow/liquidation/redemption pricing
+
+## Cross-Agent Status
+- main overlap in file/area attention: single-agent round; attention centered on `ResupplyPairCore.sol` with `RewardDistributorMultiEpoch.sol` as the main adjacent dependency
+- notable differences in attention: no cross-agent divergence in this round
+- underexplored but suspicious files/functions if clearly supported by the logs: handler-mediated settlement points in `redeemCollateral()` / `liquidate()` and the raw `oracle.getPrices()` usage sites remained active suspicion areas in the logs, but were not retained after merge
+
+## Retained Findings
+- retained after merge: reward distribution remained the only kept issue direction from this round, specifically that a misbehaving registered reward token can break checkpointing and freeze borrower-facing pair operations until manual invalidation
+
+
+Output only markdown.

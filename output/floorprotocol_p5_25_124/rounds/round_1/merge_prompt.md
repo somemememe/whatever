@@ -1,0 +1,243 @@
+Below are findings and vulnerability signals from 2 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex_1
+```
+[
+  {
+    "id": "F-001",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Periphery pools residual ETH and fragment balances, letting later callers spend prior users' funds",
+    "locations": [
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:221",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:263",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:270",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:285",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:419"
+    ],
+    "claim": "The contract does not track balances per user: native-buy flows forward the entire contract ETH balance to the Universal Router, router refunds are retained by the contract, and `_claim` funds redemptions from `address(this)` while sending NFTs to the current `msg.sender`. Any stranded ETH or fragment-token balance under the periphery can therefore be consumed by a later caller.",
+    "impact": "A prior user's overpayment, router refund, accidental ETH transfer, or pre-existing fragment-token balance can subsidize or fully fund another user's purchase/claim. The next caller can effectively steal residual value and receive NFTs for themselves.",
+    "paths": [
+      "Victim calls `buyAndClaimVault` or `fragmentAndSell`; the Universal Router refunds unused ETH back to the periphery, which accepts it in `receive()` and keeps it.",
+      "Attacker later calls `buyAndClaimVault` with `transferWay = NativeTransfer` and little or no `msg.value`; `_executeSwap` forwards `address(this).balance` to the router and `_claim` sends the purchased NFTs to the attacker.",
+      "If fragment tokens are already held by the periphery or credited to the periphery inside `floor`, a later caller can invoke `_claim`, which pays from `address(this)` but transfers the NFTs to that caller."
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "The UUPS proxy is takeable if deployment omits initializer calldata",
+    "locations": [
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:124",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/library/OwnedUpgradeable.sol:20",
+      "0x49ad262c49c7aa708cc2df262ed53b64a17dd5ee/solc_0.8/openzeppelin/proxy/ERC1967/ERC1967Proxy.sol:22"
+    ],
+    "claim": "`initialize()` is publicly callable and sets the owner via `__Owned_init()`, while the ERC1967 proxy constructor allows deployment with empty `_data`. If the proxy is deployed without atomic initialization, any external account can initialize it first, become owner, and then authorize arbitrary UUPS upgrades.",
+    "impact": "A front-runner can seize full administrative control of the periphery proxy, upgrade it to malicious logic, and then steal or permanently brick any assets and approvals routed through the contract.",
+    "paths": [
+      "Deploy `ERC1967Proxy` for `FloorPeriphery` with empty initialization calldata.",
+      "Attacker calls `initialize()` through the proxy before the intended operator does and becomes `owner`.",
+      "Attacker calls `upgradeToAndCall` to install malicious implementation logic."
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "Any ERC721 sent to the periphery can be permanently trapped",
+    "locations": [
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:400",
+      "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:410"
+    ],
+    "claim": "The contract accepts every ERC721 receipt in `onERC721Received()` but has no recovery or sweep function for NFTs it holds. Once an NFT is transferred directly to the periphery outside the intended fragment flow, there is no code path to return it to the sender.",
+    "impact": "Users can permanently lose NFTs by sending them directly to the periphery, and integrators have no on-chain recovery mechanism for mistakenly transferred assets.",
+    "paths": [
+      "A user or integration calls `safeTransferFrom(..., FloorPeriphery, tokenId)` directly.",
+      "The transfer succeeds because `onERC721Received()` always returns the selector.",
+      "The NFT remains stuck because the contract exposes no withdrawal or rescue function."
+    ]
+  }
+]
+
+```
+
+### Agent: opencode_1
+```
+Let me read the main contract files to audit them for security vulnerabilities.
+Let me continue reading more key files to understand the full contract logic:
+Let me also read the remaining key files:
+Now I'll compile all the findings into the required JSON format:
+
+```json
+[
+  {
+    "id": "F-001",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Unlimited ERC20 Approval to Floor Contract",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:396"],
+    "claim": "The approveAllERC20 function grants unlimited ERC20 token approval (type(uint256).max) to the Floor contract (floor). If the Floor contract is compromised or has a vulnerability, all tokens in FloorPeriphery can be drained.",
+    "impact": "If Floor contract is compromised, attackers can steal all ERC20 tokens held by FloorPeriphery due to unlimited approval.",
+    "paths": ["1. Attacker compromises Floor contract -> 2. Calls transferFrom from FloorPeriphery to drain all approved tokens"]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Unlimited ERC721 Approval to Floor Contract",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:406"],
+    "claim": "The approveAllERC721 function grants unlimited ERC721 approval (setApprovalForAll(spender, true)) to the Floor contract. This allows Floor to transfer any NFT from any collection that has been approved.",
+    "impact": "If Floor contract is compromised, all NFTs held by FloorPeriphery can be transferred out. Additionally, any user who has called fragmentAndSell has given Floor unlimited transfer rights over their NFTs.",
+    "paths": ["1. User calls fragmentAndSell -> 2. FloorPeriphery approves all NFTs to Floor -> 3. If Floor compromised, all NFTs can be stolen"]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "high",
+    "title": "No Access Control on extsload - Full Storage Exposure",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorGetter.sol:40-48", "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorGetter.sol:106-115"],
+    "claim": "The FloorGetter contract exposes all internal storage slots via extsload without any access control. Any external call can read any storage slot using keccak256-based slot keys.",
+    "impact": "All protocol state including user balances, vault contents, auction states, and administrative configurations can be read by anyone. This enables front-running of auctions, identification of profitable positions, and enumeration of vault contents.",
+    "paths": ["1. Anyone calls supportedToken() or collectionInfo() -> 2. Reads arbitrary storage slots via extsload with crafted keccak256 keys"]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Delegatecall in Multicall Allows Contract Hijacking",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/base/Multicall.sol:16"],
+    "claim": "The multicall function uses delegatecall to execute arbitrary bytecode in the context of FloorGetter. This allows anyone to manipulate the contract's storage.",
+    "impact": "An attacker can hijack the contract storage, steal funds, or manipulate state. This is particularly dangerous if FloorGetter holds any assets or controls critical protocol parameters.",
+    "paths": ["1. Attacker multicalls malicious bytecode -> 2. Executes in FloorGetter's context -> 3. Manipulates storage/steals funds"]
+  },
+  {
+    "id": "F-005",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Missing Reentrancy Guards",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:129-144", "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:189-200"],
+    "claim": "Functions fragmentAndSell, buyAndClaimExpired, and buyAndClaimVault make external calls to Universal Router and Floor contract without reentrancy guards. Malicious tokens could trigger callback reentrancy.",
+    "impact": "A malicious token/NFT contract could re-enter these functions, potentially stealing funds via flash loans, manipulating state, or causing unexpected behavior.",
+    "paths": ["1. User calls fragmentAndSell -> 2. External call to malicious token -> 3. Token callback re-enters fragmentAndSell -> 4. Exploits state inconsistencies"]
+  },
+  {
+    "id": "F-006",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "No Deadline Validation in Swap Execution",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:281-298"],
+    "claim": "The _executeSwap function accepts a deadline parameter but never validates that block.timestamp <= deadline. Transactions could be executed much later than intended.",
+    "impact": "Users may receive unfavorable swap rates due to delayed execution. MEV bots could sandwich swap transactions. Expired deadline still allows execution.",
+    "paths": ["1. User submits transaction with future deadline -> 2. Transaction sits in mempool -> 3. Executed later at worse price"]
+  },
+  {
+    "id": "F-007",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Missing Input Size Limits - DoS Vector",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:147-167", "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:202-218"],
+    "claim": "Batch functions (fragmentAndSell[], buyAndClaimExpired[]) accept arrays without size limits. An attacker could submit extremely large arrays causing gas exhaustion.",
+    "impact": "Protocol DoS - large batch transactions could cause out-of-gas errors, blocking the contract. Funded attacker could grief the protocol.",
+    "paths": ["1. Attacker submits batch with huge array -> 2. Gas exhausted -> 3. Transaction reverts or blocks other users"]
+  },
+  {
+    "id": "F-008",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Unchecked Permit2 Permit Results",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:318", "0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:363"],
+    "claim": "PERMIT2.permit() and PERMIT2.permitTransferFrom() return values are not checked. If permits fail silently, tokens won't be transferred but no error is thrown.",
+    "impact": "Users may believe their transaction succeeded when permit failed. Subsequent transferFrom will fail, causing confusion and potential fund lock.",
+    "paths": ["1. User calls with invalid permit -> 2. permit() fails silently -> 3. transferFrom fails -> 4. User confused about failure"]
+  },
+  {
+    "id": "F-009",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "No Signature Expiration in Permit2 Signature Transfer",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:325-336"],
+    "claim": "The SignatureTransfer path uses Permit2 signatures without validation of expiration. Old signatures can be replayed indefinitely.",
+    "impact": "If a signature is leaked or intercepted, it can be replayed at any time to steal tokens. No time-limited security.",
+    "paths": ["1. Signature leaks -> 2. Attacker replays old signature -> 3. Tokens stolen"]
+  },
+  {
+    "id": "F-010",
+    "severity": "Low",
+    "confidence": "low",
+    "title": "Inconsistent Validation in Batch Transfer",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:354-356"],
+    "claim": "Batch transfer validates 'from == msg.sender' but doesn't validate token addresses or amounts, potentially allowing transfers of unintended tokens.",
+    "impact": "User error could result in transferring wrong tokens if transferParam is malformed. Minor UX issue.",
+    "paths": ["1. User provides wrong transferParam -> 2. Unexpected token transfer"]
+  },
+  {
+    "id": "F-011",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "Missing Emit on Ownership Transfer",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/library/OwnedUpgradeable.sol:26-30"],
+    "claim": "The setOwner function emits OwnerUpdated event but does not emit events for other critical state changes in FloorPeriphery.",
+    "impact": "Monitoring and indexing of critical events is incomplete. Wallets and explorers may miss important state changes.",
+    "paths": []
+  },
+  {
+    "id": "F-012",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "Incorrect Balance Check in _executeSwap",
+    "locations": ["0xeeced9aa487dfb777ee94ab0c86ac0b0b4d3b7bf/src/FloorPeriphery.sol:285"],
+    "claim": "The condition 'address(this).balance > 0' checks balance AFTER potential token transfers but before swap. If swap fails, ETH may remain in contract with no recovery mechanism.",
+    "impact": "ETH can be stuck in contract if swap fails during NativeTransfer. No functionality to recover stranded funds.",
+    "paths": ["1. User calls with NativeTransfer -> 2. ETH sent to contract -> 3. Swap fails -> 4. ETH stuck"]
+  }
+]
+```
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

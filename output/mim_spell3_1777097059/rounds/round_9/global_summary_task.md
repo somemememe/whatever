@@ -1,0 +1,74 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `cauldrons/CauldronV4.sol` remains the dominant surface: `cook()` / `_call()` dispatch, `init()` / clone initialization, solvency-gated borrow/withdraw paths, liquidation seizure/accounting, accrual and debt/share bookkeeping, `withdrawFees()`, `reduceSupply()`, and owner/master-contract parameter storage
+- `cauldrons/PrivilegedCauldronV4.sol` remains the main secondary surface, especially `addBorrowPosition()` and privileged debt assignment paths that can separate debt ownership, MIM extraction, cap assumptions, and interest timing
+- `cauldrons/PrivilegedCheckpointCauldronV4.sol` still matters mainly for liquidation-hook external interaction and checkpoint-token coupling, but remains narrower than core cauldron debt/accounting paths
+- Supporting interfaces — `interfaces/IOracle.sol`, `interfaces/IBentoBoxV1.sol`, `interfaces/ICheckpointToken.sol`, `interfaces/ISwapperV2.sol`, `interfaces/IStrategy.sol` — continue to matter as assumption surfaces for oracle liveness/decimals, BentoBox share conversions, and external call behavior
+
+## Issue Directions Seen
+- `cook()` remains a recurring hotspot because flexible action dispatch, arbitrary external calls, and value forwarding can blur intended safety boundaries
+- Clone lifecycle / initialization is now a durable direction with a retained issue: uninitialized clones are exposed to first-caller-wins `init()` behavior, so master-vs-clone deployment assumptions remain security-critical
+- Liquidation logic remains a top-value direction: accounting consistency, rounding, duplicate-borrower handling, partial-seizure edges, oracle dependence, and external-hook interactions can create underpayment or revert-driven unliquidatability
+- Oracle integration remains a core concern: invalid, stale, reverting, or decimal-mismatched rates can distort or block borrow, withdraw, and liquidation behavior
+- Fee and debt accounting mismatches remain promising where bookkeeping for fees, supply reduction, accrual, casts, or debt state diverges from actual BentoBox share availability or effective borrower terms
+- Admin-controlled parameterization remains central: weakly constrained updates to collateralization, interest, liquidation settings, or borrow opening fees can abruptly change solvency and debt economics
+- Privileged debt paths continue to stand out where debt can be reassigned or created in ways that separate who receives assets, who bears liabilities, and when interest begins accruing
+- Shared-balance / skim mechanics remain dangerous where BentoBox-staged collateral or MIM shares can be relied on by one actor and captured by another
+
+## Useful Context
+- Cross-round attention stays concentrated in `CauldronV4`; wrapper cauldrons and interfaces mostly serve as context for validating assumptions around the core debt/accounting engine
+- A repeated pattern is internal state appearing coherent while economic reality diverges: liquidation math can under-collect through iteration/rounding effects, fee counters may not match withdrawable shares, and debt burden or recoverability can differ materially from stored values
+- Borrower-list semantics matter in liquidation analysis: logic that is locally correct per iteration can still misaccount when the same borrower is processed multiple times
+- Post-action assumptions matter more than isolated local checks, especially around oracle failure handling, delayed accrual, BentoBox rounding, liquidation seizure math, and clone initialization / ownership expectations
+- Recent review further reinforced `init()`, `cook()`, `_call()`, and liquidation accounting as the most durable audit magnets; privileged variants remain relevant but less explored overall
+
+
+## Latest Round Summary
+# Round 9 Summary
+
+## Agent: codex
+- files touched: `cauldrons/CauldronV4.sol`, `cauldrons/PrivilegedCauldronV4.sol`, `cauldrons/PrivilegedCheckpointCauldronV4.sol`, plus all scoped interface files under `interfaces/`
+- files revisited / highest-attention files: strongest focus on `cauldrons/CauldronV4.sol`, then targeted follow-up on `cauldrons/PrivilegedCauldronV4.sol` and `cauldrons/PrivilegedCheckpointCauldronV4.sol`
+- main issue directions investigated: core accounting and borrow flow tracing; privileged debt injection behavior versus normal `_borrow()` constraints; solvency checks using cached `exchangeRate`; checkpoint-token callback handling in privileged collateral/liquidation hooks
+- promising but not retained directions: candidate issues around privileged borrow-cap bypass in `addBorrowPosition()`, stale cached exchange-rate use in privileged solvency checks, and ignored `user_checkpoint()` boolean failures in `PrivilegedCheckpointCauldronV4`
+
+## Cross-Agent Status
+- main overlap in file/area attention: only `codex` logged activity this round, concentrated on Cauldron core accounting and the privileged extensions
+- notable differences in attention: no cross-agent divergence is visible from the provided logs
+- underexplored but suspicious files/functions if clearly supported by the logs: interfaces were only lightly scanned; attention centered much more on `addBorrowPosition()` and privileged checkpoint hooks than on broader interface-driven edge cases
+
+## Retained Findings
+- No findings were retained from this round after merge.
+
+
+Output only markdown.

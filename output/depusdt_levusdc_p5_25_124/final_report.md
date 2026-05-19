@@ -1,0 +1,95 @@
+# Audit Report
+
+**Total findings:** 4
+
+## Critical (1)
+
+### F-001: Public arbitrary-token approval lets any caller steal the market's USDT, cUSDT, and other ERC-20 balances
+
+**Confidence:** high | **Locations:** `0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/CurveSwap.sol:60, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/CurveSwap.sol:61`
+
+`approveToken` is a public function inherited by the live DepToken contract and has no access control. Any address can make the market approve an arbitrary spender for any ERC-20 held by the contract. Since the market custody includes idle USDT and Compound cUSDT, an attacker can approve themself and then use `transferFrom` on those token contracts to pull funds out of the protocol.
+
+**Impact:** A permissionless attacker can drain the protocol's underlying USDT, its cUSDT position, and any other ERC-20 balance held by the market, immediately rendering depositors insolvent and breaking redemptions.
+
+**Paths:**
+
+- Call `approveToken(USDTAddress, attacker, amount)` or `approveToken(compoundV2cUSDTAddress, attacker, amount)` on the market.
+
+- Call the approved token's `transferFrom(depToken, attacker, amount)` to move assets out of the protocol.
+
+- Repeat for each token balance the market holds.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (2)
+
+### F-002: Redeem burns full DepTokens even when Compound withdrawal fails and only partial cash is available
+
+**Confidence:** high | **Locations:** `0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepositWithdraw.sol:92, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepositWithdraw.sol:93, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:683, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:690, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:693, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:698, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:709, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:718`
+
+`withdrawUSDTfromCmp` ignores the return code from Compound's `redeemUnderlying`. In `redeemInternal`, the contract attempts to pull USDT from Compound, then if the expected cash is still missing it silently reduces `redeemAmount` down to `cashAvailToWithdraw`, but it still burns the original `redeemTokens` amount from the user.
+
+**Impact:** If Compound redemption fails, is paused, or returns less liquidity than expected, redeemers permanently lose part of their claim: their full DepToken balance is destroyed while they receive only the cash already on hand.
+
+**Paths:**
+
+- A user redeems while part of the backing is parked in Compound.
+
+- `redeemInternal` calls `withdrawUSDTfromCmp(...)`, but `redeemUnderlying` fails or returns insufficient funds and the failure is ignored.
+
+- `cashAvailToWithdraw` ends up below the originally computed `redeemAmount`, so the contract clamps the payout downward.
+
+- The contract still subtracts the full `redeemTokens` from `totalSupply` and the user balance, then transfers only the reduced USDT amount.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+### F-003: Curve swaps use zero minimum output, enabling sandwich extraction on borrow and refund flows
+
+**Confidence:** high | **Locations:** `0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/CurveSwap.sol:46, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/CurveSwap.sol:49, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:796, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:836, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:865`
+
+All live USDT->USDC Curve swaps pass `_expected = 0` into the registry exchange call. That means borrow conversions and over-repayment refunds accept any output amount, with no slippage bound enforced by the caller.
+
+**Impact:** Searchers can sandwich these swaps and extract value by manipulating the Curve pool around the transaction. On borrows, the protocol records the full USDT debt while the lev side may receive materially less USDC than intended; on refund paths, excess repayment returned to the lev side can be skimmed the same way.
+
+**Paths:**
+
+- Observe a borrow or repay/liquidation transaction that will trigger `changeUSDT2USDC`.
+
+- Front-run to move the Curve USDT/USDC price against the protocol.
+
+- The protocol swap executes with `min_dy = 0` and accepts the manipulated rate.
+
+- Back-run to restore the pool and capture the difference as MEV.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+## Medium (1)
+
+### F-004: Ignored Compound mint errors can brick later USDT resupply attempts via stale allowance
+
+**Confidence:** medium | **Locations:** `0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepositWithdraw.sol:77, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepositWithdraw.sol:78, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepositWithdraw.sol:79, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:602, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/DepToken.sol:822, 0x94290106d2a32bc89be9f1c3a3f3394f64578aa6/contracts/vendor/interfaces/SafeERC20.sol:53`
+
+`supplyUSDT2Cmp` uses `safeApprove` and then ignores the return code from cUSDT `mint(amount)`. If Compound returns a non-zero error code without consuming the approval, the USDT allowance from the market to cUSDT stays non-zero. Every later call to `supplyUSDT2Cmp` then reverts inside `safeApprove` because it forbids changing a non-zero allowance directly to another non-zero value.
+
+**Impact:** A single failed Compound supply can make later deposit or repay paths that try to re-supply idle USDT revert until someone manually resets the approval, causing operational DoS and trapping cash management in a broken state.
+
+**Paths:**
+
+- A mint or repay path reaches `supplyUSDT2Cmp` with excess USDT.
+
+- cUSDT `mint(amount)` returns an error code instead of reverting and does not spend the approved allowance.
+
+- The non-zero USDT allowance to cUSDT remains in place.
+
+- The next call into `supplyUSDT2Cmp` reverts on `SafeERC20: approve from non-zero to non-zero allowance`.
+
+*Round 1 | Agents: codex_1*
+
+---

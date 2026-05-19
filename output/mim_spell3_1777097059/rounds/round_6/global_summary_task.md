@@ -1,0 +1,73 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `cauldrons/CauldronV4.sol` remains the dominant audit surface: `cook()` dispatch/external calls, `updateExchangeRate()`, solvency-gated borrow/withdraw paths, liquidation accounting, borrow/debt and opening-fee booking, `withdrawFees()`, `reduceSupply()`, initialization, and owner/master-contract parameter storage
+- `cauldrons/PrivilegedCauldronV4.sol` remains the main secondary surface, especially `addBorrowPosition()` and privileged debt assignment that can separate debt ownership, MIM extraction, and interest timing
+- `cauldrons/PrivilegedCheckpointCauldronV4.sol` still matters mainly for liquidation-hook external interaction and checkpoint-token state coupling, but remains narrower than core cauldron debt/accounting paths
+- Supporting interfaces — `interfaces/IOracle.sol`, `interfaces/IBentoBoxV1.sol`, `interfaces/ICheckpointToken.sol`, `interfaces/ISwapperV2.sol`, `interfaces/IStrategy.sol` — continue to matter as assumption surfaces for oracle liveness/decimals, shared-balance accounting, and external call behavior
+
+## Issue Directions Seen
+- `cook()` remains a recurring hotspot because flexible action dispatch, arbitrary external calls, and value forwarding can blur intended safety boundaries
+- Oracle integration is a durable core concern: invalid, stale, reverting, or decimal-mismatched rates can distort or fully block borrow, withdraw, and liquidation behavior
+- Admin-controlled parameterization remains central: unbounded or weakly constrained updates to collateralization, interest, liquidation settings, or borrow opening fees can abruptly change solvency and debt economics
+- Fee and debt accounting mismatches remain promising, especially where bookkeeping for fees, supply reduction, or debt state diverges from actual MIM/share availability or effective borrower terms
+- Privileged debt paths continue to stand out where debt can be reassigned or created in ways that separate who receives assets, who bears liabilities, and when interest begins accruing
+- Shared-balance / skim mechanics remain dangerous where BentoBox-staged collateral or MIM shares can be relied on by one actor and captured by another
+- Liquidation logic is still worth attention for accounting consistency, rounding edges, oracle dependence, and external-hook interactions
+
+## Useful Context
+- Cross-round attention remains concentrated in `CauldronV4`, with the most durable themes combining flexible control flow, privileged state mutation, oracle dependency, and trust in external components
+- A repeated pattern is accounting or control assumptions drifting from economic reality: state can appear internally coherent while fee availability, borrowability, liquidation reachability, or debt burden differs materially
+- Post-action assumptions matter more than isolated local checks, especially around oracle failure handling, delayed accrual, admin reparameterization, shared-balance workflows, and master-vs-clone storage/ownership assumptions
+- Privileged variants remain less explored overall; `PrivilegedCauldronV4` consistently matters for retained debt/accounting themes, while `PrivilegedCheckpointCauldronV4` remains a narrower external-interaction surface
+
+
+## Latest Round Summary
+# Round 6 Summary
+
+## Agent: codex
+- files touched: `cauldrons/CauldronV4.sol`, `cauldrons/PrivilegedCauldronV4.sol`, `cauldrons/PrivilegedCheckpointCauldronV4.sol`, `interfaces/IBentoBoxV1.sol`, `interfaces/IOracle.sol`, `interfaces/ISwapperV2.sol`, `interfaces/ICheckpointToken.sol`, `interfaces/IStrategy.sol`
+- files revisited / highest-attention files: `cauldrons/CauldronV4.sol` was the clear focus, with repeated line-by-line review around `init()`, `_call()`, `cook()`, `liquidate()`, and `withdrawFees()`
+- main issue directions investigated: borrow/repay/liquidation state flows; `cook()` arbitrary-call surface and blacklist behavior; clone initialization behavior; fee accounting and BentoBox share conversion edge cases
+- promising but not retained directions: a low-confidence market-takeover scenario around public `init()` plus pre-init `cook(ACTION_CALL)` behavior was developed as `F-023` in the agent output but was not retained after merge
+
+## Cross-Agent Status
+- main overlap in file/area attention: this round’s attention was concentrated almost entirely on `cauldrons/CauldronV4.sol`, especially liquidation and fee-withdrawal logic
+- notable differences in attention: privileged cauldron variants and interface files were opened for context, but they did not receive comparable depth versus the main cauldron
+- underexplored but suspicious files/functions if clearly supported by the logs: `CauldronV4.sol` `init()` / `_call()` / `cook()` remained an active suspicious area in the logs, but only the liquidation and fee-dust paths were retained
+
+## Retained Findings
+- `F-022`: retained high-severity bad-debt path where severely underwater accounts can become unliquidatable because liquidation tries to seize more collateral than remains and reverts
+- `F-024`: retained low-severity fee-accounting issue where `withdrawFees()` rounds down BentoBox shares and then zeroes `feesEarned`, permanently discarding fee dust
+
+
+Output only markdown.

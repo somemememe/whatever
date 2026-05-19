@@ -1,0 +1,27 @@
+# Audit Report
+
+**Total findings:** 1
+
+## Critical (1)
+
+### F-001: Caller-controlled router target and calldata let anyone drain third-party ERC20 allowances
+
+**Confidence:** high | **Locations:** `Contract.sol:22, Contract.sol:25, Contract.sol:37, Contract.sol:40, Contract.sol:96, Contract.sol:106, Contract.sol:117, Contract.sol:118, Contract.sol:128, Contract.sol:129`
+
+The reproduced exploit shows that both Rubic proxy variants expose a `routerCallNative` entrypoint where the caller supplies the external call target (`_params.router`) and raw calldata (`_data`). By setting `router` to the USDC token contract and encoding `transferFrom(victim, attacker, amount)`, the proxy executes the token call as itself, so any user that previously approved the proxy can have funds pulled without their involvement.
+
+**Impact:** Any attacker can steal ERC20 balances from arbitrary victims up to each victim's allowance granted to the Rubic proxy, causing immediate loss of funds.
+
+**Paths:**
+
+- Identify a victim that approved one of the Rubic proxy contracts for an ERC20.
+
+- Set `_params.router` to that ERC20 token address.
+
+- Encode `_data` as `transferFrom(victim, attacker, amount)` for up to the victim's balance/allowance.
+
+- Call `routerCallNative(...)` so the proxy performs the token call as the approved spender and transfers funds to the attacker.
+
+*Round 1 | Agents: codex*
+
+---

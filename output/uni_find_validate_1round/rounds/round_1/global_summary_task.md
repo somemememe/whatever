@@ -1,0 +1,69 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `0x76ea342bc038d665e8a116392c82552d2605eda1/Contract.sol` — Uniswap V2-style pair logic; repeated focus on `initialize`, `swap`, `skim`, and `sync`, with issue direction centered on reserve/balance accounting and initialization assumptions
+
+## Issue Directions Seen
+- Compatibility/accounting risk when token balances change outside normal AMM flows, especially around reserve desynchronization versus live balances
+- Permissionless handling of surplus token balances, particularly `skim` behavior when extra balances can appear in the pair
+- Pair initialization safety and setup assumptions were investigated, but the stronger durable signal so far is accounting fragility rather than classic access-control failure
+- General correctness of pair state transitions (`swap`/`burn`/`sync`) remains tied to how non-standard token mechanics interact with reserve updates
+
+## Useful Context
+- Audit attention has been narrowly concentrated on a single pair contract rather than broader protocol surface
+- Retained concerns are driven by non-standard token behavior and balance/reserve mismatch, not by privileged-role misuse
+- The most durable cross-round theme so far is that external balance drift can create extractable surplus or force LP loss realization when reserves are reconciled
+
+
+## Latest Round Summary
+# Round 1 Summary
+
+## Agent: codex
+- files touched: `onchain_auto/0x76ea342bc038d665e8a116392c82552d2605eda1/Contract.sol`; also checked `/Users/zhanglongqin/AuditHoundV2/output/uni_find_validate_1round/global_summary.md` for overlap avoidance
+- files revisited / highest-attention files: repeated close reads of `onchain_auto/0x76ea342bc038d665e8a116392c82552d2605eda1/Contract.sol`, especially constructor/permit domain logic, `initialize`, `_update`, `mint`, `burn`, `swap`, `skim`, and `sync`
+- main issue directions investigated: reserve/balance accounting trust assumptions; malicious or non-standard token behavior around `balanceOf`; swap invariant manipulation; oracle/TWAP poisoning through forged reserves; surplus extraction via `skim`; reserve desync from balance-decreasing tokens; permit domain handling across chain-id changes
+- promising but not retained directions: non-atomic `mint`/`burn` theft scenarios and factory-led re-initialization via `initialize` were explored and reported by the agent, but were not retained after merge
+
+## Cross-Agent Status
+- main overlap in file/area attention: only one agent participated, with attention concentrated on the single pair contract and its balance/reserve update paths
+- notable differences in attention: none within this round; coverage stayed tightly focused on pair accounting, oracle state updates, and permit-domain behavior
+- underexplored but suspicious files/functions if clearly supported by the logs: no additional files were explored; within the contract, `initialize`, `mint`, and `burn` were investigated but did not survive merge as retained findings
+
+## Retained Findings
+- retained issues center on unsafe trust in token-reported balances and compatibility with non-standard token mechanics
+- the merged set keeps two balance-drift findings: permissionless surplus extraction through `skim` for balance-increasing tokens, and reserve desynchronization / swap DoS / LP loss for balance-decreasing tokens
+- the strongest retained issue is that a malicious token can spoof `balanceOf` during `swap` to fake input and drain the honest-side asset
+- a related retained issue is oracle manipulation: forged balances can be written into reserves and then propagated into TWAP/cumulative price data
+- the round also retained the cached `DOMAIN_SEPARATOR` permit replay risk across chain-id changes or forks
+
+
+Output only markdown.

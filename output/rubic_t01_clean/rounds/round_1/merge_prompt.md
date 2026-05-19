@@ -1,0 +1,173 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "FlawVerifier contains a permissionless hardcoded allowance-draining backdoor",
+    "locations": [
+      "FlawVerifier.sol:99",
+      "FlawVerifier.sol:180",
+      "FlawVerifier.sol:203",
+      "FlawVerifier.sol:308"
+    ],
+    "claim": "`executeOnOpportunity()` is publicly callable and intentionally scans a hardcoded victim list, builds `USDC.transferFrom(victim, address(this), amount)` calldata, and routes it through already-approved external proxies so this contract can pull third-party USDC without victim consent.",
+    "impact": "Any user whose USDC allowance is still live toward the referenced proxies can have their full approved balance stolen and liquidated into WETH. This is direct, irreversible theft of user funds.",
+    "paths": [
+      "Call `executeOnOpportunity()`.",
+      "The contract ranks victims by `min(balance, allowance)`.",
+      "For each candidate it encodes `transferFrom(victim, this, amount)`.",
+      "It passes `router = USDC` into the proxy call so the proxy becomes the approved spender executing the token pull.",
+      "Stolen USDC is immediately swapped to WETH."
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Transfer helper libraries silently accept EOAs or non-contract token addresses as successful transfers",
+    "locations": [
+      "interface.sol:4764",
+      "interface.sol:4780",
+      "interface.sol:5692",
+      "interface.sol:5722",
+      "interface.sol:5751"
+    ],
+    "claim": "Both `TransferHelper` and `SafeTransferLib` treat a low-level call as successful when it returns no data, but neither library verifies that `token` actually has code. Calls to an EOA, a precompile with unexpected behavior, or a destroyed contract can therefore be reported as successful even though no ERC20 state transition occurred.",
+    "impact": "Any caller that credits deposits, unlocks withdrawals, updates accounting, or marks a bridge/loan leg as complete after these helpers return can be tricked into releasing real value against a fake token transfer, causing reserve theft or insolvency.",
+    "paths": [
+      "An integration accepts a user-supplied or misconfigured token address.",
+      "The helper performs `token.call(...)` against an address with no ERC20 code.",
+      "The EVM call returns success with empty returndata.",
+      "The helper accepts this as success and the caller proceeds as if assets moved."
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Unsafe approve wrappers preserve the classic ERC20 allowance race",
+    "locations": [
+      "interface.sol:4764",
+      "interface.sol:5751"
+    ],
+    "claim": "`TransferHelper.safeApprove` and `SafeTransferLib.safeApprove` write a new allowance directly without enforcing a zero-reset flow. On standard ERC20s, a spender can front-run allowance changes and spend both the old and new allowance.",
+    "impact": "If an integration uses these wrappers to change an existing non-zero approval for an untrusted or compromised spender, users or the protocol can lose more tokens than intended.",
+    "paths": [
+      "A caller changes allowance from non-zero to another non-zero value.",
+      "The spender front-runs with `transferFrom` using the old allowance.",
+      "The approval update lands afterward, restoring fresh spend capacity."
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "Medium",
+    "confidence": "medium",
+    "title": "ETH transfer helpers forward all gas and can reenter integrating contracts",
+    "locations": [
+      "interface.sol:4789",
+      "interface.sol:5676"
+    ],
+    "claim": "Both ETH transfer helpers use raw `call{value: amount}` and forward all remaining gas to the recipient. Any caller that performs state changes after invoking these helpers, or assumes `transfer`-style stipend behavior, becomes reentrancy-prone.",
+    "impact": "Integrations can be drained or left in an inconsistent state if a malicious recipient reenters during payout, refund, or settlement flows.",
+    "paths": [
+      "An integration sends ETH to an untrusted recipient using one of these helpers.",
+      "The recipient's fallback receives full gas and calls back into the integration before state is finalized.",
+      "The integration executes a second withdrawal/refund/settlement path."
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "Unsafe fixed-point division helpers return zero on divide-by-zero instead of reverting",
+    "locations": [
+      "interface.sol:5643",
+      "interface.sol:5652",
+      "interface.sol:5661"
+    ],
+    "claim": "`unsafeMod`, `unsafeDiv`, and `unsafeDivUp` intentionally return `0` when the denominator is zero. Reusing them in pricing, share-minting, fee, or solvency code can silently convert an invariant violation into a valid-looking zero result.",
+    "impact": "A downstream protocol may undercharge, over-mint, misprice collateral, or bypass sanity checks instead of halting on impossible math, leading to loss or insolvency.",
+    "paths": [
+      "A denominator unexpectedly becomes zero due to empty supply, oracle failure, or initialization edge case.",
+      "The caller uses one of the `unsafe*` helpers.",
+      "Execution continues with a zero result rather than reverting."
+    ]
+  },
+  {
+    "id": "F-006",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Minimal proxy library does not verify that the implementation has deployed code",
+    "locations": [
+      "interface.sol:4801",
+      "interface.sol:4823",
+      "interface.sol:4839"
+    ],
+    "claim": "`Clones.clone` and `cloneDeterministic` only check that deployment itself succeeds; they never verify that `implementation` contains code. A zero-code, self-destructed, or metamorphic implementation can therefore produce clones that appear deployed but delegate to nothing or to unexpected logic.",
+    "impact": "Factories that accept configurable implementations can accidentally or maliciously deploy bricked clones, or point users at clones whose behavior later changes in a way that locks or steals funds.",
+    "paths": [
+      "A factory passes an implementation address without validating `code.length`.",
+      "The clone deploys successfully.",
+      "User calls delegate into an address with no code or mutated code, breaking invariants or locking assets."
+    ]
+  }
+]
+
+```
+
+
+
+## Excluded From Direct Audit Scope
+Do not keep findings whose reportable root cause exists solely in files matching:
+- `out/**`
+
+Those files may still be read as context for in-scope implementation code.
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

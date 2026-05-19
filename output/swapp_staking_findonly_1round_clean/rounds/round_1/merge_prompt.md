@@ -1,0 +1,127 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Stablecoin accounting assumes Compound calls succeed even though cTokens return error codes",
+    "locations": [
+      "Staking.sol:259",
+      "Staking.sol:265",
+      "Staking.sol:306",
+      "Staking.sol:332"
+    ],
+    "claim": "The contract never checks the return values of `CTokenInterface.mint`, `redeemUnderlying`, or `redeem`, but it updates `stableCoinBalances`, user balances, and downstream transfers as if those Compound operations always succeeded.",
+    "impact": "If a Compound market is paused, illiquid, or otherwise returns a non-zero error, the contract's internal accounting diverges from its real assets. Deposits can be credited without being invested, withdrawals can consume any idle stablecoins before later users revert, and harvest functions can proceed on stale assumptions, creating pool-wide insolvency or withdrawal denial for remaining depositors.",
+    "paths": [
+      "deposit(USDC/USDT/DAI) -> `stableCoinBalances[token] += amount` -> `_transferToCompound()` -> `cToken.mint(amount)` returns non-zero -> user is still credited even though Compound leg failed",
+      "withdraw(USDC/USDT/DAI) -> `stableCoinBalances[token] -= amount` -> `_redeemFromCompound()` -> `redeemUnderlying(amount)` returns non-zero -> any idle local balance is still paid out to early withdrawers while later users face failed withdrawals"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Emergency withdrawals remove principal without removing epoch stake checkpoints",
+    "locations": [
+      "Staking.sol:61",
+      "Staking.sol:487",
+      "Staking.sol:508",
+      "Staking.sol:558"
+    ],
+    "claim": "`emergencyWithdraw()` zeroes `balances[msg.sender][token]` and transfers tokens out, but never updates `balanceCheckpoints` or `poolSize`, so epoch-based accounting continues to treat the user as staked.",
+    "impact": "A user can pull out their non-stable tokens yet still appear in `getEpochUserBalance()` for the current and future epochs, corrupting pool accounting and enabling reward dilution or outright reward theft against users who remain staked.",
+    "paths": [
+      "Wait until `getCurrentEpoch() - lastWithdrawEpochId[token] >= 10` (already true for dormant pools because `lastWithdrawEpochId` defaults to 0) -> call `emergencyWithdraw(token)` -> `balanceOf()` becomes 0 but `getEpochUserBalance(user, token, epoch)` still returns the old effective stake"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Arbitrary ERC20 deposits are credited by requested amount instead of actual tokens received",
+    "locations": [
+      "Staking.sol:113",
+      "Staking.sol:129",
+      "Staking.sol:136",
+      "Staking.sol:148",
+      "Staking.sol:363",
+      "Staking.sol:379",
+      "Staking.sol:393"
+    ],
+    "claim": "For non-stable pools, the contract accepts any token address and books `amount` directly into user balances, checkpoints, and pool sizes without verifying the actual transfer result or measuring the real balance delta.",
+    "impact": "Fee-on-transfer, deflationary, rebasing, or false-return ERC20s can create phantom stake and overstated pool sizes. An attacker can deposit a token that transfers less than requested, receive full internal credit, and later withdraw more than the contract actually received, pushing the shortfall onto other depositors in that token pool.",
+    "paths": [
+      "Choose a non-stable token with a transfer tax/burn -> deposit `amount` -> contract receives less than `amount` but credits full `amount` to `balances` and epoch checkpoints -> later withdraw full credited amount once other users have added liquidity"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "A single failed Compound mint can permanently brick future stablecoin deposits",
+    "locations": [
+      "Staking.sol:117",
+      "Staking.sol:259",
+      "Staking.sol:354",
+      "SafeERC20.sol:60"
+    ],
+    "claim": "`_transferToCompound()` and the remint path in `getInterest()` use `safeApprove(cToken, amount)`, which requires the current allowance to be zero, but failed `cToken.mint()` calls are ignored; when mint returns an error before consuming allowance, that non-zero allowance becomes stuck with no reset path.",
+    "impact": "After one paused-market or failed-mint event, subsequent stablecoin deposits can revert forever on `safeApprove()` because the old allowance is still non-zero. This creates a persistent denial of service for affected stablecoin pools and prevents the contract from re-investing idle principal.",
+    "paths": [
+      "deposit(USDC/USDT/DAI) while the corresponding cToken `mint()` returns non-zero -> allowance to the cToken is set but not spent -> every later deposit for that stablecoin reverts on `SafeERC20: approve from non-zero to non-zero allowance`",
+      "call `getInterest()` when the final remint returns non-zero -> principal stays idle and the leftover allowance blocks future reinvestment/deposits the same way"
+    ]
+  }
+]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

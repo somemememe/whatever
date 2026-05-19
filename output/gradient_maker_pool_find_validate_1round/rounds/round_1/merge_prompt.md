@@ -1,0 +1,159 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Depositing while the orderbook holds assets mints inflated LP shares",
+    "locations": [
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:160",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:172",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:439",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:472",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:504",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:539"
+    ],
+    "claim": "LP shares are minted against `pool.totalLiquidity`, but `transferETHToOrderbook` and `transferTokenToOrderbook` reduce that denominator without burning any LP shares. A user can therefore deposit while pool assets are temporarily parked in the orderbook, receive an outsized number of shares, and later redeem those shares after the assets return.",
+    "impact": "This lets a depositor steal principal from existing LPs. The attack does not require compromising the owner; it only requires timing a deposit during normal orderbook outflows and withdrawing after inventory is returned.",
+    "paths": [
+      "LP1 seeds a pool and receives 1,000 LP shares for 1,000 units of liquidity.",
+      "The orderbook pulls 900 units out of the pool via `transferETHToOrderbook` / `transferTokenToOrderbook`, leaving `pool.totalLiquidity = 100` while `pool.totalLPShares` stays 1,000.",
+      "An attacker deposits 100 units and receives `100 * 1000 / 100 = 1000` new LP shares.",
+      "When the orderbook later returns the 900 units, the attacker owns 50% of all shares despite contributing only ~9% of the final pool value, and can withdraw roughly 550 units."
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Reward accounting mixes raw deposits and LP shares, enabling reward theft and lockups",
+    "locations": [
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:145",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:168",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:203",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:252",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:292",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:296"
+    ],
+    "claim": "The contract accrues and stores `rewardDebt` using `mm.tokenAmount + mm.ethAmount`, but `claimReward()` calculates the user's accumulated rewards with `mm.lpShares`. Once LP shares diverge from recorded deposits (for example after orderbook outflows/inflows or share inflation), reward math becomes inconsistent and can overpay, underflow, or permanently desynchronize user accounting.",
+    "impact": "Attackers can claim rewards accrued before they joined, draining the reward pool from honest LPs. In the opposite direction, honest users can hit arithmetic underflow in `claimReward()` or `withdrawLiquidity()` and become unable to claim or exit until the pool state changes enough to reverse the mismatch.",
+    "paths": [
+      "Rewards accrue while `accRewardPerShare > 0`.",
+      "The orderbook reduces `pool.totalLiquidity`, allowing a new depositor to receive disproportionately many `lpShares` while `rewardDebt` is still initialized from only the raw deposit amount.",
+      "The new depositor immediately calls `claimReward()`; `accumulated = lpShares * accRewardPerShare`, while `rewardDebt` is much smaller, so they steal previously accrued rewards.",
+      "If `claimReward()` sets `rewardDebt` from `lpShares` in a state where `lpShares > tokenAmount + ethAmount`, a later `withdrawLiquidity()` computes `pending` from the smaller raw-deposit base and reverts on underflow, locking liquidity."
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Token accounting trusts the requested amount instead of the amount actually received",
+    "locations": [
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:138",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:165",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:172",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:535",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:538",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:539"
+    ],
+    "claim": "Both `provideLiquidity()` and `receiveTokenFromOrderbook()` credit balances using the nominal `tokenAmount` / `amount` argument after calling `safeTransferFrom`, instead of measuring the token balance delta. Fee-on-transfer, rebasing, or otherwise non-standard tokens can therefore cause the pool to mint shares and update accounting for more tokens than were actually received.",
+    "impact": "An attacker can over-mint LP shares and later withdraw more assets than they contributed, stealing from honest LPs once enough real tokens/ETH are in the pool. Even without a profitable withdrawal, the pool can become insolvent because `pool.totalToken` exceeds the contract's real token balance, causing later withdrawals and orderbook transfers to revert.",
+    "paths": [
+      "A token charges a transfer tax or otherwise delivers fewer tokens than requested.",
+      "The attacker calls `provideLiquidity()` with `tokenAmount = 100`, but only 90 tokens arrive.",
+      "The contract still credits `mm.tokenAmount += 100`, `pool.totalToken += 100`, and mints LP shares against the inflated accounting.",
+      "Later withdrawals are computed from the inflated state, letting the attacker extract value from subsequent deposits or forcing the pool into a stuck, undercollateralized state."
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "High",
+    "confidence": "high",
+    "title": "Owner can unconditionally drain all pool and reward assets",
+    "locations": [
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:317",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:321",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:329",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:331",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:348",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:351"
+    ],
+    "claim": "The owner can call `emergencyWithdraw()` / `emergencyWithdrawETH()` at any time to transfer the contract's entire ETH balance and arbitrary token balances to `owner()`, with no pause requirement, no timelock, and no preservation of LP accounting.",
+    "impact": "This is a direct rug vector against all LP principal and unclaimed rewards. After the owner drains funds, users retain bookkeeping entries but cannot actually withdraw their assets.",
+    "paths": [
+      "Users deposit liquidity and/or reward ETH accumulates in the contract.",
+      "The owner calls `emergencyWithdraw()` with the active pool tokens, or `emergencyWithdrawETH()`.",
+      "All assets move to the owner, leaving LPs with unrecoverable claims."
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "Low",
+    "confidence": "high",
+    "title": "The `minTokenAmount` parameter provides no real slippage protection",
+    "locations": [
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:126",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:129",
+      "0x37ea5f691bce8459c66ffceeb9cf34ffa32fdadc/contracts/GradientMarketMakerPool.sol:132"
+    ],
+    "claim": "The code checks `tokenAmount >= minTokenAmount`, which only compares two user-supplied inputs and does not verify that the computed or actually required token amount meets the user's slippage bound.",
+    "impact": "Depositors receive a false sense of protection. Reserve manipulation or stale quoting can still force them to provide an unexpectedly bad ratio while the advertised slippage check passes.",
+    "paths": [
+      "A user signs a transaction expecting `minTokenAmount` to cap adverse price movement.",
+      "Reserves change before execution, altering `expectedTokens`.",
+      "As long as the caller's own `tokenAmount` argument is still above their own `minTokenAmount`, the function does not enforce the intended slippage bound."
+    ]
+  }
+]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

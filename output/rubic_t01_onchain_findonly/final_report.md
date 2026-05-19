@@ -1,0 +1,97 @@
+# Audit Report
+
+**Total findings:** 4
+
+## High (2)
+
+### F-001: Old proxy credits fee-on-transfer inputs at the user-declared amount, allowing theft from pre-existing token balances
+
+**Confidence:** high | **Locations:** `onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:69, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:73, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:81, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:83`
+
+The 0x3335 deployment transfers `_params.srcInputAmount` in and then computes fees, approvals, and the expected spend from that declared amount instead of from the contract's actual post-transfer balance delta. For fee-on-transfer or deflationary tokens, the proxy can therefore approve and spend more tokens than it actually received from the caller.
+
+**Impact:** If the proxy already holds the same token from accrued fees, prior stuck funds, or accidental transfers, an attacker can route a taxed token deposit and have the shortfall sourced from the proxy's existing balance. This is direct theft of inventory already sitting in the proxy.
+
+**Paths:**
+
+- The proxy already holds token `T` from previous activity.
+
+- An attacker calls `routerCall` with `srcInputToken = T` and `srcInputAmount = X`, where transferring `X` to the proxy yields only `X - fee`.
+
+- `accrueTokenFees` and `SmartApprove` still use the larger declared `X`-based amount, and the router call is validated against spending that larger amount.
+
+- The router/gateway pulls the difference from the proxy's pre-existing `T` balance, letting the attacker consume tokens they never supplied.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-002: Old proxy leaves permanent max approvals to gateways, exposing all future balances to gateway compromise or abuse
+
+**Confidence:** high | **Locations:** `onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:81, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/libraries/SmartApprove.sol:19, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/libraries/SmartApprove.sol:22, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/libraries/SmartApprove.sol:24, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/libraries/SmartApprove.sol:29`
+
+In the 0x3335 deployment, each successful `routerCall` can grant `_gateway` a `type(uint256).max` allowance through `SmartApprove`, and that allowance is never reset after the external call finishes.
+
+**Impact:** Any whitelisted gateway that is later compromised, upgraded maliciously, or simply exposes a callable pull path can drain the proxy's entire current and future balance of that token, including accrued fees and other users' funds, without any further approval transaction from the proxy.
+
+**Paths:**
+
+- A normal user routes token `T` through gateway `G`.
+
+- `SmartApprove` raises the proxy's allowance for `G` on `T` to `uint256.max`.
+
+- After the transaction, the allowance remains live indefinitely.
+
+- If `G` becomes malicious or attacker-controlled, it can call `transferFrom(proxy, attacker, amount)` and empty the proxy's `T` balance whenever funds appear.
+
+*Round 1 | Agents: codex*
+
+---
+
+## Medium (1)
+
+### F-006: Native router calls do not refund or account for unspent ETH returned to the proxy
+
+**Confidence:** medium | **Locations:** `onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:109, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:117, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:120, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:113, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:121, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:124`
+
+Both `routerCallNative` entrypoints forward the full post-fee ETH amount to the whitelisted router, but unlike the ERC20 flow they never verify how much native asset was actually consumed and never refund ETH that may be sent back to the proxy during the router call. Any surplus returned to `msg.sender` lands on the proxy itself because the proxy is the caller.
+
+**Impact:** If an approved router or downstream protocol refunds unused ETH, the refund can remain stuck in the proxy and later be swept by the admin. Users can therefore lose native funds even when the router honestly returns excess value.
+
+**Paths:**
+
+- A user calls `routerCallNative` with a whitelisted router and sends `msg.value`.
+
+- The proxy deducts fees and forwards the remaining ETH to `_params.router`.
+
+- The router or a downstream call path refunds unused ETH to the caller, which is the proxy contract.
+
+- `routerCallNative` exits without checking spent amount or forwarding any returned ETH back to the user, and `sweepTokens(address(0), ...)` lets the admin extract the stranded balance later.
+
+*Round 1 | Agents: merge-review*
+
+---
+
+## Low (1)
+
+### F-003: Any caller can impersonate a privileged integrator and inherit its custom fee schedule
+
+**Confidence:** high | **Locations:** `onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:71, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:73, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/contracts/RubicProxy.sol:88, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/BridgeBase.sol:140, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/BridgeBase.sol:174, onchain/0x3335a88bb18fd3b6824b59af62b50ce494143333/rubic-bridge-base/contracts/BridgeBase.sol:311, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:80, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:82, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:89, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:111, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:113, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/contracts/RubicProxy.sol:116, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/rubic-bridge-base/contracts/BridgeBase.sol:140, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/rubic-bridge-base/contracts/BridgeBase.sol:174, onchain/0x33388cf69e032c6f60a420b37e44b1f5443d3333/rubic-bridge-base/contracts/BridgeBase.sol:311`
+
+Both deployments key their fee logic entirely off the user-supplied `_params.integrator` address. The proxies load `integratorToFeeInfo[_params.integrator]` and apply its token and fixed-fee parameters, but never verify that the caller is actually routed by, approved by, or authenticated to that integrator.
+
+**Impact:** If management configures any partner integrator with discounted or zero fees, any user can reuse that address to pay the partner rate. This causes protocol fee leakage and breaks the assumption that custom fee schedules are reserved for specific integrators.
+
+**Paths:**
+
+- Management calls `setIntegratorInfo` to give integrator `I` a lower `tokenFee` and/or `fixedFeeAmount`.
+
+- An arbitrary user submits a swap/bridge call with `_params.integrator = I`.
+
+- `accrueTokenFees` and `accrueFixedCryptoFee` apply `I`'s custom fee schedule with no authorization check.
+
+- The user receives the discounted fee treatment even though they have no relationship with `I`.
+
+*Round 1 | Agents: codex*
+
+---

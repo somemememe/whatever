@@ -1,0 +1,127 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "sDOLA collateral can be re-priced by donating assets directly to the vault",
+    "locations": [
+      "Curve_LlamaLend.sol:107",
+      "Curve_LlamaLend.sol:108",
+      "Curve_LlamaLend.sol:109",
+      "Curve_LlamaLend.sol:132",
+      "Curve_LlamaLend.sol:135"
+    ],
+    "claim": "The exploit path redeems sDOLA into DOLA and then stakes DOLA with `recipient = address(sDOLA)`, which donates assets to the vault without minting matching sDOLA shares. Any collateral or health logic that trusts `sDOLA.convertToAssets(...)` or share-based accounting can therefore be flash-loan manipulated inside one transaction.",
+    "impact": "An attacker can make the protocol overvalue sDOLA collateral, borrow crvUSD against insufficient real backing, and/or distort borrower health enough to create bad debt or trigger wrongful liquidations.",
+    "paths": [
+      "Acquire sDOLA -> `sDOLA.redeem(...)` -> `DOLA_SAVINGS.stake(..., address(sDOLA))` -> `sDOLA.convertToAssets(1e18)` -> `crvUSD_Controller.min_collateral(...)` -> `crvUSD_Controller.create_loan(...)`"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "Critical",
+    "confidence": "medium",
+    "title": "Loan sizing and liquidation depend on flash-loanable spot liquidity from thin pools",
+    "locations": [
+      "Curve_LlamaLend.sol:95",
+      "Curve_LlamaLend.sol:96",
+      "Curve_LlamaLend.sol:103",
+      "Curve_LlamaLend.sol:104",
+      "Curve_LlamaLend.sol:118",
+      "Curve_LlamaLend.sol:123",
+      "Curve_LlamaLend.sol:132"
+    ],
+    "claim": "Before borrowing and liquidating, the attacker pushes `alUSD_sDOLA`, `SAVE_DOLA`, and `LLAMMA_CRV_USD_AMM` with flash-loaned size and then immediately relies on `min_collateral(...)` and liquidation flows. That sequence indicates the market is using synchronous AMM spot state, or logic derived from it, instead of a manipulation-resistant oracle.",
+    "impact": "A one-block price distortion can make healthy users appear liquidatable or let the attacker open an undercollateralized loan, leading to direct collateral theft and protocol insolvency.",
+    "paths": [
+      "`alUSD_FRAXB3CRV_F.exchange_underlying(...)` -> `alUSD_sDOLA.exchange(...)` -> `SAVE_DOLA.exchange(...)` -> `LLAMMA_CRV_USD_AMM.exchange(...)` -> `crvUSD_Controller.users_to_liquidate()` / `crvUSD_Controller.min_collateral(...)`"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Liquidations become executable in the same transaction as the price manipulation",
+    "locations": [
+      "Curve_LlamaLend.sol:111",
+      "Curve_LlamaLend.sol:112",
+      "Curve_LlamaLend.sol:115",
+      "Curve_LlamaLend.sol:171",
+      "Curve_LlamaLend.sol:172",
+      "Curve_LlamaLend.sol:179",
+      "Curve_LlamaLend.sol:180"
+    ],
+    "claim": "Immediately after manipulating vault/pool state, the attacker can 'poke' the market and then call `users_to_liquidate()` followed by `liquidate(...)` for each returned borrower in the same transaction. This implies no TWAP delay, cooldown, or deferred health settlement between price update and liquidation eligibility.",
+    "impact": "Flash-loan attackers can mass-liquidate positions that are only briefly unhealthy under manipulated spot conditions, extracting borrower collateral from otherwise solvent accounts.",
+    "paths": [
+      "Manipulate sDOLA and pool state -> `LLAMMA_CRV_USD_AMM.exchange(0, 1, 0, 1)` -> deploy helper -> `users_to_liquidate()` -> loop over `liquidate(user, 0)`"
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "Medium",
+    "confidence": "low",
+    "title": "Zero-amount LLAMMA exchanges appear to mutate market state for free",
+    "locations": [
+      "Curve_LlamaLend.sol:111",
+      "Curve_LlamaLend.sol:131"
+    ],
+    "claim": "The exploit calls `LLAMMA_CRV_USD_AMM.exchange(0, 1, 0, 1)` twice with `in_amount = 0` as a meaningful step, which strongly suggests the AMM accepts a zero-input trade that still refreshes internal state, pricing, or liquidation bands.",
+    "impact": "If a zero-cost call can advance oracle/band state, attackers can repeatedly commit manipulated prices without paying swap cost or inventory risk, making liquidation and borrow-side oracle attacks much cheaper and easier to automate.",
+    "paths": [
+      "Manipulate surrounding pool/vault state -> `LLAMMA_CRV_USD_AMM.exchange(..., 0, ...)` -> immediately consume the refreshed state via liquidation or borrowing"
+    ]
+  }
+]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

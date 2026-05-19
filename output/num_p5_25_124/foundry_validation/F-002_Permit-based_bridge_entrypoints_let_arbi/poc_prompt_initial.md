@@ -1,0 +1,96 @@
+You are operating inside a Foundry workspace to build a real exploit PoC.
+
+Allowed inputs only:
+- Hypothesis file: finding:num
+- RPC: https://eth-mainnet.g.alchemy.com/v2/ugA3TDW3tlXhwhc3SHfuk
+- Chain: mainnet mainnet
+- Chain ID: 1
+- Fork block: 16029969
+- Target contract: 0x765277EebeCA2e31912C9946eAe1021199B39C61
+- Target source root: /Users/zhanglongqin/AuditHoundV2/cases/num/src
+
+Finding:
+- id: F-002
+- severity: High
+- confidence: high
+- title: Permit-based bridge entrypoints let arbitrary callers redirect a signer’s funds to attacker-chosen recipients, chains, and routes
+- claim: The `*WithPermit` and `*WithTransferPermit` bridge entrypoints use the signature only to authorize token movement into the router/token vault, but they never require `msg.sender == from` and do not authenticate bridge-critical fields such as destination recipient, destination chain, or swap path. A third party who obtains a valid permit-style signature can therefore submit the transaction themselves and choose where the bridged value ultimately goes.
+- impact: A malicious frontend, relayer, or signature collector can steal a victim’s funds by consuming the victim’s permit and bridging the value to an attacker-controlled address or chain. In the swap variants, the attacker can also choose the output route and asset, converting the victim’s funds into attacker-preferred destination assets.
+
+Exploit paths:
+- Victim signs a permit for `anySwapOutUnderlyingWithPermit`; attacker submits the call first with `to` set to the attacker and `toChainID` set to the attacker’s preferred chain.
+- Victim signs for a cross-chain swap permit; attacker calls `anySwapOutExactTokensForTokensUnderlyingWithPermit` or `anySwapOutExactTokensForNativeUnderlyingWithPermit` with attacker-chosen `path` and `to`, causing the victim’s value to be bridged into attacker-selected assets.
+- The same redirection works through the `*WithTransferPermit` variants because the signed transfer only covers moving funds into the bridge token, not the final bridge recipient or chain.
+
+Relevant locations:
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:257
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:269
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:272
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:275
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:286
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:288
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:382
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:395
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:398
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:407
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:412
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:424
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:427
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:476
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:489
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:492
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:501
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:506
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:518
+- onchain_auto/0x765277eebeca2e31912c9946eae1021199b39c61/Contract.sol:521
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state at or before the fork block.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+- You MUST implement the exploit aligned with the full `Exploit paths` list.
+- Do not ignore any path stage unless it is provably infeasible at this fork state.
+- Keep the generated PoC mechanically aligned with `Exploit paths` (same core actions, same causality).
+- Path-Strict requirements (all cases):
+  - Treat `Exploit paths` as the allowed attack plan.
+  - Implement a one-to-one mapping from PoC on-chain actions to path stages.
+  - Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but they must preserve the same exploit causality.
+  - If an additional step is strictly required for execution, keep it minimal and explain in code comments why it does not change the exploit hypothesis.
+- If any path stage is infeasible at this fork state, return concrete infeasibility reasons instead of pivoting to an unrelated route.
+
+Task:
+1) Convert the hypothesis into concrete exploit preconditions and a profit path.
+2) Build and iterate a Foundry exploit PoC implementation in `src/FlawVerifier.sol`.
+3) Ensure the PoC can be validated by a Foundry test harness at `test/ExploitPOC.t.sol`.
+4) Iterate until either:
+   - positive net attacker profit is achieved after repaying temporary capital, or
+   - failure is proven with a clear mechanical/economic reason.
+
+Final response must contain only:
+- whether profit was achieved
+- profit token and amount
+- exploit path used
+- whether the original hypothesis was validated or refuted
+
+Harness note:
+- This validator performs iterative attempts up to a configured max-attempts.
+- The test file is auto-generated by the harness.
+- If exploitability is not feasible at this fork state, return best-effort executable logic that fails only for concrete on-chain preconditions.
+- If any `Exploit paths` stage is infeasible, state the concrete on-chain reason in code comments and avoid silently changing to an unrelated route.
+- Because the harness owns the test execution loop, do not output prose summaries; return Solidity only.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Output format required by this harness:
+- Return ONLY COMPLETE Solidity source code for `src/FlawVerifier.sol` (no markdown, no prose).
+- Include at least one deployable contract with a zero-argument constructor.
+- Define `function executeOnOpportunity() external` or `public` as the fixed exploit entry.
+- Expose non-ETH profit metadata via getters:
+  - `profitToken() external view returns (address)` (address(0) means native ETH)
+  - `profitAmount() external view returns (uint256)` (net realized profit amount in `profitToken` units)

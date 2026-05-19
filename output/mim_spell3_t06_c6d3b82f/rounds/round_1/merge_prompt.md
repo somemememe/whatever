@@ -1,0 +1,109 @@
+Below are findings and vulnerability signals from 1 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Unhandled `cook` actions clear the final solvency check, enabling unbacked MIM borrows",
+    "locations": [
+      "cauldrons/CauldronV4.sol:456",
+      "cauldrons/CauldronV4.sol:488",
+      "cauldrons/CauldronV4.sol:490",
+      "cauldrons/CauldronV4.sol:538"
+    ],
+    "claim": "In the base contract, `_additionalCookAction()` is an empty virtual function that returns a zeroed `CookStatus`. Any unsupported action code—including the advertised `ACTION_ACCRUE` value `8`, which is never explicitly handled—therefore overwrites `status.needsSolvencyCheck` back to `false`. An attacker can call `cook()` with `[ACTION_BORROW, ACTION_ACCRUE]` (or `[ACTION_BORROW, arbitraryUnsupportedAction]`) so `_borrow()` transfers out MIM, sets `needsSolvencyCheck = true`, and the following unhandled action silently clears that flag before the epilogue runs.",
+    "impact": "A user with insufficient collateral can borrow MIM anyway and walk away with the BentoBox shares/tokens, leaving the cauldron undercollateralized or fully drained of available MIM liquidity.",
+    "paths": [
+      "cook([5,8], [0,0], [abi.encode(amount, attacker), bytes(\"\")])",
+      "cook([5,100], [0,0], [abi.encode(amount, attacker), bytes(\"\")])"
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "High",
+    "confidence": "high",
+    "title": "The same `cook` status reset lets insolvent accounts remove pledged collateral",
+    "locations": [
+      "cauldrons/CauldronV4.sol:281",
+      "cauldrons/CauldronV4.sol:484",
+      "cauldrons/CauldronV4.sol:486",
+      "cauldrons/CauldronV4.sol:456",
+      "cauldrons/CauldronV4.sol:538"
+    ],
+    "claim": "`_removeCollateral()` is also only protected by the deferred `cook()` solvency epilogue. Because an unhandled action resets the local `CookStatus`, an underwater borrower can execute `[ACTION_REMOVE_COLLATERAL, ACTION_ACCRUE]` (or any unsupported second action) and bypass the post-removal solvency check entirely.",
+    "impact": "Once a position is at or below its collateral requirement, the borrower can still pull out collateral shares and leave the protocol with larger bad debt. In combination with public `skim`-based collateral accounting and flash liquidity, this allows a borrower to stage temporary collateral, borrow, and then extract that collateral back out in the same attack flow.",
+    "paths": [
+      "addCollateral(attacker, true, share) -> cook([4,8], [0,0], [abi.encode(share, attacker), bytes(\"\")])",
+      "flashLoan(collateral) -> bento.deposit(collateral, attacker, cauldron, amount, 0) -> addCollateral(attacker, true, shareOut) -> cook([4,8], ...)"
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "High",
+    "confidence": "medium",
+    "title": "Clone initialization ignores oracle failure and can lock in a zero exchange rate",
+    "locations": [
+      "cauldrons/CauldronV4.sol:146",
+      "cauldrons/CauldronV4.sol:158",
+      "cauldrons/CauldronV4.sol:226",
+      "cauldrons/CauldronV4.sol:232"
+    ],
+    "claim": "`init()` discards the success flag returned by `oracle.get(oracleData)` and unconditionally stores the returned `rate` into `exchangeRate`. If the initial oracle read fails and returns `0` (a common failure value), the cauldron is initialized with `exchangeRate = 0`. Later, `updateExchangeRate()` preserves the old value whenever `oracle.get()` returns `updated == false`, so a failed oracle can keep the zero rate alive.",
+    "impact": "With `exchangeRate == 0`, the debt side of `_isSolvent()` collapses to zero, so any account with even 1 share of collateral appears solvent and can borrow out the entire MIM balance or remove collateral until the oracle recovers. A launch-time oracle outage can therefore expose the whole market to immediate draining.",
+    "paths": [
+      "init(...) while oracle.get returns (false, 0)",
+      "addCollateral(attacker, false/true, dustShare) -> borrow(attacker, maxAvailableMim)"
+    ]
+  }
+]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

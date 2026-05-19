@@ -1,0 +1,87 @@
+# Scope
+
+- Moloch.sol:Moloch (2110 LOC) — TODO
+- Moloch.sol:Shares (2110 LOC) — TODO
+- Moloch.sol:Loot (2110 LOC) — TODO
+- Moloch.sol:Badges (2110 LOC) — TODO
+- Moloch.sol:IMajeurRenderer (2110 LOC) — TODO
+- Moloch.sol:Summoner (2110 LOC) — TODO
+- Renderer.sol:IMajeurRenderer (891 LOC) — TODO
+- Renderer.sol:IMoloch (891 LOC) — TODO
+- Renderer.sol:Renderer (891 LOC) — TODO
+- Renderer.sol:for (891 LOC) — TODO
+- Renderer.sol:Display (891 LOC) — TODO
+- peripheral/BondingCurveSale.sol:for (379 LOC) — TODO
+- peripheral/BondingCurveSale.sol:BondingCurveSale (379 LOC) — TODO
+- peripheral/BondingCurveSale.sol:IMoloch (379 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:as (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:acts (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:ClassicalCurveSale (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:URI (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:ERC20 (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:before (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:for (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:as (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:to (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:to (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:as (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:that (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:ETH (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:IZAMM (1637 LOC) — TODO
+- peripheral/ClassicalCurveSale.sol:ERC20 (1637 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:for (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:IZAMM (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:IMoloch (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:for (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:IShareSale (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:allowances (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:LPSeedSwapHook (1091 LOC) — TODO
+- peripheral/LPSeedSwapHook.sol:if (1091 LOC) — TODO
+- peripheral/MolochViewHelper.sol:ISummoner (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:IBadges (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:IShares (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:ILoot (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:IERC20 (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:IDAICO (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:IMoloch (1247 LOC) — TODO
+- peripheral/MolochViewHelper.sol:MolochViewHelper (1247 LOC) — TODO
+- peripheral/RollbackGuardian.sol:IMoloch (207 LOC) — TODO
+- peripheral/RollbackGuardian.sol:RollbackGuardian (207 LOC) — TODO
+- peripheral/RollbackGuardian.sol:uint256 (207 LOC) — TODO
+- peripheral/SafeSummoner.sol:ISummoner (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:IMoloch (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:IShareSale (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:ITapVest (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:ILPSeedSwapHook (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:ISharesLoot (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:IShareBurner (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:IRollbackGuardian (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:IMolochBumpConfig (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:SafeSummoner (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:address (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:address (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:address (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:address (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:via (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:address (1128 LOC) — TODO
+- peripheral/SafeSummoner.sol:deployed (1128 LOC) — TODO
+- peripheral/ShareBurner.sol:IShares (91 LOC) — TODO
+- peripheral/ShareBurner.sol:IMoloch (91 LOC) — TODO
+- peripheral/ShareBurner.sol:ShareBurner (91 LOC) — TODO
+- peripheral/ShareBurner.sol:uint256 (91 LOC) — TODO
+- peripheral/ShareBurner.sol:uint256 (91 LOC) — TODO
+- peripheral/ShareSale.sol:an (226 LOC) — TODO
+- peripheral/ShareSale.sol:ShareSale (226 LOC) — TODO
+- peripheral/ShareSale.sol:and (226 LOC) — TODO
+- peripheral/ShareSale.sol:IMoloch (226 LOC) — TODO
+- peripheral/TapVest.sol:an (241 LOC) — TODO
+- peripheral/TapVest.sol:TapVest (241 LOC) — TODO
+- peripheral/TapVest.sol:IMoloch (241 LOC) — TODO
+- peripheral/TapVest.sol:IMoloch (241 LOC) — TODO
+- peripheral/Tribute.sol:Tribute (337 LOC) — TODO
+- peripheral/Tribute.sol:for (337 LOC) — TODO
+
+# Notes
+
+- Auto-generated contract-level map.
+- Descriptions are placeholders and can be edited later.

@@ -1,0 +1,74 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `FlawVerifier.sol` — dominant audit focus; settlement execution, replay construction/corruption, resolver callback handling, and token-drain helpers define the main risk surface
+- `executeOnOpportunity` flow — repeatedly examined for divergence between signed order intent and externally supplied interaction bytes or payer/source fields
+- `_buildReplayOrder` / replay path / `_tryReplayCalldataCorruption()` — recurring attention on calldata shaping, offset/length handling, and reuse of historical order material
+- `_drainSettlementToken` / settlement payout path — repeatedly tied to draining live `SETTLEMENT` inventory or omnibus balances through weak asset/accounting assumptions
+- Resolver / callback path (`NoopResolver`) — explored as a place where callback success may be satisfied by inert or no-code targets rather than meaningful validation
+- Swap/conversion helpers and referenced interfaces/constants — lightly surveyed side surface, but still underexplored relative to replay/drain logic
+- `Counter.sol` — briefly revisited for unrestricted mutation style concerns, but remains peripheral to the core risk picture
+
+## Issue Directions Seen
+- Unsigned or weakly bound external interaction data being executed inside settlement flows
+- Signed-order fields potentially diverging from interaction-supplied payer/source or resolver-controlled execution context
+- Self-targeted or nested settlement execution enabling callback/authorization assumptions to be bypassed during reentry-like flows
+- Unsafe parsing of dynamic calldata offsets/lengths causing corruption, replay reconstruction, or reuse of prior order calldata
+- Callback success conditions that may accept no-op, inert, or no-code resolver targets
+- Token-accounting trust assumptions around maker assets and settlement inventory, especially where real omnibus balances can be spent without order-scoped accounting
+
+## Useful Context
+- Cross-round attention is overwhelmingly concentrated on `FlawVerifier.sol`; replay-building and settlement-drain helpers remain the most consistently scrutinized areas
+- The strongest recurring theme is compositional mismatch: signed order intent, executed calldata, resolver callbacks, and settlement-side balance accounting may not align tightly
+- Resolver/callback validation and settlement inventory usage now appear alongside replay corruption as stable recurring lines of inquiry rather than one-off ideas
+- `Counter.sol` has remained a low-confidence side path and is not part of the main accumulated risk narrative
+
+
+## Latest Round Summary
+# Round 3 Summary
+
+## Agent: codex
+- files touched: `Counter.sol`, `FlawVerifier.sol`
+- files revisited / highest-attention files: `FlawVerifier.sol` received nearly all attention, especially `executeOnOpportunity()`, the replay/calldata-corruption builder, the settlement payload construction around the nested interaction bytes, the historical attack call path, and swap helper code
+- main issue directions investigated: settlement payload fields not obviously bound to signed order data; replay/calldata-corruption flow; caller-chosen payer/source semantics in settlement encoding; unrestricted public execution of the prefunded exploit entrypoint; zero-slippage swap behavior; absence of asset recovery/withdrawal handling
+- promising but not retained directions: a new settlement-drain angle via caller-controlled payer/source address was proposed; public `executeOnOpportunity()` access, zero-slippage swaps, and missing withdrawal/recovery paths were also proposed, but none were retained after merge
+
+## Cross-Agent Status
+- main overlap in file/area attention: only one agent logged this round; attention concentrated on `FlawVerifier.sol` and its settlement/execution plumbing
+- notable differences in attention: `Counter.sol` was only briefly inspected, while `FlawVerifier.sol` was examined at function and line-slice level
+- underexplored but suspicious files/functions if clearly supported by the logs: no additional clearly supported hotspot beyond the already-focused settlement payload construction and replay-related paths in `FlawVerifier.sol`
+
+## Retained Findings
+- None retained from this round after merge.
+
+
+Output only markdown.

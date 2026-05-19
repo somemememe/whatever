@@ -1,0 +1,141 @@
+# Audit Report
+
+**Total findings:** 6
+
+## Critical (1)
+
+### F-001: CryptoPunks can be pledged with `nftType=1155`, permanently locking wrapped collateral and enabling bad debt
+
+**Confidence:** high | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:125, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:130, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:131, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:140, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:340, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:357`
+
+`pledgeInternal()` converts CryptoPunks deposits into `wrappedPunks` but preserves the caller-supplied `_nftType`. A borrower can therefore deposit a Punk with `_nftType = 1155`, causing the order to record an ERC721 wrapped punk as ERC1155 collateral. Every later collateral transfer path uses `order.nftType`, so withdrawals, repay-claims, borrower redemption, liquidation settlement, and auction withdrawal all call the ERC1155 interface against `wrappedPunks` and revert.
+
+**Impact:** Affected CryptoPunks collateral becomes permanently stuck inside `XNFT`. If the borrower also drew debt against the order, the protocol can be left with irrecoverable bad debt while the underlying Punk remains frozen in escrow.
+
+**Paths:**
+
+- Borrower calls `pledgeAndBorrow(address(punks), punkId, 1155, xToken, borrowAmount)`
+
+- `_depositPunk()` wraps the Punk and `pledgeInternal()` rewrites `collection` to `wrappedPunks` but stores `nftType = 1155`
+
+- Any later transfer path reaches `transferNftInternal(..., wrappedPunks, punkId, 1155)`
+
+- `IERC1155Upgradeable(wrappedPunks).safeTransferFrom(...)` reverts because `wrappedPunks` is ERC721, permanently locking the collateral
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (3)
+
+### F-002: ETH settlement paths use `transfer`, so malicious contract recipients can permanently brick auctions and withdrawals
+
+**Confidence:** high | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:196, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:198, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:202, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:218, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:220, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:249, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:251, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:331, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:336`
+
+For ETH-underlying pools, all refunds and profit distributions are funneled through `doTransferOut()`, which uses Solidity's `transfer`. Any liquidator, highest bidder, or pledger implemented as a contract with a reverting or >2300-gas fallback will cause those payout attempts to revert. Because outbid refunds and redemption/withdraw compensation are paid inline, the malicious recipient can block every later state transition that needs to pay them.
+
+**Impact:** A malicious contract can become the current auction account or liquidation counterparty and then freeze outbids, borrower redemption, or final settlement. This can indefinitely lock both the NFT and the escrowed ETH, preventing recovery of distressed loans.
+
+**Paths:**
+
+- A contract with a reverting/expensive `receive()` becomes `auctionAccount` or `liquidator` in an ETH pool
+
+- A later outbid or redemption hits `doTransferOut(..., recipient, amount)`
+
+- `account.transfer(amount)` reverts, so the entire auction/redemption/withdrawal transaction reverts
+
+- The order remains stuck because every future settlement attempt must keep paying the same hostile recipient
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-004: Admin can sweep escrowed auction and redemption funds, not just protocol income
+
+**Confidence:** high | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:565, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:566, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:569, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:570, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:571`
+
+`withdraw()` lets the admin transfer out arbitrary balances for any pool asset held by `XNFT`, while only `withdrawAuctionIncome()` is bounded by `addUpIncomeMap`. The contract also temporarily escrows bidder deposits, borrower redemption payments, and other user funds needed for later refunds and payouts, so `withdraw()` is not limited to protocol-owned income.
+
+**Impact:** The admin can directly steal escrowed user funds. Even absent outright theft, draining those balances breaks later auction, redemption, and withdrawal settlements because `XNFT` no longer holds the funds it promised to return or distribute.
+
+**Paths:**
+
+- Users send ETH/ERC20 into `XNFT` during auctions or borrower redemption
+
+- Before settlement completes, admin calls `withdraw(xToken, amount)`
+
+- The contract transfers out user escrow with no check against `addUpIncomeMap`
+
+- Later refunds or profit-sharing payouts revert or become underfunded
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-005: Admin `claim()` is an unrestricted arbitrary call that can transfer pledged NFTs and tokens out of escrow
+
+**Confidence:** high | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:588, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:589, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:590`
+
+`claim(address airdop, bytes memory byteCode)` performs an unrestricted low-level call from the `XNFT` contract and does not verify that the target or calldata are actually related to airdrops. Since `XNFT` is the on-chain owner of pledged NFTs and may also hold ERC20 balances, the admin can call collateral/token contracts directly and execute transfer or approval logic as `address(this)` to move assets out of escrow.
+
+**Impact:** The admin can bypass all loan and liquidation accounting and steal pledged NFTs or non-ETH tokens held by the contract. This can leave borrowers unable to recover collateral and lenders undercollateralized.
+
+**Paths:**
+
+- A pledged NFT or token balance is held by `XNFT`
+
+- Admin calls `claim(target, calldata)` where `calldata` invokes the target contract's transfer/approval function from `address(this)`
+
+- Because the external call originates from `XNFT`, the target contract treats `XNFT` as the asset owner
+
+- Escrowed collateral or tokens move to an arbitrary recipient outside the protocol flow
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+## Medium (2)
+
+### F-003: Liquidated collateral continues routing airdrop value to the defaulted borrower until the auction fully ends
+
+**Confidence:** medium | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:403, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:408, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:417, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:423, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:424, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:430, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:436`
+
+`airDrop()` sends a liquidated NFT through the airdrop executor but keeps `receiver = order.pledger` for the entire active auction window, switching to the liquidator/high bidder only after `auctionDuration` has elapsed. Because `airDrop()` and `batchAirDrop()` are public, anyone can force an airdrop claim during the auction and direct the proceeds to the defaulted borrower instead of the party now economically exposed to the collateral.
+
+**Impact:** Borrowers can continue stripping airdrop value from collateral after default, reducing lender recovery and the value that liquidators or bidders actually acquire. For collections where airdrops are material, this can distort auction pricing and worsen insolvency risk.
+
+**Paths:**
+
+- An order is liquidated and either the liquidator or third-party bidders have funds at risk
+
+- Before `auctionDuration` expires, anyone calls `airDrop(orderId, airDropContract, ercType)` or `batchAirDrop(...)`
+
+- The function chooses `receiver = order.pledger` while the auction is still active
+
+- Airdrop proceeds go to the defaulted borrower even though the collateral is already in liquidation
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-006: `notifyRepayBorrow()` authenticates with `tx.origin`, which can block repayment-and-claim for contract wallets or third-party payers
+
+**Confidence:** low | **Locations:** `0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:296, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:297, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:300, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/XNFT.sol:302, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/interface/IXToken.sol:16, 0x39360ac1239a0b98cb8076d4135d0f72b7fd9909/contracts/interface/IP2Controller.sol:19`
+
+`notifyRepayBorrow()` can only be called by the controller, but it also requires `tx.origin == _order.pledger`. Orders can be opened by smart contracts, and the lending interfaces explicitly distinguish `borrower` from `payer`, implying repayment may come from a third party. For any repayment flow that invokes `notifyRepayBorrow()`, contract-wallet borrowers, multisigs, relayers, or third-party payers can fail this `tx.origin` check even when the debt is otherwise validly repaid.
+
+**Impact:** Affected borrowers may be unable to complete the normal repay-and-claim path and recover their NFT, leaving positions exposed to avoidable liquidation or operational lockup. The exact blast radius depends on the controller/xToken implementation, so confidence is lower.
+
+**Paths:**
+
+- A smart-contract wallet or multisig pledges an NFT and borrows against it
+
+- The borrower later attempts to repay through the normal lending flow, or a third party repays on the borrower's behalf
+
+- The controller calls `notifyRepayBorrow(orderId)` to release the collateral
+
+- `tx.origin != _order.pledger` causes the repayment/claim flow to revert, blocking recovery of the NFT
+
+*Round 1 | Agents: *
+
+---

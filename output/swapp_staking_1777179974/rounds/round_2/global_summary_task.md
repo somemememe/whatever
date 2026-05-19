@@ -1,0 +1,70 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `Staking.sol` — primary hotspot across the audit; focus stays on `deposit`, `withdraw`, `emergencyWithdraw`, Compound interaction helpers, and epoch snapshot/accounting helpers
+- `Contract.sol` — wrapper entry used to surface and inspect `Staking.sol`; not an independent logic hotspot so far
+
+## Issue Directions Seen
+- Token/accounting mismatch paths: credited stake can diverge from actual assets received or held, especially around non-standard ERC-20 behavior and failed external integrations
+- Emergency-path accounting drift: emergency exits appear able to bypass full cleanup of checkpointed stake and pool accounting
+- Epoch snapshot integrity: historical pool-size and balance views look vulnerable to mutability or stale-state leakage rather than being fixed per epoch
+- Withdrawal gating edge cases: token-wide emergency withdrawal gating may be refreshable through low-impact or zero-amount withdraw flows
+- Compound integration safety: ignored `mint` / `redeem` return codes suggest silent failure can propagate into internal accounting desync
+
+## Useful Context
+- Audit attention is highly concentrated in a single contract, with most risk themes tied to state-accounting consistency rather than access control or role management
+- The same accounting surfaces recur across normal withdrawals, emergency withdrawals, and epoch snapshot readers, suggesting shared-state coupling is a central risk pattern
+- External asset-handling assumptions are weak in two recurring ways: token transfers are trusted at face value, and Compound-style integrations are treated as succeeding unless they revert
+- Historical-view helpers are part of the effective attack surface because current state may bleed into past-epoch reads
+
+
+## Latest Round Summary
+# Round 2 Summary
+
+## Agent: codex
+- files touched: `Contract.sol`; extracted and inspected embedded `Staking.sol` content, with a brief look at embedded `SafeERC20.sol`
+- files revisited / highest-attention files: `Staking.sol`, especially `deposit`, `withdraw`, `manualEpochInit`, `emergencyWithdraw`, epoch snapshot helpers, and Compound interest/withdrawal paths
+- main issue directions investigated: dormant-pool epoch initialization liveness, stablecoin exit dependence on Compound redemption, unchecked ERC-20 payout return values, and permissionless team-interest withdrawal timing during liquidity stress
+- promising but not retained directions: a low-confidence direction around permissionless `getInterestFromCompound` / `getInterest` potentially front-running user withdrawals and favoring team interest extraction was reported by the agent but not retained after merge
+
+## Cross-Agent Status
+- main overlap in file/area attention: single-agent round; attention remained concentrated on `Staking.sol` accounting/liveness around withdrawals, emergency exits, epoch initialization, and Compound integration
+- notable differences in attention: none visible from the logs because only `codex` participated
+- underexplored but suspicious files/functions if clearly supported by the logs: `getInterestFromCompound` / `getInterest` received some scrutiny as a possible liquidity-priority hotspot, but this direction was not retained
+
+## Retained Findings
+- dormant pools can lose withdrawal/restake liveness because skipped epochs must be manually backfilled one-by-one before later `deposit` or `withdraw` calls succeed
+- stablecoin pools have no protocol-level fallback exit when Compound redemption is unavailable, because `emergencyWithdraw` excludes stablecoins
+- `withdraw` and `emergencyWithdraw` can erase or reduce user claims without payout when an accepted token returns `false` on transfer instead of reverting
+
+
+Output only markdown.

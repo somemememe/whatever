@@ -1,0 +1,166 @@
+Below are findings and vulnerability signals from 2 agents auditing the same codebase,
+plus accumulated findings from previous rounds. You need to inspect the source code when needed.
+
+You are the merge and review layer for a audit.
+
+Your task:
+- merge new or materially improved reportable issues into the accumulated findings
+- reconstruct plausible but poorly written findings or signals into low-confidence findings when the code supports them
+- reject clearly non-reportable candidates with your reasons
+- try to use this round's signals and the source code to look for additional findings yourself
+
+Prefer downgrading severity or confidence over discarding a plausible issue.
+Keep findings that can cause realistic protocol-level harm, including fund loss,
+theft, insolvency, permanent lockup, economic manipulation, or permissionless DoS and some other realistic issues.
+
+## Accumulated Findings
+None yet.
+
+## This Round's Agent Outputs
+### Agent: codex_1
+```
+[
+  {
+    "id": "F-001",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Anyone can drain auction funds through unrestricted withdrawal functions",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1348",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1354",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1359"
+    ],
+    "claim": "The withdrawal functions are public and lack any `onlyOwner` check; in particular, `ownerWithdrawTo` and `ownerWithdrawAllTo` let any caller choose an arbitrary payout address, while `ownerWithdrawAll` lets any caller empty the full contract balance to the owner at any time.",
+    "impact": "Any attacker can steal bidder deposits and sale proceeds, including draining the contract mid-auction before refunds or settlement complete.",
+    "paths": [
+      "Place or wait for bids, then call `ownerWithdrawAllTo(attacker)` to transfer the entire contract balance to the attacker.",
+      "After the auction ends, call `ownerWithdrawTo(attacker)` to redirect the winning proceeds to the attacker."
+    ]
+  },
+  {
+    "id": "F-002",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Reentrant refund logic lets a losing bidder drain pooled ETH",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1326",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1331",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1364",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1368"
+    ],
+    "claim": "Both `refundBids` and `bidderWithdraw` transfer ETH with `call` before clearing `bids[bidder]`, so a malicious bidder contract can reenter while its recorded balance is still non-zero and withdraw the same bid repeatedly.",
+    "impact": "A single losing bidder can drain ETH belonging to other bidders and even the winning proceeds, leaving the auction insolvent.",
+    "paths": [
+      "Bid from a contract, get outbid, then call `bidderWithdraw`; in the fallback, recursively call `bidderWithdraw` again before `bids[msg.sender]` is zeroed.",
+      "After the auction ends, call `refundBids`; when the malicious bidder is paid, reenter `refundBids` or `bidderWithdraw` to receive multiple refunds."
+    ]
+  },
+  {
+    "id": "F-003",
+    "severity": "Critical",
+    "confidence": "high",
+    "title": "Auction settlement can be reentered to mint unlimited NFTs",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1310",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1318",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1323",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:795",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:797"
+    ],
+    "claim": "`endAuction` calls `_safeMint` before setting `auctionEnded = true`; because `_safeMint` invokes `onERC721Received` on contract recipients, the highest-bidder contract can reenter `endAuction` repeatedly and mint more token IDs before the auction is marked finished.",
+    "impact": "An attacker can inflate a supposed 1/1 collection into many NFTs, permanently breaking scarcity and ownership assumptions.",
+    "paths": [
+      "Become `highestBidder` using a contract that implements `onERC721Received`.",
+      "After expiry, call `endAuction` and recursively call `endAuction` from `onERC721Received` before the outer call sets `auctionEnded`."
+    ]
+  },
+  {
+    "id": "F-004",
+    "severity": "Medium",
+    "confidence": "high",
+    "title": "Failed batch refunds silently erase bidder balances",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1329",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1331",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1332"
+    ],
+    "claim": "`refundBids` ignores the `success` flag from the low-level ETH transfer and zeroes `bids[bidder]` regardless, so any failed payout permanently destroys the bidder's claim.",
+    "impact": "Losing bidders using non-payable or reverting smart-contract wallets can permanently lose their deposits when anyone triggers the batch refund.",
+    "paths": [
+      "Bid from a contract whose receive function reverts.",
+      "After the auction ends, any user calls `refundBids`; the transfer fails, but the code still sets that bidder's balance to zero."
+    ]
+  },
+  {
+    "id": "F-005",
+    "severity": "High",
+    "confidence": "low",
+    "title": "Hardcoded proxy registry can grant blanket approvals to the wrong operator set",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1195",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1387",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1389"
+    ],
+    "claim": "The contract hardcodes `proxyRegistryAddress` and automatically approves whatever proxy that external contract reports for each owner, without validating the deployment network or allowing users to opt out.",
+    "impact": "If the contract is deployed on a chain where that address is not the intended OpenSea registry, or if the registry is compromised, arbitrary operators can receive full transfer approval and steal NFTs.",
+    "paths": [
+      "Deploy on a network where `0xa540...` is controlled by an attacker-controlled contract.",
+      "Have that contract return the attacker's proxy for a victim owner, then call `transferFrom` using the auto-approved operator path."
+    ]
+  },
+  {
+    "id": "F-006",
+    "severity": "Low",
+    "confidence": "medium",
+    "title": "Buy-now settlement can lock the NFT in contracts that cannot handle ERC721s",
+    "locations": [
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1291",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:1304",
+      "onchain_auto/0xe85a08cf316f695ebe7c13736c8cc38a7cc3e944/Contract.sol:814"
+    ],
+    "claim": "`buyNow` uses `_mint` instead of `_safeMint`, so the NFT is minted directly to `msg.sender` without checking ERC721 receiver compatibility.",
+    "impact": "A buyer using a contract wallet or another non-receiver contract can pay for the NFT and have it minted into an address that cannot safely manage or recover it.",
+    "paths": [
+      "Call `buyNow` from a contract that does not implement `onERC721Received` and cannot later transfer the token out."
+    ]
+  }
+]
+
+```
+
+### Agent: opencode_1
+```
+Let me look inside the onchain_auto folder:
+Now I'll compile my security findings into the required JSON format:
+[{"id":"F-001","severity":"Critical","confidence":"high","title":"Reentrancy vulnerability in refundBids() function","locations":["Contract.sol:1326-1335"],"claim":"The refundBids() function does not follow the checks-effects-interactions pattern. It iterates through bidders and sends ETH via low-level .call() before updating state (setting bids to 0), allowing a malicious contract to re-enter and drain all contract funds.","impact":"An attacker can deploy a malicious contract that calls refundBids() and re-enters during the loop to steal all ETH held by the contract.","paths":["1. Attacker places a bid\n2. Attacker deploys malicious contract with fallback() that re-enters refundBids()\n3. During iteration, malicious fallback is triggered, allowing drain of remaining funds"]},{"id":"F-002","severity":"Critical","confidence":"high","title":"Reentrancy vulnerability in bidderWithdraw() function","locations":["Contract.sol:1364-1371"],"claim":"The bidderWithdraw() function sends ETH via .call() before resetting the bids mapping, allowing reentrant calls to drain additional funds.","impact":"A malicious bidder can call bidderWithdraw() multiple times to withdraw more than their actual bid amount.","paths":["1. Attacker places a bid\n2. Attacker calls bidderWithdraw()\n3. During external call, attacker calls bidderWithdraw() again\n4. bids[attacker] is set to 0 only after the first withdrawal, allowing double-spending"]},{"id":"F-003","severity":"High","confidence":"high","title":"Missing access control on startAuction()","locations":["Contract.sol:1232-1237"],"claim":"The startAuction() function has no access control - any address can start the auction at any time.","impact":"Anyone can start the auction prematurely, potentially before the owner is ready or before certain conditions are met, disrupting the intended auction flow.","paths":["1. Any external address calls startAuction()\n2. Auction begins immediately without owner confirmation"]},{"id":"F-004","severity":"High","confidence":"high","title":"Missing access control on endAuction()","locations":["Contract.sol:1310-1324"],"claim":"The endAuction() function has no access control - any address can end the auction once the timer expires.","impact":"Anyone can end the auction once the timestamp passes, which may be used to grief the auction or cause unexpected state changes. While functionally similar to the owner ending it, the lack of owner-only control is a design issue.","paths":["1. Any external address calls endAuction() after auctionEndTimestamp\n2. NFT is minted to highestBidder or owner\n3. Auction ends prematurely from owner's perspective"]},{"id":"F-005","severity":"High","confidence":"high","title":"Missing access control on refundBids()","locations":["Contract.sol:1326-1335"],"claim":"The refundBids() function can be called by anyone, not just the owner. This allows any external actor to trigger the refund process.","impact":"While not directly harmful (bidders get their funds back), unexpected early triggering may interfere with auction mechanics and represents missing access control on a sensitive financial function.","paths":["1. Any external address calls refundBids()\n2. All non-winning bids are refunded"]},{"id":"F-006","severity":"High","confidence":"medium","title":"buyNow() can mint NFT to zero address","locations":["Contract.sol:1291-1308"],"claim":"The buyNow() function does not check if highestBidder is address(0) before minting. If called when highestBidder is zero (which would only happen if someone calls buyNow without any prior bids), the NFT will be minted to the zero address and permanently lost.","impact":"The NFT can be burned/lost forever if buyNow() is called when highestBidder is address(0). This represents a permanent loss of the asset.","paths":["1. Auction starts with no bids\n2. Someone calls buyNow() with correct payment\n3. NFT is minted to zero address (lost forever)"]},{"id":"F-007","severity":"High","confidence":"high","title":"Reentrancy vulnerability in ownerWithdraw()","locations":["Contract.sol:1342-1346"],"claim":"The ownerWithdraw() function uses low-level .call() to send ETH without following the checks-effects-interactions pattern. While there is no state change after the call, the external call can trigger reentrancy into other vulnerable functions.","impact":"If other functions in the contract have reentrancy vulnerabilities, calling ownerWithdraw() could trigger them. Also, the function lacks a reentrancy guard.","paths":["1. Owner calls ownerWithdraw()\n2. External call triggers fallback in malicious contract\n3. Re-enters other vulnerable functions"]},{"id":"F-008","severity":"High","confidence":"high","title":"Reentrancy vulnerability in ownerWithdrawTo()","locations":["Contract.sol:1348-1352"],"claim":"Same reentrancy issue as ownerWithdraw() - uses .call() without proper CEI pattern.","impact":"Similar to ownerWithdraw() - can trigger reentrancy into other functions.","paths":["1. Owner calls ownerWithdrawTo()\n2. External call can trigger reentrancy"]},{"id":"F-009","severity":"High","confidence":"high","title":"Reentrancy vulnerability in ownerWithdrawAll()","locations":["Contract.sol:1354-1357"],"claim":"Same reentrancy issue - uses .call() without proper CEI pattern.","impact":"Similar to ownerWithdraw() - can trigger reentrancy into other functions.","paths":["1. Owner calls ownerWithdrawAll()\n2. External call can trigger reentrancy"]},{"id":"F-010","severity":"High","confidence":"high","title":"Reentrancy vulnerability in ownerWithdrawAllTo()","locations":["Contract.sol:1359-1362"],"claim":"Same reentrancy issue - uses .call() without proper CEI pattern.","impact":"Similar to ownerWithdraw() - can trigger reentrancy into other functions.","paths":["1. Owner calls ownerWithdrawAllTo()\n2. External call can trigger reentrancy"]},{"id":"F-011","severity":"Medium","confidence":"high","title":"editDuration() lacks zero value validation","locations":["Contract.sol:1217-1221"],"claim":"The editDuration() function allows setting duration to 0, which would make the auction end immediately.","impact":"If owner accidentally sets duration to 0 after auction starts, the auction ends immediately, potentially causing loss for participants.","paths":["1. Owner calls editDuration(0)\n2. auctionEndTimestamp becomes equal to auctionStartTimestamp\n3. Auction ends immediately"]},{"id":"F-012","severity":"Medium","confidence":"medium","title":"Potential integer overflow in getBuyNowPrice()","locations":["Contract.sol:1282-1289"],"claim":"The calculation highestBid * buyNowMultiplier / 10 could overflow if highestBid is very large (approaching max uint256) when buyNowMultiplier is 20.","impact":"While unlikely in practice due to realistic bid amounts, a deliberate attack with very high bid could cause overflow and unexpected behavior.","paths":["1. Attacker places extremely high bid near uint256 max\n2. getBuyNowPrice() calculation overflows\n3. Unexpected behavior in buyNow()"]},{"id":"F-013","severity":"Medium","confidence":"low","title":"editBaseUri() allows changing metadata at any time","locations":["Contract.sol:1203-1205"],"claim":"The owner can change the baseURI at any time, even after tokens have been minted, allowing metadata manipulation.","impact":"Owner can change token metadata after minting, potentially altering the NFT's appearance or metadata arbitrarily.","paths":["1. Owner calls editBaseUri() with new URI\n2. All existing tokens now point to new metadata"]},{"id":"F-014","severity":"Low","confidence":"medium","title":"auctionStarted flag can be reset","locations":["Contract.sol:1232-1237"],"claim":"The startAuction() function can only be called when auctionStarted is false, but there is no function to reset auctionStarted to false after auction ends, preventing re-starting.","impact":"The auction cannot be restarted if needed, limiting flexibility.","paths":["1. Auction starts\n2. Auction ends\n3. Cannot restart auction - contract is in final state"]},{"id":"F-015","severity":"Low","confidence":"medium","title":"Missing validation on bid function","locations":["Contract.sol:1248-1267"],"claim":"The bid() function does not validate that msg.value is greater than 0, allowing dust bids of 0 ETH that satisfy the minimum step if previous bid was also 0.","impact":"While highestBid starts at 0.9 ether, edge cases could allow unexpected behavior.","paths":["1. edge case if highestBid is manipulated\n2. Zero-value bids could be accepted"]}]
+
+```
+
+
+
+## Output
+Return a JSON object with:
+- `findings`: the COMPLETE updated findings list
+- `rejected_candidates`: candidates rejected from this round, with concise reasons
+
+Each `findings` element must have:
+- `id`
+- `severity`
+- `confidence`
+- `title`
+- `locations`
+- `claim`
+- `impact`
+- `paths`
+- `round`
+- `source_agents`
+
+Preserve existing IDs for surviving findings whenever possible.
+`source_agents` must include every agent that materially supports the final finding.
+
+Each `rejected_candidates` element must have:
+- `title`
+- `source_agents`
+- `reason`
+
+Output ONLY valid JSON. No markdown. No prose.

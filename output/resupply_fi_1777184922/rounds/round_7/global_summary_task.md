@@ -1,0 +1,77 @@
+You maintain a concise global audit memory for future audit agents.
+
+Update the existing global memory by folding in durable observations from the
+latest round summary. The goal is an accumulated cross-round audit view, not a
+per-round recap.
+
+This memory is optional context only. Findings are stored separately.
+
+Write the updated memory in this exact structure:
+
+# Global Audit Memory
+
+## Scope Touched
+- files/contracts/flows that have mattered across rounds, with short issue-direction notes
+
+## Issue Directions Seen
+- recurring or promising vulnerability directions seen across the audit
+
+## Useful Context
+- compact cross-round observations 
+
+Rules:
+- keep it compact
+- preserve useful prior context while integrating new durable observations
+- prefer stable cross-round patterns over latest-round details
+- fold repeated wording into a single clearer observation
+- keep the memory descriptive rather than prescriptive
+
+## Existing Global Memory
+# Global Audit Memory
+
+## Scope Touched
+- `src/protocol/pair/ResupplyPairCore.sol` / `src/protocol/ResupplyPair.sol` — enduring audit center for borrow/collateral/liquidation/redemption accounting, solvency + exchange-rate refresh, fee paths, external handler settlement, Convex transitions, and deployment/runtime parameter consistency
+- Convex collateral management in `src/protocol/ResupplyPair.sol` — persistent risk surface where credited collateral can diverge from asset location across staking, pool-switch, migration, or sentinel/state transitions
+- Oracle integration around `src/interfaces/IOracle.sol` and pair refresh paths — protocol-wide dependency for price normalization, inversion/decimals handling, freshness/sanity assumptions, and zero-price availability
+- `src/protocol/RewardDistributorMultiEpoch.sol` — recurring liveness/accounting boundary; checkpoint/integral/claim behavior and reward-token failures can spill into borrower-facing pair flows
+- `src/protocol/WriteOffToken.sol` — durable writeoff/redemption accounting dependency, especially where token state or validity affects loss attribution
+- `src/interfaces/ICore.sol` and pair initialization paths — supporting scope for governance/risk-parameter assumptions, especially max-LTV bounds at construction vs runtime
+- `src/libraries/VaultAccount.sol` — supporting accounting primitive revisited around debt/share state transitions and full-reset cleanup behavior
+
+## Issue Directions Seen
+- Oracle math and refresh behavior remain a core direction: decimal mismatches, inversion logic, weak freshness/sanity assumptions, and zero-price availability failures
+- Internal accounting vs real asset state is still the strongest recurring theme, especially where redemptions, writeoffs, migrations, or external integrations let balances diverge from recoverable collateral
+- Redemption/writeoff accounting is a firm cross-round direction: borrower writeoff handling, skipped-loss tracking, and writeoff-token state can misallocate losses or misstate remaining collateral
+- Reward distribution remains a recurring secondary direction in two forms: zero-borrow-share/integral edge cases can strand rewards, and misbehaving registered reward tokens can break checkpointing/claims and freeze borrower-facing flows until invalidated
+- Full-redemption/reset logic remains live: when debt is fully cleared, stale debt/share state can survive and contaminate later borrowing cycles
+- Convex integration remains live beyond staking-success assumptions: pool-management edge cases and state encoding can orphan or live-lock collateral
+- Configuration-bound enforcement is an emerging durable direction: constructor-time assignments can bypass runtime setter guards, creating unsafe deployment states such as over-cap LTV
+- Handler-mediated redemption/liquidation settlement assumptions remain background suspicion, but lower-confidence than the core accounting/oracle directions
+
+## Useful Context
+- The most stable audit picture still radiates from `ResupplyPairCore` plus the wrapper pair contract; external modules mostly amplify mistakes in accounting, pricing, liveness, or configuration enforcement
+- A repeated cross-round pattern is state drift: internal debt, share, collateral, reward, or writeoff state can advance in ways that do not cleanly match attributable debt or recoverable assets
+- Redemption is a recurring desynchronization point, not just a settlement path; borrower-specific writeoff state, reward-side behavior, and global debt/share cleanup can interact unexpectedly
+- Reward-side components are not isolated from core lending behavior: checkpointing, claiming, invalidation, or reward-token misbehavior can affect both value accounting and operational liveness
+- Low-confidence but retained background context includes handler ordering/trust assumptions, fee handling, and bounded-integer debt edge cases for future correlation
+
+
+## Latest Round Summary
+# Round 7 Summary
+
+## Agent: codex
+- files touched: `src/protocol/ResupplyPair.sol`, `src/protocol/pair/ResupplyPairCore.sol`, `src/protocol/RewardDistributorMultiEpoch.sol`, `src/protocol/WriteOffToken.sol`; broad symbol/revert scans also covered `src/libraries/VaultAccount.sol`, `src/dependencies/*.sol`, and `src/interfaces/*.sol`
+- files revisited / highest-attention files: `src/protocol/pair/ResupplyPairCore.sol` was the main focus, with repeated attention on `src/protocol/ResupplyPair.sol` and `src/protocol/RewardDistributorMultiEpoch.sol`
+- main issue directions investigated: debt/interest accounting edge cases near numeric caps; constructor-vs-runtime parameter validation mismatches for pair fees; reward invalidation behavior and whether accrued rewards / held balances become stranded; redemption collateral accounting under distress
+- promising but not retained directions: `redeemCollateral` insolvency/par-value redemption behavior in `src/protocol/pair/ResupplyPairCore.sol` was raised as a strong candidate (`F-020`) but was not retained after merge; `src/protocol/WriteOffToken.sol` was inspected but produced no retained finding
+
+## Cross-Agent Status
+- main overlap in file/area attention: only `codex` is present in this round’s logs, so there is no cross-agent overlap to report
+- notable differences in attention: not applicable for the same reason
+- underexplored but suspicious files/functions if clearly supported by the logs: current logs show non-retained attention on `redeemCollateral` in `src/protocol/pair/ResupplyPairCore.sol`; `src/protocol/WriteOffToken.sol` was opened but remains without a retained issue from this round
+
+## Retained Findings
+- retained issues from this round centered on three areas: interest accrual overflow in `ResupplyPairCore` can skip and forgive an elapsed interval’s debt growth (`F-021`), reward-token invalidation in `RewardDistributorMultiEpoch` can strand already-accrued rewards and pair-held balances (`F-022`), and constructor-time fee assignment in the pair contracts can bypass fee caps enforced later by runtime setters (`F-023`)
+
+
+Output only markdown.

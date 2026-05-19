@@ -1,0 +1,87 @@
+You are operating inside a Foundry workspace to build a real exploit PoC.
+
+Allowed inputs only:
+- Hypothesis file: finding:floordao
+- RPC: https://mainnet.infura.io/v3/a5fc4fc5ece34a6eb6e8dfe627dce240
+- Chain: mainnet mainnet
+- Chain ID: 1
+- Fork block: 18068772
+- Target contract: 0x759c6De5bcA9ADE8A1a2719a31553c4B7DE02539
+- Target source root: /Users/zhanglongqin/AuditHoundV2/cases/floordao/src
+
+Finding:
+- id: F-001
+- severity: Critical
+- confidence: high
+- title: Warmup deposits are rebased but never counted as liabilities, allowing staking insolvency
+- claim: `stake()` transfers FLOOR into the contract and records warmup positions as `deposit` plus `gons`, while `claim()` later pays `sFLOOR.balanceForGons(info.gons)`, so warmup balances continue to appreciate with rebases. However, `rebase()` computes distributable surplus from `FLOOR.balanceOf(address(this)) - sFLOOR.circulatingSupply() - bounty` and never subtracts `gonsInWarmup` or `supplyInWarmup()`. Warmup-backed FLOOR is therefore treated as free excess reserves and redistributed to current stakers even though it is still owed to warmup claimants.
+- impact: Large warmup balances can make the system undercollateralized. After one or more rebases, the contract can owe more sFLOOR/gFLOOR/FLOOR than it holds backing for, causing honest claimants or unstakers to receive unbacked positions or hit `unstake()` reverts due to insufficient FLOOR reserves.
+
+Exploit paths:
+- Set `warmupPeriod > 0` and let some users already hold active staking positions.
+- A user stakes FLOOR into warmup, increasing `gonsInWarmup` but not `sFLOOR.circulatingSupply()`.
+- When `rebase()` runs, the newly deposited FLOOR is included in `balance` and treated as surplus because warmup liabilities are not subtracted.
+- Existing stakers receive that value through rebases, while the warmup user still retains a claim for `sFLOOR.balanceForGons(info.gons)`.
+- Total redeemable claims eventually exceed the contract's FLOOR backing, and withdrawals start failing.
+
+Relevant locations:
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:94
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:104
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:111
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:133
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:135
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:233
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:234
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:238
+- 0x759c6de5bca9ade8a1a2719a31553c4b7de02539/contracts/Staking.sol:279
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state at or before the fork block.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+- You MUST implement the exploit aligned with the full `Exploit paths` list.
+- Do not ignore any path stage unless it is provably infeasible at this fork state.
+- Keep the generated PoC mechanically aligned with `Exploit paths` (same core actions, same causality).
+- Path-Strict requirements (all cases):
+  - Treat `Exploit paths` as the allowed attack plan.
+  - Implement a one-to-one mapping from PoC on-chain actions to path stages.
+  - Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but they must preserve the same exploit causality.
+  - If an additional step is strictly required for execution, keep it minimal and explain in code comments why it does not change the exploit hypothesis.
+- If any path stage is infeasible at this fork state, return concrete infeasibility reasons instead of pivoting to an unrelated route.
+
+Task:
+1) Convert the hypothesis into concrete exploit preconditions and a profit path.
+2) Build and iterate a Foundry exploit PoC implementation in `src/FlawVerifier.sol`.
+3) Ensure the PoC can be validated by a Foundry test harness at `test/ExploitPOC.t.sol`.
+4) Iterate until either:
+   - positive net attacker profit is achieved after repaying temporary capital, or
+   - failure is proven with a clear mechanical/economic reason.
+
+Final response must contain only:
+- whether profit was achieved
+- profit token and amount
+- exploit path used
+- whether the original hypothesis was validated or refuted
+
+Harness note:
+- This validator performs iterative attempts up to a configured max-attempts.
+- The test file is auto-generated by the harness.
+- If exploitability is not feasible at this fork state, return best-effort executable logic that fails only for concrete on-chain preconditions.
+- If any `Exploit paths` stage is infeasible, state the concrete on-chain reason in code comments and avoid silently changing to an unrelated route.
+- Because the harness owns the test execution loop, do not output prose summaries; return Solidity only.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Output format required by this harness:
+- Return ONLY COMPLETE Solidity source code for `src/FlawVerifier.sol` (no markdown, no prose).
+- Include at least one deployable contract with a zero-argument constructor.
+- Define `function executeOnOpportunity() external` or `public` as the fixed exploit entry.
+- Expose non-ETH profit metadata via getters:
+  - `profitToken() external view returns (address)` (address(0) means native ETH)
+  - `profitAmount() external view returns (uint256)` (net realized profit amount in `profitToken` units)

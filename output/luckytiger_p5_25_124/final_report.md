@@ -1,0 +1,97 @@
+# Audit Report
+
+**Total findings:** 4
+
+## Critical (1)
+
+### F-002: Contract callers can revert losing mints and keep only winning outcomes
+
+**Confidence:** high | **Locations:** `onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:944, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:968, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:971, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:982, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1395, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1402, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1405, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1407, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1413, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1419, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1422, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1424`
+
+A wrapper contract can call `freeMint` or `publicMint`, let the mint logic fully determine whether the token is lucky and whether prize ETH was paid, inspect the outcome after the call returns, and revert the outer transaction whenever the outcome is unfavorable. Because a revert rolls back the mint, payment, and whitelist consumption, the attacker can cheaply retry until only profitable outcomes are finalized.
+
+**Impact:** This turns the lottery into a one-sided option for contract callers. In `publicMint`, the attacker only commits winning mints and loses only gas on failed attempts, allowing extraction from the bonus pool. In `freeMint`, the attacker can repeatedly retry the same whitelist slot until a lucky result appears, then finalize the free NFT plus payout. The bonus pool can be drained and the game becomes economically non-viable.
+
+**Paths:**
+
+- Attacker deploys a contract implementing `onERC721Received` and a cheap `receive()` function.
+
+- The wrapper calls `publicMint()` or `freeMint(victim)` and waits for the call to return.
+
+- After return, the wrapper inspects whether the minted token is marked lucky or whether it received the ETH payout.
+
+- If the outcome is losing, the wrapper reverts, rolling back the mint and any whitelist consumption; if the outcome is winning, it does not revert and keeps the NFT/payout.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (2)
+
+### F-001: Whitelist free mint can be stolen by passing an arbitrary whitelisted address
+
+**Confidence:** high | **Locations:** `onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1395, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1398, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1400, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1401`
+
+`freeMint` authorizes against the caller-supplied `_user` parameter, but the NFT is minted to `msg.sender`. Any caller can therefore consume another address's whitelist entitlement by passing a whitelisted victim as `_user` and receive the NFT themselves.
+
+**Impact:** Whitelist spots are not bound to their intended recipients. An attacker can front-run or simply target known whitelisted addresses, mint for free to themselves, and permanently invalidate the victim's allocation. If the stolen mint lands on a lucky outcome, the attacker also captures the prize payout funded by the contract.
+
+**Paths:**
+
+- Owner adds victim to `whiteLists` via `setWhiteLists`.
+
+- Attacker calls `freeMint(victim)` from a different address.
+
+- `whiteLists[victim]` passes, `_safeMint(msg.sender, 1)` mints to the attacker, and then `whiteLists[victim]` is set to `false`.
+
+- Victim can no longer use their whitelist slot, while attacker keeps the NFT and any lucky payout.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+### F-003: Prize randomness is block-level and predictable enough for builders to cherry-pick winning blocks
+
+**Confidence:** high | **Locations:** `onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1402, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1419, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1436, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1437, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1438`
+
+`_getRandom()` derives the lucky bit only from `block.difficulty` and `block.timestamp`. These are block-level values rather than user-specific entropy, so every mint in the same block shares the same result, and builders/validators or private-orderflow actors can simulate or influence inclusion around favorable outcomes.
+
+**Impact:** A block producer or an actor with privileged orderflow can include mint transactions only in winning blocks and avoid losing blocks altogether. Because all mints in the same block inherit the same lucky bit, once a block is favorable the attacker can batch many mints and drain the prize pool far faster than intended.
+
+**Paths:**
+
+- Attacker routes mint transactions through a builder/relay with block simulation capabilities.
+
+- The builder computes whether `keccak256(block.difficulty, block.timestamp) % 2` will be the lucky branch for the candidate block.
+
+- Transactions are included only in favorable blocks and withheld otherwise.
+
+- Since all mints in that block share the same result, the attacker batches repeated mints to maximize payout extraction.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+## Medium (1)
+
+### F-004: Hardcoded `send` recipient can permanently brick winner payouts and withdrawals
+
+**Confidence:** low | **Locations:** `onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1344, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1408, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1425, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1430, onchain_auto/0x9c87a5726e98f2f404cdd8ac8968e9b2c80c0967/Contract.sol:1431`
+
+Winner payouts and owner withdrawals depend on `send()` to a single hardcoded `withdrawAddress`, and there is no way to update that recipient. If this address is ever a contract that rejects plain ETH or needs more than 2300 gas, every lucky mint and `withdraw()` will revert permanently.
+
+**Impact:** A misconfigured or incompatible `withdrawAddress` can lock ETH in the contract and make lucky mints unexecutable because the fee transfer reverts the whole transaction. With no setter or escape hatch, the protocol can be stuck with trapped funds and broken payout flows.
+
+**Paths:**
+
+- `withdrawAddress` resolves to a contract whose `receive`/`fallback` rejects or exceeds the 2300-gas stipend used by `send()`.
+
+- A user hits the lucky branch in `freeMint()` or `publicMint()`, and the fee transfer to `withdrawAddress` fails.
+
+- The entire mint reverts, so lucky outcomes cannot complete.
+
+- `withdraw()` uses the same `send()` pattern, so the owner also cannot recover the contract balance.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---

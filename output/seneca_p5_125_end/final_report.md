@@ -1,0 +1,77 @@
+# Audit Report
+
+**Total findings:** 4
+
+## Critical (1)
+
+### F-001: Unsupported batched operations clear the deferred solvency flag and enable undercollateralized borrows/withdrawals
+
+**Confidence:** high | **Locations:** `0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:399, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:431, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:469, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:481`
+
+`performOperations()` relies on `status.needsSolvencyCheck` to enforce solvency after `OPERATION_BORROW` and `OPERATION_REMOVE_COLLATERAL`, but any unrecognized action is dispatched to `_extraOperation()`. In this base contract `_extraOperation()` has an empty implementation, so it returns a zeroed `OperationStatus` and clears any pending solvency check before the function exits.
+
+**Impact:** A borrower can borrow senUSD or remove collateral while ending the batch insolvent, creating bad debt limited only by chamber liquidity and borrow caps.
+
+**Paths:**
+
+- Call `performOperations([5,8], ...)`, where action `5` borrows and action `8` is the declared but unimplemented `OPERATION_ACCRUE`; `_borrow()` sets `needsSolvencyCheck = true`, then `_extraOperation()` overwrites the status with all-zero values so the final solvency check is skipped.
+
+- Call `performOperations([4,100], ...)` to remove collateral and then append any unsupported opcode such as `100`; the unsupported branch clears `needsSolvencyCheck`, allowing the caller to exit undercollateralized.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+## High (1)
+
+### F-002: Oracle failures and zero exchange rates are accepted, allowing stale-price borrowing and zero-rate solvency bypasses
+
+**Confidence:** high | **Locations:** `0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:115, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:125, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:183, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:193, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:199, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:201, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:509`
+
+The market never requires a successful oracle read with a sane non-zero rate. `init()` ignores the oracle success flag entirely, and `updatePrice()` silently reuses the cached `exchangeRate` whenever `oracle.get()` fails. All solvency checks and liquidations then trust that stale or zero cached value.
+
+**Impact:** If a high price is cached and the oracle later fails, borrowers can keep borrowing or removing collateral against overstated collateral values. If initialization or a later update leaves `exchangeRate == 0`, any account with even dust collateral is treated as solvent regardless of debt size, while liquidation logic also stops recognizing those positions as insolvent. This can create protocol bad debt and drain available senUSD liquidity.
+
+**Paths:**
+
+- If `oracle.get()` returns `(false, 0)` during `init()`, the chamber stores `exchangeRate = 0`; afterward `_isSolvent()` only checks that the borrower has nonzero collateral share, so a user can deposit dust collateral and borrow up to the chamber's available senUSD and borrow cap.
+
+- After a valid but overly high rate has been cached, an oracle outage causes `updatePrice()` to keep returning that stale rate; users can continue passing the post-action solvency checks in `borrow()`, `removeCollateral()`, and `performOperations()`, and `liquidate()` also evaluates insolvency using the same stale price.
+
+*Round 1 | Agents: codex_1, opencode_1*
+
+---
+
+## Medium (2)
+
+### F-003: Interest-rate changes are applied retroactively to already elapsed debt
+
+**Confidence:** high | **Locations:** `0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:131, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:147, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:604, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:613`
+
+`changeInterestRate()` overwrites `accruedInterest.INTEREST_PER_SECOND` without first accruing interest up to the current timestamp. The next `accumulate()` call therefore applies the new rate to the entire elapsed period since `lastAccrued`, including time that passed under the old rate.
+
+**Impact:** Raising the rate overcharges all existing borrowers for past time, inflates `feesEarned`, and can trigger liquidations that should not occur. Lowering the rate causes the opposite accounting error and under-accrues protocol revenue.
+
+**Paths:**
+
+- Allow debt to remain outstanding for a long period without calling `accumulate()`, increase the interest rate via `changeInterestRate()`, then trigger any function that calls `accumulate()`; the higher rate is charged over the full historical interval instead of only future time.
+
+*Round 1 | Agents: codex_1*
+
+---
+
+### F-004: Any clone deployed without atomic initialization can be permanently captured because `init()` is unrestricted
+
+**Confidence:** low | **Locations:** `0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:115, 0x65c210c59b43eb68112b7a4f75c8393c36491f06/contracts/Chamber2.sol:127`
+
+`init()` is public, one-shot, and does not restrict the caller to BentoBox, a factory, or governance. The contract is therefore safe only if every clone is initialized atomically at deployment time; otherwise the first external caller can permanently choose the chamber's collateral, oracle, and risk parameters.
+
+**Impact:** A chamber clone that appears at a predictable address but is not initialized in the same transaction can be hijacked and configured with attacker-chosen oracle/risk settings, permanently compromising that market.
+
+**Paths:**
+
+- Observe a freshly deployed clone whose `collateral` is still zero, call `init()` first with attacker-controlled parameters, and permanently lock out the intended initializer.
+
+*Round 1 | Agents: codex_1*
+
+---

@@ -1,0 +1,205 @@
+# Audit Report
+
+**Total findings:** 9
+
+## Critical (6)
+
+### F-001: Anyone can front-run initialization and permanently seize an uninitialized pool
+
+**Confidence:** high | **Locations:** `0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:160, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:175, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:411`
+
+`init()` is a one-time external initializer with no access control. On any freshly deployed pool, any address can call it first, choose arbitrary `token0`, `token1`, `interestRateAddress`, `ltv/lb/rf`, and overwrite `core` with an attacker-controlled address. Because privileged functions are gated only by `onlyCore`, the attacker permanently becomes the pool controller.
+
+**Impact:** If deployment and initialization are not atomic, a front-runner can seize the pool before the intended deployer initializes it. Once in control, the attacker can route all `onlyCore` operations through an attacker-controlled core, use malicious oracle responses, and directly transfer out any assets later sent to the pool via privileged flows such as `processFlashLoan`, leading to theft or permanent pool bricking.
+
+**Paths:**
+
+- A pool is deployed but remains uninitialized for at least one transaction.
+
+- An attacker calls `init()` first and sets `core` to an attacker-controlled address or contract.
+
+- The legitimate initializer is locked out by `initialized = true`.
+
+- Any funds later routed into the pool can be drained or the market can be permanently misconfigured via the attacker-controlled `onlyCore` entrypoints.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-002: Collateral withdrawals pass health checks because redemption validates before the asset transfer leaves the pool
+
+**Confidence:** high | **Locations:** `0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:281, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:302, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:568, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:571, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:591, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:594, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:620, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:623, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:643, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:646`
+
+`redeem()` and `redeemUnderlying()` burn a user's lend shares and then immediately run `checkHealthFactorLtv*()` before transferring the redeemed tokens out of the pool. However, `userBalanceOftoken0/1()` prices lend balances from `IERC20(token).balanceOf(address(this)) + totalBorrow`, so the not-yet-transferred collateral is still counted during the health-factor check even though the user's share denominator has already been reduced. This lets the check observe an inflated post-withdraw collateral value.
+
+**Impact:** A borrower can withdraw collateral that is backing an opposite-side loan while still passing the LTV check, then receive the tokens moments later. After the transfer completes, the position can become undercollateralized or outright insolvent, leaving bad debt for lenders.
+
+**Paths:**
+
+- A user deposits collateral on one side and borrows the opposite asset.
+
+- The user calls `redeem()` or `redeemUnderlying()` to withdraw the collateral side.
+
+- The pool burns lend shares and checks health factor while the soon-to-be-withdrawn tokens are still in the contract balance used for collateral valuation.
+
+- The check passes, the transfer executes, and the position is left with less real collateral than the validation assumed.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-005: Borrowing rounds debt shares down, letting new borrowers take more underlying than the liability they receive
+
+**Confidence:** high | **Locations:** `onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:44, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:48, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:664, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:685`
+
+`borrow()` mints borrow shares with `calculateShare`, which uses floor division. When `totalBorrow / totalBorrowShare > 1` after interest accrual, extinguishing a given underlying liability should require rounding debt shares up, but `borrow()` rounds down instead. A borrower can therefore receive an amount whose exact share cost is `n + ε` while only being assigned `n` borrow shares.
+
+**Impact:** Each such borrow socializes part of the borrowed principal onto the existing borrow-share base. An attacker can repeatedly extract underlying while receiving less debt than the borrowed value warrants, creating protocol bad debt and potentially rendering the pool insolvent.
+
+**Paths:**
+
+- Interest accrues so the debt-per-share ratio for one asset rises above 1.
+
+- The attacker calls `borrow()` for an amount whose exact share conversion falls just above an integer boundary.
+
+- `calculateShare` floors the share mint, so the borrower receives too few borrow shares while the pool still transfers the full underlying amount.
+
+- The borrower later repays or liquidates only the understated liability, leaving the remainder socialized to the pool.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-006: Exact-underlying redemptions burn LP shares with floor rounding, allowing lenders to withdraw more assets than their shares cover
+
+**Confidence:** high | **Locations:** `onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:56, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:57, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:614, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:637`
+
+`redeemUnderlying()` converts a requested underlying amount into LP shares with `getShareByValue`, which floors instead of rounding up. For exact-value withdrawals, the pool should burn enough shares to cover the requested underlying, but the current code lets a redeemer ask for an amount worth `n + ε` shares while only burning `n` shares.
+
+**Impact:** Once LP share price rises above 1, a lender can repeatedly over-withdraw underlying and drain value from the remaining LPs. This is a direct accounting flaw in the share burn calculation and does not rely on the separate health-factor bug in redemption.
+
+**Paths:**
+
+- Borrower interest accrues so one LP share becomes worth more than one unit of the underlying asset.
+
+- The attacker calls `redeemUnderlying()` for an amount whose exact share cost has a fractional component.
+
+- `getShareByValue` floors the burn amount, so too few LP shares are destroyed.
+
+- The pool transfers the full requested underlying anyway, shifting the shortfall onto the remaining LP share base.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-008: Batch liquidation collapses two-token settlements into one signed integer, allowing opposite-side liquidations to cancel out
+
+**Confidence:** high | **Locations:** `onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:813, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:814, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:866, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:867, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:899, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:923`
+
+`liquidateMulti()` aggregates all realized repayment obligations into a single signed `liquidatedAmountTotal` and all realized collateral payouts into a single signed `recAmountINtotal`. Negative values represent token0 flows and positive values represent token1 flows, so batching liquidations across both debt directions collapses two independent token dimensions into one scalar and irreversibly loses information.
+
+**Impact:** A caller can combine token0-debt and token1-debt liquidations so that the batch's net repayment scalar is zero or materially smaller than the true two-token amounts owed, while the internal liquidation logic still reduces debts and transfers or reassigns collateral for every position. This can produce free or underpaid liquidations and direct theft of collateral, especially when collateral is reassigned to `_toNftID` instead of being paid out immediately.
+
+**Paths:**
+
+- The attacker submits a `liquidateMulti()` batch containing at least one `amount < 0` liquidation and one `amount > 0` liquidation.
+
+- Each position is processed correctly inside `liquidateInternal()`, but the per-token repayment and collateral flows are netted into a single signed integer per side.
+
+- Opposite-direction token0 and token1 obligations cancel in the aggregate even though they are not fungible.
+
+- The caller settles only the net scalar while still receiving both sets of liquidation effects, resulting in underpayment or free collateral capture.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-009: The first borrow of each asset mints 1,000 unowned debt shares to position 0, creating permanent bad debt
+
+**Confidence:** high | **Locations:** `onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:44, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:46, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:664, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:666, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:685, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:687, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:715, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:741`
+
+On the first borrow of an asset, `calculateShare()` returns `_amount - 1000`, and `borrow()` additionally mints `1000` borrow shares to position `0` as a minimum-liquidity analogue. Unlike LP shares, borrow shares represent liabilities, so these extra shares create debt that is not assigned to the actual borrower. The first borrower receives the full underlying amount but is only accountable for roughly `amount - 1000` of debt, while the remaining ~1,000 units become orphaned bad debt attached to position `0`.
+
+**Impact:** The first borrower in each asset can extract roughly 1,000 units of underlying for free, and the pool is left with a permanent debt overhang even if that borrower later repays their entire recorded liability. This creates an immediate insolvency hole and distorts all later borrow-share accounting for that asset.
+
+**Paths:**
+
+- An asset has no existing borrow shares.
+
+- A user performs the first successful borrow for that asset with amount greater than 1,000 units.
+
+- `borrow()` mints 1,000 borrow shares to position `0` and only `amount - 1000` shares to the borrower, while still increasing `totalBorrow` by the full amount transferred out.
+
+- When the borrower later repays their full recorded liability, the orphaned position-0 borrow shares remain backed by no user, leaving permanent bad debt in the pool.
+
+*Round 1 | Agents: codex*
+
+---
+
+## High (3)
+
+### F-003: New LPs can steal previously accrued borrower interest because `lend()` mints shares against stale debt
+
+**Confidence:** high | **Locations:** `0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:388, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:511, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:518, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:533`
+
+`lend()` never calls `accrueInterest()`. It mints lend shares using `tokenBalance + totalBorrow`, but `totalBorrow` can be stale for many blocks while interest has already economically accrued. Deposits made during that window are therefore priced against an understated pool value and receive too many lend shares.
+
+**Impact:** A late depositor can wait for a large amount of interest to accrue, deposit just before any accrual-triggering action, and receive an outsized ownership share. Once interest is accrued by a later state-changing call, the attacker can redeem and capture value that should have belonged to prior lenders.
+
+**Paths:**
+
+- Borrows remain open while `lastUpdated` lags and interest accumulates off-chain/economically but is not yet added to `totalBorrow`.
+
+- An attacker deposits via `lend()` and receives shares priced from stale `totalBorrow`.
+
+- Any later call such as `borrow`, `redeem`, `repay`, `liquidate`, or `processFlashLoan` runs `accrueInterest()`.
+
+- The attacker redeems the over-minted shares and extracts previously accrued interest from existing LPs.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-004: Liquidation uses `100 - lb` instead of the borrow limit, creating a large undercollateralized but non-liquidatable zone
+
+**Confidence:** high | **Locations:** `0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:234, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:243, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:257, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:266, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:779, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:781, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:832, 0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:833`
+
+Borrow safety checks use `ltv`, but liquidation eligibility uses `(100 - lb)` instead. When `ltv` is materially lower than `100 - lb`—for example 80% LTV with a 5% liquidation bonus—positions can exceed the protocol's stated borrow limit and still remain non-liquidatable until they deteriorate much further.
+
+**Impact:** The protocol can accumulate a wide band of unhealthy positions that are above the allowed borrow limit but cannot yet be liquidated. Continued price movement or interest accrual inside that gap makes lender losses more likely and can convert recoverable positions into bad debt.
+
+**Paths:**
+
+- A user borrows up to the configured `ltv` cap.
+
+- Collateral value falls or debt grows so the position moves above `ltv` but remains below the looser `(100 - lb)` liquidation threshold.
+
+- Liquidators cannot act during that unhealthy interval.
+
+- Further deterioration pushes the account closer to insolvency before liquidation becomes possible, increasing realized losses for LPs.
+
+*Round 1 | Agents: codex*
+
+---
+
+### F-007: Direct liquidation seizes collateral by value but burns too few collateral shares from the victim
+
+**Confidence:** high | **Locations:** `onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:56, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:57, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:804, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:805, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:856, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:857, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:886, onchain_auto/0x4e34dd25dbd367b1bf82e1b5527dbbe799fad0d0/contracts/pool.sol:892`
+
+In the direct-payout liquidation path (`_toNftID == 0`), `liquidateInternal()` computes the collateral value to seize in underlying units and then converts that value into LP shares with `getShareByValue`, which floors. The pool then transfers the full underlying `recAmountIN` to the liquidator, even though it may have burned fewer LP shares from the victim than that underlying amount actually represents.
+
+**Impact:** A liquidator can over-seize collateral from unhealthy accounts whenever collateral share price exceeds 1. The victim and remaining LPs absorb the accounting gap, enabling direct extraction of excess collateral during liquidation.
+
+**Paths:**
+
+- An unhealthy position has collateral in an asset whose LP share price is above 1.
+
+- The liquidator uses the direct liquidation path with `_toNftID == 0`.
+
+- The seized underlying amount converts to `n + ε` LP shares, but `getShareByValue` floors this to `n`.
+
+- The pool transfers the full underlying collateral anyway, so the liquidator receives more value than the victim's burned shares cover.
+
+*Round 1 | Agents: codex*
+
+---
