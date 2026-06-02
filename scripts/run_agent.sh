@@ -49,6 +49,15 @@ resolve_opencode_cli() {
   return 1
 }
 
+resolve_python3() {
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+
+  return 1
+}
+
 AGENT_TYPE="${1:?Usage: run_agent.sh <agent_type> <round_dir> <target_dir> [model] [agent_label]}"
 ROUND_DIR="${2:?Usage: run_agent.sh <agent_type> <round_dir> <target_dir> [model] [agent_label]}"
 TARGET_DIR="${3:?Usage: run_agent.sh <agent_type> <round_dir> <target_dir> [model] [agent_label]}"
@@ -64,6 +73,9 @@ case "$AGENT_TYPE" in
     ;;
   opencode)
     MODEL="${AUDITHOUND_OPENCODE_MODEL:-$MODEL}"
+    ;;
+  deepseek)
+    MODEL="${AUDITHOUND_DEEPSEEK_MODEL:-${DEEPSEEK_MODEL:-$MODEL}}"
     ;;
 esac
 
@@ -121,6 +133,25 @@ case "$AGENT_TYPE" in
       --dangerously-skip-permissions \
       -m "$MODEL" \
       "Read the file at $TASK_FILE in full. Follow all instructions in that file exactly. Return only the JSON array specified there." \
+      > "$AGENT_DIR/stdout.log" 2> "$AGENT_DIR/stderr.log"
+    ;;
+  deepseek)
+    PYTHON3_BIN="$(resolve_python3 || true)"
+    if [ -z "$PYTHON3_BIN" ]; then
+      echo "python3 not found" > "$AGENT_DIR/stdout.log"
+      echo "python3 not found in PATH" > "$AGENT_DIR/stderr.log"
+      exit 1
+    fi
+
+    DEEPSEEK_MAX_STEPS="${AUDITHOUND_DEEPSEEK_MAX_STEPS:-24}"
+    "$PYTHON3_BIN" "$ROOT/scripts/tool_call_runner.py" \
+      --provider deepseek \
+      --mode finding \
+      --workdir "$TARGET_DIR" \
+      --prompt-file "$PROMPT_FILE" \
+      --model "$MODEL" \
+      --max-steps "$DEEPSEEK_MAX_STEPS" \
+      --log-dir "$AGENT_DIR/tool_logs" \
       > "$AGENT_DIR/stdout.log" 2> "$AGENT_DIR/stderr.log"
     ;;
   *)

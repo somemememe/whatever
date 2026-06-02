@@ -191,6 +191,7 @@ for round in $(seq "$start_round" "$MAX_ROUNDS"); do
   if [ -n "$AGENT_TYPES_CSV" ]; then
     codex_count=0
     opencode_count=0
+    deepseek_count=0
     for agent in "${AGENT_TYPES[@]}"; do
       if [ -z "$agent" ]; then
         continue
@@ -203,6 +204,10 @@ for round in $(seq "$start_round" "$MAX_ROUNDS"); do
         opencode)
           opencode_count=$((opencode_count + 1))
           label="${agent}_$opencode_count"
+          ;;
+        deepseek)
+          deepseek_count=$((deepseek_count + 1))
+          label="${agent}_$deepseek_count"
           ;;
         *)
           echo "Unsupported agent type in AUDITHOUND_AGENT_TYPES: $agent" >&2

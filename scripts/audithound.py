@@ -75,6 +75,8 @@ def default_output_dir(case_name: str) -> Path:
 
 
 def default_model_for_agent(agent: str) -> str:
+    if agent == "deepseek":
+        return os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", os.environ.get("DEEPSEEK_MODEL", "deepseek-reasoner"))
     if agent == "opencode":
         return os.environ.get("OPENCODE_MODEL", "opencode/minimax-m2.5-free")
     return os.environ.get("CODEX_MODEL", "gpt-5.4")
@@ -541,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         help="Output directory. Defaults to AuditHoundV2/output/<case>_<timestamp>.",
     )
-    run_parser.add_argument("--agent", default="codex", choices=("codex", "opencode"), help="Code agent to run.")
+    run_parser.add_argument("--agent", default="codex", choices=("codex", "opencode", "deepseek"), help="Code agent to run.")
     run_parser.add_argument(
         "--agents",
         help="Comma-separated agents to run each round, e.g. codex,opencode or codex,codex,opencode. Overrides --agent/--workers shape.",
@@ -732,6 +734,10 @@ def main() -> int:
             args.codex_model = os.environ.get("CODEX_MODEL", "gpt-5.4")
         if not args.opencode_model:
             args.opencode_model = os.environ.get("OPENCODE_MODEL", "opencode/minimax-m2.5-free")
+        if not args.merge_model:
+            args.merge_model = os.environ.get("AUDITHOUND_MERGE_MODEL", os.environ.get("CODEX_MODEL", "gpt-5.4"))
+        if not args.summary_model:
+            args.summary_model = os.environ.get("AUDITHOUND_SUMMARY_MODEL", args.merge_model)
         if not args.foundry_model:
             args.foundry_model = args.model
     return args.func(args)
