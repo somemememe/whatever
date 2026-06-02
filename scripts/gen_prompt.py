@@ -116,13 +116,110 @@ Only keep findings whose root cause location is inside files matching:
 
 You may still read other files in the target directory for context, but do not report them as root cause locations.
 """
+    chain_access_note = """
+## Chain Access
+
+Use these chain endpoints directly when you need live on-chain evidence:
+- RPC: `https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- Etherscan API key: `ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K`
+
+Use the RPC to inspect deployed code, storage, balances, and return values with `cast`.
+Use the Etherscan API key when you need to fetch verified implementation source or confirm proxy metadata.
+
+Examples:
+- `cast code <address> --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- `cast storage <address> <slot> --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- `cast call <address> "<signature>" --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- `curl -s "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address=<address>&apikey=ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K"`
+
+When a finding depends on live-chain behavior, do not present it as a hypothesis only.
+Support it with chain-derived evidence such as runtime code, storage values, selector discovery, call results, or verified source fetched from Etherscan.
+
+### Proxy Storage Slot Collision Check
+
+When the target is a proxy (or any contract in scope is a proxy), you MUST:
+1. Check which storage slots the proxy uses for its own admin/state variables (especially non-standard slots like slot 0).
+2. Read the implementation's initialization logic and check which slots it writes during `initialize()`.
+3. If the proxy stores admin in a non-EIP-1967 slot that overlaps with the implementation's initialization state, this is a critical storage collision vulnerability.
+4. Verify with `cast storage <proxy> 0x0 --rpc-url ...` and `cast storage <proxy> <EIP1967_IMPL_SLOT> --rpc-url ...`.
+5. A storage collision means an attacker can re-initialize the implementation through the proxy and seize privileged roles (guardian, governance admin, registry controller), enabling direct treasury drain.
+
+This is one of the highest-value proxy attack patterns — do NOT skip this check for any proxy contract.
+"""
+    tooling_note = """
+## Phase 0: Proxy Detection (MANDATORY — Do this FIRST)
+
+Before any analysis of business logic, determine whether the target is a proxy. Attackers can exploit proxy storage layout, upgrade mechanisms, and initialization guards even when the implementation logic is sound. **Skipping this phase will cause you to miss the highest-value vulnerabilities.**
+
+1. **Check if the target is a proxy**:
+   - Read the target contract source. Look for `delegatecall` in the fallback, or inheritance from known proxy patterns (`ERC1967Proxy`, `TransparentUpgradeableProxy`, `AdminUpgradeabilityProxy`, custom proxy with `target_`, etc.).
+   - ```bash
+     grep -i "delegatecall\|fallback\|implementation\|upgradeTo\|_target\|target_\|setTarget" <target>/Contract.sol
+     ```
+
+2. **Find the implementation address**:
+   - Standard EIP-1967 proxy:
+     ```bash
+     cast storage <PROXY_ADDR> 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc --rpc-url <RPC_URL>
+     ```
+   - Try common getter functions:
+     ```bash
+     cast call <PROXY_ADDR> "implementation()(address)" --rpc-url <RPC_URL>
+     ```
+   - For custom proxies, read the proxy source to identify where `target_` or equivalent is stored.
+
+3. **Check proxy storage layout for collisions**:
+   - Read the proxy source to identify **which slot stores the admin/owner** — especially non-standard slots (e.g., slot 0 instead of EIP-1967 admin slot).
+   - Read the implementation's `initialize()` function and identify **which slots it writes during initialization**.
+   - If the proxy stores admin in a slot that overlaps with the implementation's initialization state, this is a **critical storage collision** — an attacker can call `initialize()` through the proxy and seize privileged roles (guardian, governance admin, registry controller), enabling direct treasury drain.
+   - ```bash
+     cast storage <PROXY_ADDR> 0x0 --rpc-url <RPC_URL>
+     cast storage <PROXY_ADDR> <SLOT> --rpc-url <RPC_URL>
+     ```
+
+4. **If the implementation source is not already in the target directory**, fetch it using `fetch_source` or by querying Etherscan. Analyze the implementation for business logic vulnerabilities, but also cross-reference with the proxy's storage layout.
+
+**⚠️ CRITICAL: Code Search & Review Best Practices**
+
+1. **Always use case-insensitive search** when looking for functions:
+   ```bash
+   grep -i "swap" Contract.sol
+   ```
+
+2. **Check BOTH directions for bidirectional operations**:
+   - If you find `swapAForB()`, also search for `swapBForA()`
+   - If you find `deposit()`, also search for `withdraw()`
+   - Function naming can vary: `swapETHForTokens` vs `swapETHforTokens` (note capitalization!)
+
+3. **Read the COMPLETE contract file, don't rely only on grep**:
+   ```bash
+   cat etherscan-contracts/0x.../Contract.sol | less
+   ```
+
+4. **When you identify a POTENTIAL vulnerability**:
+   - ✅ READ the complete source file to find ALL related functions
+   - ✅ Check access modifiers on ALL functions (public/external/internal/private)
+   - ✅ Verify your understanding by checking function signatures with `cast`
+   - ❌ DON'T stop after finding one function with restrictions
+   - ❌ DON'T assume "if X is restricted, Y must be too"
+
+5. **Don't Give Up Too Early**:
+   - If you identify a PRICING ERROR or LOGIC BUG but one function has access control:
+     * Check ALL related functions in the contract
+     * Read the entire contract file to find alternative entry points
+     * The vulnerability might be accessible through a different function
+"""
     return f"""You are auditing the smart contracts in {target}.
 
-## Contracts in Scope
+## Starting Point
+
+The source directory below is your starting point. You may and should explore beyond it — use Etherscan to fetch additional verified contracts, and verify everything on-chain.
 
 {code_map}
 {include_note}
 {exclude_note}
+{chain_access_note}
+{tooling_note}
 
 ## Known Findings (do not duplicate)
 
@@ -132,21 +229,37 @@ You may still read other files in the target directory for context, but do not r
 
 ## Task
 
-Find security vulnerabilities in the contracts listed above as more as you can.And there are lots of high severity vulns.
+Your job is vulnerability discovery. Find vulnerabilities that can realistically be exploited for profit or cause protocol-level harm. The source directory is your starting point, not your boundary.
 
-You should look for:
-- vulnerabilities
-- reportable issues
+**Use every tool available.** You have full shell and RPC access. Verify on-chain instead of hypothesizing:
+- `cast call` to test if functions are reachable and state supports exploitation
+- `cast storage` to inspect proxy slots and state variables
+- `curl` with the Etherscan API key to fetch verified source for any contract you need (Etherscan ONLY — do NOT use curl or any HTTP tool to access other websites)
+- `grep` / `find` / `read_file` to navigate the source directory
+- Python scripts to compute optimal exploit parameters
 
-Known findings are not proof that a file, function, or theme is fully audited.
-Do not repeat the same root cause, but keep investigating nearby code and related mechanisms.
-Report a new finding when it has a distinct root cause, exploit path, impact, or materially stronger version of an existing issue.
+**If the source in the directory does not match on-chain behavior, the source is wrong — not your reasoning.** Verify via `cast call` whether the vulnerability exists on the fork block, regardless of what the local source files show.
 
-Audit only Solidity source files under the target directory above.
-Do not inspect or rely on files outside that directory, including README, docs, audit reports, discord exports, scripts, broadcasts, or other repository context, unless they are explicitly included in the target directory.
+**Think like an attacker, not an auditor.** Your goal is to find at least one vulnerability with a realistic profit path.
 
-If you identify a problem that is not fully proven, still report it as a low-confidence finding.
-Be skeptical of documented behavior and pure owner-only configuration issues, but you may still report them when they create realistic protocol-level harm such as fund loss, theft, insolvency, permanent lockup, economic manipulation, or permissionless denial of service.
+Known findings are context, not limits. Use them as leads but explore independently. Produce distinct findings with clear exploit paths.
+
+## Hard Constraints
+
+- **Do NOT search the web for exploit writeups, PoCs, or attack descriptions** for this project. This includes Google, GitHub, security blogs, DeFiHackLabs, Rekt, and any other external source. All findings must come from reading the contract code and verifying on-chain state.
+- **Do NOT use external answers/PoCs/articles/repos** (including DeFiHackLabs). Use only on-chain verification and source code analysis.
+- **Do NOT curl/wget/fetch any URL outside of Etherscan/blockchain explorers and your configured RPC endpoints.** You may use Etherscan to fetch verified contract source code only.
+- **Do NOT access other runs' output directories.** Stay within the target source directory and your own workspace.
+
+## Before You Submit: Compute Optimal Parameters
+
+If any finding's exploit path depends on finding an optimal input value (amount, price, ratio, pool index, etc.) for a known contract function, do NOT leave the parameter to guesswork by the downstream PoC agent. Use the chain endpoints and shell access to compute it now:
+
+1. Read the current chain state with `cast call` at the fork block.
+2. Write a short Python script to search for the optimal value across a range of candidate inputs. Use `subprocess` to call `cast`, then compare the results to find the maximum profit.
+3. Include the computed optimal parameter in your finding's `paths` field with exact numerical values.
+
+If the parameter is trivial to compute (e.g., a fixed ratio or a boolean), skip this step.
 
 ## Output Format
 
@@ -160,7 +273,7 @@ Each element must have:
 - `locations`: array of `file:line`
 - `claim`: core mechanism statement
 - `impact`: why it matters
-- `paths`: array of trigger/exploit paths, may be empty
+- `paths`: array of trigger/exploit paths. Include computed optimal parameters when applicable.
 
 If there are no findings, return `[]`.
 """

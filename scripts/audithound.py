@@ -265,13 +265,12 @@ def _materialize_onchain_sources(manifest: dict, api_key: str) -> Path:
     _write_source_payload(root_item, root_out)
     fetched.append({"address": target_addr.lower(), "outdir": str(root_out)})
 
-    proxy_flag = str(root_item.get("Proxy") or "0").strip()
-    implementation = str(root_item.get("Implementation") or "").strip()
-    if proxy_flag == "1" and implementation.startswith("0x"):
-        impl_item = _fetch_etherscan_contract(chain_id, implementation, api_key)
-        impl_out = materialized_base / implementation.lower()
-        _write_source_payload(impl_item, impl_out)
-        fetched.append({"address": implementation.lower(), "outdir": str(impl_out)})
+    # NOTE: We intentionally do NOT auto-fetch the implementation source from
+    # Etherscan's `Implementation` field, because that field reflects the
+    # CURRENT implementation, not the one deployed at the fork block.
+    # If the target is a proxy, Phase 0 in the audit prompt guides the agent
+    # to resolve the correct implementation at the fork block using cast
+    # storage + fetch_implementation_source, just like Red_V2 does.
 
     (materialized_base / "_index.json").write_text(json.dumps(fetched, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({"auto_materialized": True, "target_root": str(materialized_base), "fetched": fetched}, ensure_ascii=True))
@@ -324,6 +323,9 @@ def run_foundry_validation(
     anvil_port_start: int | None,
     anvil_port_end: int | None,
     anvil_ready_timeout: float | None,
+    tool_provider: str = "codex",
+    tool_model: str | None = None,
+    bundle: bool = False,
 ) -> int:
     findings_path = output_dir / "findings_acc.json"
     if not findings_path.exists():
@@ -353,6 +355,12 @@ def run_foundry_validation(
         "--maximize-plateau",
         str(maximize_plateau),
     ]
+    if tool_provider:
+        cmd.extend(["--tool-provider", tool_provider])
+    if tool_model:
+        cmd.extend(["--tool-model", tool_model])
+    if bundle:
+        cmd.extend(["--bundle"])
     if rpc_url:
         cmd.extend(["--rpc-url", rpc_url])
     if anvil_port is not None:
@@ -510,6 +518,9 @@ def run_validate(args: argparse.Namespace) -> int:
         anvil_port=args.anvil_port,
         anvil_port_start=args.anvil_port_start,
         anvil_port_end=args.anvil_port_end,
+        tool_provider=getattr(args, "tool_provider", "codex") or "codex",
+        tool_model=getattr(args, "tool_model", None) or None,
+        bundle=getattr(args, "bundle", False),
         anvil_ready_timeout=args.anvil_ready_timeout,
     )
 
@@ -627,7 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--foundry-top-k", type=int, default=3, help="How many top findings to validate in Foundry.")
     run_parser.add_argument("--foundry-min-profit", type=float, default=0.001, help="Minimum profit threshold for Foundry validation.")
-    run_parser.add_argument("--foundry-max-attempts", type=int, default=3, help="Maximum PoC generation/validation attempts per finding.")
+    run_parser.add_argument("--foundry-max-attempts", type=int, default=1, help="Maximum PoC generation/validation attempts per finding.")
     run_parser.add_argument(
         "--foundry-maximize-plateau",
         type=int,
@@ -661,7 +672,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("--top-k", type=int, default=3)
     validate_parser.add_argument("--min-profit", type=float, default=0.001)
-    validate_parser.add_argument("--max-attempts", type=int, default=3, help="Maximum PoC generation/validation attempts per finding.")
+    validate_parser.add_argument("--max-attempts", type=int, default=1, help="Maximum PoC generation/validation attempts per finding.")
+    validate_parser.add_argument(
+        "--bundle",
+        action="store_true",
+        help="Bundle all findings into a single ALL_FINDINGS validation run.",
+    )
     validate_parser.add_argument(
         "--maximize-plateau",
         type=int,
@@ -669,6 +685,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop maximize search after this many non-improving successful attempts.",
     )
     validate_parser.add_argument("--model", default=os.environ.get("CODEX_MODEL", "gpt-5.4"))
+    validate_parser.add_argument(
+        "--tool-provider",
+        choices=("codex", "deepseek"),
+        default=os.environ.get("AUDITHOUND_TOOL_PROVIDER", "codex"),
+        help="Structured tool-call provider used during validation.",
+    )
+    validate_parser.add_argument(
+        "--tool-model",
+        help="Structured tool-call model used during validation.",
+    )
     validate_parser.add_argument(
         "--opencode-api-key",
         help=(

