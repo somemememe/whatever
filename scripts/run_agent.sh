@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 resolve_codex_cli() {
   if command -v codex >/dev/null 2>&1; then
     command -v codex
