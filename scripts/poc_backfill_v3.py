@@ -8,8 +8,11 @@ _LOG_LOCK = threading.Lock()
 _PRICE_CACHE = {}  # token_address -> (eth_price, timestamp)
 
 ARCHIVE_RPCS = [
-    "https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W",
+    "https://mainnet.infura.io/v3/e256143b4bb44b44a98e9b22b0290400",
+    "https://mainnet.infura.io/v3/a5fc4fc5ece34a6eb6e8dfe627dce240",
     "https://ethereum.blockpi.network/v1/rpc/9864568b5fe8b75df7f3a38dc5b8742f5b6efaba",
+    "https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W",
+    "https://eth-mainnet.g.alchemy.com/v2/p6UDlMQUt1PeyOcmJpF6Y",
 ]
 def get_rpc(name):
     return ARCHIVE_RPCS[hash(name) % len(ARCHIVE_RPCS)]
