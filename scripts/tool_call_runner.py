@@ -54,12 +54,12 @@ def _resolve_model_name(provider: str, model: str) -> str:
         return requested
 
     alias = requested.lower()
-    if alias in {"", "deepseek4.0", "deepseek-4.0", "deepseek-v4", "deepseek-v4-flash", "deepseek4", "deepseek-reasoner"}:
+    if alias in {"", "deepseek4.0", "deepseek-4.0", "deepseek-v4", "deepseek-v4-flash", "deepseek4", "deepseek-v4-pro"}:
         env_model = (
             os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", "").strip()
             or os.environ.get("DEEPSEEK_MODEL", "").strip()
         )
-        return env_model or "deepseek-reasoner"
+        return env_model or "deepseek-v4-pro"
     return requested
 
 
@@ -112,11 +112,20 @@ def _tool_shell(base_dir: Path, args: dict) -> dict:
     }
 
 
-def _tool_read_file(base_dir: Path, args: dict) -> dict:
+def _tool_read_file(base_dir: Path, args: dict, mode: str = "generic") -> dict:
     raw_path = str(args.get("path") or "").strip()
     if not raw_path:
         raise ValueError("read_file requires 'path'")
     path = _safe_path(base_dir, raw_path)
+    # Block pre-written answer files during audit (finding) mode
+    forbidden = {"FlawVerifier.sol", "ExploitPOC.t.sol", "Counter.sol"}
+    if mode in ("finding", "validation") and path.name in forbidden:
+        return {
+            "path": str(path),
+            "exists": True,
+            "content": f"[BLOCKED] {path.name} is blocked to prevent answer leakage. Write your own code from scratch.",
+            "blocked": True,
+        }
     return {
         "path": str(path),
         "exists": path.exists(),
@@ -518,10 +527,11 @@ def _system_prompt(mode: str) -> str:
         return base + (
             " You are generating or repairing a Foundry exploit PoC; keep the final answer to the exact format requested by the prompt. "
             "Prioritize concrete exploitability and profit maximization, using tools iteratively to discover viable attack paths. "
-            "Convergence policy: at most one short reconnaissance phase, then produce code. Avoid repeated filesystem exploration."
+            "Convergence policy: at most one short reconnaissance phase, then produce code. Avoid repeated filesystem exploration. "
+            "IMPORTANT: Files named FlawVerifier.sol, ExploitPOC.t.sol, and Counter.sol are BLOCKED. You must write your OWN exploit code from scratch. Do NOT search for or copy pre-existing exploit files."
         )
     if mode == "finding":
-        return base + " You are performing static or hybrid finding generation over the provided source scope."
+        return base + " You are performing static or hybrid finding generation over the provided source scope. IMPORTANT: Files named FlawVerifier.sol, ExploitPOC.t.sol, and Counter.sol are BLOCKED from reading. All findings must come from reading the actual contract source code and on-chain verification only."
     return base
 
 
@@ -573,7 +583,7 @@ def _run_tool_loop(client: OpenAI, model: str, prompt: str, mode: str, max_steps
         choice = resp.choices[0]
         msg = choice.message
         tool_calls = getattr(msg, "tool_calls", None) or []
-        content = msg.content or ""
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
 
         if tool_calls and remaining_steps > 1:
             _append_log(log_dir, "tool_calls_received", {"step": step, "count": len(tool_calls)})
@@ -608,7 +618,10 @@ def _run_tool_loop(client: OpenAI, model: str, prompt: str, mode: str, max_steps
                 else:
                     try:
                         _append_log(log_dir, "tool_call_start", {"step": step, "tool": tool_name, "args": args})
-                        payload = handler(base_dir, args)
+                        if tool_name == "read_file":
+                            payload = handler(base_dir, args, mode=mode)
+                        else:
+                            payload = handler(base_dir, args)
                         _append_log(log_dir, "tool_call_ok", {"step": step, "tool": tool_name})
                     except Exception as exc:
                         payload = {"error": f"{type(exc).__name__}: {exc}", "args": args}
@@ -657,7 +670,7 @@ def main() -> int:
     )
     parser.add_argument("--workdir", default=str(Path.cwd()))
     parser.add_argument("--mode", choices=("finding", "validation", "generic"), default="generic")
-    parser.add_argument("--max-steps", type=int, default=24)
+    parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--prompt-file")
     parser.add_argument("--log-dir", default="")
     args = parser.parse_args()

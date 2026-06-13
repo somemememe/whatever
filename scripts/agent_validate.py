@@ -12,7 +12,7 @@ Key differences from tool_call_runner.py:
 Usage:
   python3 agent_validate.py \\
     --workdir /path/to/workspace \\
-    --model deepseek-reasoner \\
+    --model deepseek-v4-pro \\
     --provider deepseek \\
     --reasoning-effort medium \\
     --prompt-file /path/to/prompt.md \\
@@ -38,7 +38,7 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-AGENT_MAX_ITERATIONS = 200  # safety limit; should never hit this
+AGENT_MAX_ITERATIONS = 500  # safety limit; increased for complex cases
 AGENT_TIME_BUDGET_SECONDS = 60 * 60  # 60 minutes default
 MAX_ANALYSIS_STEPS = 8  # max steps for Phase 1: Quick Analysis
 LAST_FORGE_TEST_OUTPUT = None
@@ -183,10 +183,10 @@ def _resolve_model_name(provider: str, model: str) -> str:
         return requested
     alias = requested.lower()
     if alias in {"", "deepseek4.0", "deepseek-4.0", "deepseek-v4",
-                 "deepseek-v4-flash", "deepseek4", "deepseek-reasoner"}:
+                 "deepseek-v4-flash", "deepseek4", "deepseek-v4-pro"}:
         env_model = (os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", "").strip()
                      or os.environ.get("DEEPSEEK_MODEL", "").strip())
-        return env_model or "deepseek-reasoner"
+        return env_model or "deepseek-v4-pro"
     return requested
 
 
@@ -227,6 +227,12 @@ def tool_run_shell(command: str, workdir: str | Path,
     # Reject heredocs
     if "<<" in command and ("EOF" in command or "HEREDOC" in command):
         return "ERROR: Heredoc syntax (<<) is not allowed. Use printf or echo instead."
+
+    # Block shell access to pre-written answer files
+    forbidden_shell_files = {"FlawVerifier.sol", "ExploitPOC.t.sol", "Counter.sol"}
+    for fname in forbidden_shell_files:
+        if fname in command:
+            return f"Command blocked: access to {fname} is forbidden to prevent answer leakage."
     # Allow cd into workspace before forge — strip the cd and run directly
     if "forge" in command and re.search(r'\bcd\s+\S', command):
         m = re.search(r'\bcd\s+(\S+)\s*(?:&&|;)\s*(.+)', command)
@@ -278,6 +284,13 @@ def tool_read_file(path: str, workdir: str | Path) -> str:
             "You may only read files within the current workspace or the "
             "target source directory. Use relative paths."
         )
+    # Block pre-written answer files
+    forbidden = {"FlawVerifier.sol", "ExploitPOC.t.sol", "Counter.sol"}
+    if os.path.basename(path) in forbidden:
+        return (
+            f"[BLOCKED] {os.path.basename(path)} is blocked to prevent answer leakage. "
+            "Write your own exploit code from scratch based on the finding description."
+        )
     if not os.path.exists(path):
         return f"Error: File not found: {path}"
     try:
@@ -292,6 +305,11 @@ def tool_write_file(path: str, content: str, workdir: str | Path) -> str:
     workdir = str(workdir)
     if not os.path.isabs(path):
         path = os.path.join(workdir, path)
+    # Reject writes outside the workspace
+    norm_path = os.path.normpath(os.path.realpath(path))
+    norm_workdir = os.path.normpath(os.path.realpath(workdir))
+    if not norm_path.startswith(norm_workdir + os.sep) and norm_path != norm_workdir:
+        return f"ERROR: Write denied - path {path} is outside workspace {workdir}."
     # Protect test files from modification
     test_dir = os.path.join(os.path.normpath(workdir), "test")
     normalized_path = os.path.normpath(path)
@@ -986,6 +1004,7 @@ class AgentState:
         self.workdir = workdir
         self.rpc_url = rpc_url
         self.min_profit_wei = min_profit_wei
+        self.blocked_count = 0
 
 
 def dispatch_tool(tc, state: AgentState) -> str:
@@ -1135,7 +1154,7 @@ def run_agent_loop(
 
         msg = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None) or []
-        content = msg.content or ""
+        content = msg.content or getattr(msg, "reasoning_content", None) or ""
 
         # ---- Logging ----
         if log_dir:
@@ -1246,7 +1265,7 @@ def main() -> int:
         description="Red_V2-style agent for AuditHoundV2 validation.")
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--model", default=os.environ.get("CODEX_MODEL",
-                                                          "deepseek-reasoner"))
+                                                          "deepseek-v4-pro"))
     parser.add_argument("--provider", default="deepseek",
                         choices=("codex", "deepseek", "claude"))
     parser.add_argument("--reasoning-effort", default="medium")

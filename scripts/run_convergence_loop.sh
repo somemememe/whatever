@@ -234,13 +234,24 @@ for round in $(seq "$start_round" "$MAX_ROUNDS"); do
 
   prev=$(python3 -c "import json; from pathlib import Path; p=Path('$OUTPUT_DIR/findings_acc.json'); print(len(json.loads(p.read_text())))")
 
-  python3 "$ROOT/scripts/merge.py" \
-    --round-dir "$RD" \
-    --target-dir "$TARGET_DIR" \
-    --acc "$OUTPUT_DIR/findings_acc.json" \
-    --round-num "$round" \
-    --mode "$MERGE_MODE" \
-    --model "$MERGE_MODEL"
+  if [ "$MERGE_MODE" = "raw" ]; then
+    # Single-agent mode: extract findings directly from agent stdout
+    AGENT_DIR=$(find "$RD" -type d -name "agent_*" | head -1)
+    python3 "$ROOT/scripts/extract_findings.py" \
+      --agent-dir "$AGENT_DIR" \
+      --out "$OUTPUT_DIR/findings_acc.json" \
+      --accumulated "$OUTPUT_DIR/findings_acc.json"
+  elif [ "$MERGE_MODE" = "skip" ]; then
+    echo "Skipping merge (findings already extracted)"
+  else
+    python3 "$ROOT/scripts/merge.py" \
+      --round-dir "$RD" \
+      --target-dir "$TARGET_DIR" \
+      --acc "$OUTPUT_DIR/findings_acc.json" \
+      --round-num "$round" \
+      --mode "$MERGE_MODE" \
+      --model "$MERGE_MODEL"
+  fi
 
   if ! python3 "$ROOT/scripts/summarize_round.py" \
     --round-dir "$RD" \

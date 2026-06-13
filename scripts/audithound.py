@@ -76,7 +76,7 @@ def default_output_dir(case_name: str) -> Path:
 
 def default_model_for_agent(agent: str) -> str:
     if agent == "deepseek":
-        return os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", os.environ.get("DEEPSEEK_MODEL", "deepseek-reasoner"))
+        return os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"))
     if agent == "opencode":
         return os.environ.get("OPENCODE_MODEL", "opencode/minimax-m2.5-free")
     return os.environ.get("CODEX_MODEL", "gpt-5.4")
@@ -428,7 +428,7 @@ def run_loop(args: argparse.Namespace) -> int:
         str(output_dir),
         str(args.max_rounds),
         str(args.converge_after),
-        args.merge_mode,
+        "raw" if args.agent == "deepseek" and int(args.workers) <= 1 else args.merge_mode,
         args.model,
         str(args.workers),
     ]

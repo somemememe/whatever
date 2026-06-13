@@ -145,7 +145,7 @@ case "$AGENT_TYPE" in
       exit 1
     fi
 
-    DEEPSEEK_MAX_STEPS="${AUDITHOUND_DEEPSEEK_MAX_STEPS:-24}"
+    DEEPSEEK_MAX_STEPS="${AUDITHOUND_DEEPSEEK_MAX_STEPS:-100}"
     "$PYTHON3_BIN" "$ROOT/scripts/tool_call_runner.py" \
       --provider deepseek \
       --mode finding \

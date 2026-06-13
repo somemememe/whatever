@@ -581,6 +581,8 @@ Hard constraints:
 
 You are encouraged to read the FULL source code and discover your OWN attack vectors. The most profitable exploit may not be among the listed findings at all. If you spot a different vulnerability while reading the code, pursue it. Your goal is maximum profit, not faithfulness to the provided finding list.
 
+**CRITICAL: What counts as profit:** Profit = value extracted from the TARGET protocol (stolen tokens, drained reserves, borrowed assets, etc.). You MUST NOT count tokens obtained by swapping your own seed ETH/capital as profit. Swapping seed ETH for tokens on a DEX is NOT an exploit — it is just trading. Profit must come from exploiting a vulnerability in the target contract, not from your own seed capital. Also: do NOT try to bypass the test harness guards. Write a genuine exploit.
+
 Remember: you have the full tool set available. Follow the phased workflow:
 
 ### Phase 1: Multi-Pass Analysis
@@ -636,7 +638,7 @@ If the target itself has insufficient balance to profit, do NOT abandon the case
 
 **⚠️ If your exploit requires optimal parameters (bonding curve amounts, AMM slippage, reserve ratios, weight calculations):** write a Python script NOW. Use `cast call` to read state, brute-force or analytically solve. Do NOT guess in Solidity — a 10-line Python loop finds the answer in seconds.
 
-1. Implement the HIGHEST-PROFIT exploit in src/FlawVerifier.sol
+1. Implement the HIGHEST-PROFIT exploit in src/FlawVerifier.sol. Profit means extracting value FROM the target protocol, NOT converting seed capital into tokens.
 2. Test with forge test -vvv
 3. Iterate until passing with profit
 4. Call task_complete with a summary of your verified profit
@@ -878,11 +880,14 @@ contract FlawVerifierTest {{
             reportedProfit = 0;
         }}
 
-        // Anti-seed-conversion guard: if > 90% of native ETH was consumed and no
-        // native profit was produced, the agent likely converted seed funds into
-        // tokens and is misreporting them as profit.
-        if (nativeProfit == 0 && reportedToken != address(0) && afterBal < beforeBal / 10) {{
-            reportedProfit = 0;
+        // Anti-seed-conversion guard: if native ETH was consumed and no
+        // native profit was produced, deduct seed cost from token profit.
+        if (nativeProfit == 0 && reportedToken != address(0) && afterBal < beforeBal) {{
+            uint256 seedSpent = beforeBal - afterBal;
+            emit log_named_uint("AUDITHOUND_SEED_SPENT_WEI", seedSpent);
+            if (reportedProfit <= seedSpent) {{
+                reportedProfit = 0;
+            }}
         }}
         uint256 effectiveProfit = nativeProfit > 0 ? nativeProfit : reportedProfit;
 
@@ -891,6 +896,7 @@ contract FlawVerifierTest {{
         emit log_named_uint("AUDITHOUND_PROFIT_WEI", nativeProfit);
         emit log_named_uint("AUDITHOUND_PROFIT_ANY", reportedProfit);
         emit log_named_uint("AUDITHOUND_EFFECTIVE_PROFIT_WEI", effectiveProfit);
+        emit log_named_uint("AUDITHOUND_PREFUND_WEI", {prefund_wei});
         emit log_named_uint("AUDITHOUND_MIN_PROFIT_WEI", {min_profit_wei});
         emit log_named_address("AUDITHOUND_PROFIT_TOKEN", reportedToken);
         emit log_named_address("AUDITHOUND_PROFIT_MODE", nativeProfit > 0 ? address(0) : address(1));
@@ -1243,7 +1249,7 @@ def _run_sequential_validation(
 
             (case_dir / "src" / "FlawVerifier.sol").write_text(current_code, encoding="utf-8")
             contract_name, entry_fn = current_detected
-            prefund_wei_val = max(0, int(1_000_000 * 10**18))  # 1M ETH seed
+            prefund_wei_val = max(0, int(10 * 10**18))  # 1M ETH seed
             write_test_file(case_dir, fork_block, contract_name, int(min_profit_wei), prefund_wei_val)
 
             log(f"[{finding.fid}] forge attempt={attempt} running")
@@ -1386,6 +1392,7 @@ def _run_sequential_validation(
             "balance_after_wei": bal_after,
             "profit_wei": profit_wei,
             "profit_any": profit_any,
+            "profit_token": profit_token,
             "profit_eth": (profit_wei / 1e18) if isinstance(profit_wei, int) else None,
             "best_profit_score": (
                 int(best_success.get("profit_score", 0)) if best_success is not None else 0
@@ -1489,7 +1496,7 @@ def _run_combined_validation(
     case_dir = validation_root / "ALL_FINDINGS_All_findings_reference_bundle"
     write_foundry_files(case_dir)
     min_profit = max(0, int(min_profit_wei))
-    prefund_wei = 1_000_000 * 10**18  # 1M ETH seed, same as single-finding default
+    prefund_wei = 10 * 10**18  # 1M ETH seed, same as single-finding default
     write_test_file(case_dir, fork_block, "FlawVerifier", min_profit, prefund_wei)
 
     # Build combined prompt
@@ -1771,8 +1778,8 @@ def main() -> int:
     parser.add_argument(
         "--prefund-wei",
         type=int,
-        default=0,
-        help="Optional initial ETH funding for verifier in tests. Default 0 to avoid principal-as-profit misclassification.",
+        default=10000000000000000000,
+        help="Optional initial ETH funding for verifier in tests. Prefund is deducted from profit in the test harness.",
     )
     parser.add_argument("--model", default=os.environ.get("CODEX_MODEL", "gpt-5.4"), help="Model used for PoC generation.")
     parser.add_argument(

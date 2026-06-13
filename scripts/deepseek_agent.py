@@ -75,7 +75,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default=os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", "deepseek-reasoner"),
+        default=os.environ.get("AUDITHOUND_DEEPSEEK_MODEL", "deepseek-v4-pro"),
     )
     parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument(
