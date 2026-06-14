@@ -120,16 +120,16 @@ You may still read other files in the target directory for context, but do not r
 ## Chain Access
 
 Use these chain endpoints directly when you need live on-chain evidence:
-- RPC: `https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- RPC: `https://eth-mainnet.g.alchemy.com/v2/p6UDlMQUt1PeyOcmJpF6Y`
 - Etherscan API key: `ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K`
 
 Use the RPC to inspect deployed code, storage, balances, and return values with `cast`.
 Use the Etherscan API key when you need to fetch verified implementation source or confirm proxy metadata.
 
 Examples:
-- `cast code <address> --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
-- `cast storage <address> <slot> --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
-- `cast call <address> "<signature>" --rpc-url https://eth-mainnet.g.alchemy.com/v2/YB8p9sQb6OE4_ZXJP1I5W`
+- `cast code <address> --rpc-url https://eth-mainnet.g.alchemy.com/v2/p6UDlMQUt1PeyOcmJpF6Y`
+- `cast storage <address> <slot> --rpc-url https://eth-mainnet.g.alchemy.com/v2/p6UDlMQUt1PeyOcmJpF6Y`
+- `cast call <address> "<signature>" --rpc-url https://eth-mainnet.g.alchemy.com/v2/p6UDlMQUt1PeyOcmJpF6Y`
 - `curl -s "https://api.etherscan.io/v2/api?chainid=1&module=contract&action=getsourcecode&address=<address>&apikey=ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K"`
 
 When a finding depends on live-chain behavior, do not present it as a hypothesis only.
