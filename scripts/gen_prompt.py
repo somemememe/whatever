@@ -250,6 +250,7 @@ Known findings are context, not limits. Use them as leads but explore independen
 - **Do NOT use external answers/PoCs/articles/repos** (including DeFiHackLabs). Use only on-chain verification and source code analysis.
 - **Do NOT curl/wget/fetch any URL outside of Etherscan/blockchain explorers and your configured RPC endpoints.** You may use Etherscan to fetch verified contract source code only.
 - **Do NOT access other runs' output directories.** Stay within the target source directory and your own workspace.
+- **Do NOT use `find /`, `rg --files /`, or any other command that scans outside the target source directory.** Scope all file-search commands to the target directory (e.g., `find .`, `rg --files .`). Working directory is the target source root.
 
 ## Before You Submit: Compute Optimal Parameters
 
