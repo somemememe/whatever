@@ -496,6 +496,7 @@ def chain_id_from_manifest(chain: str) -> int | None:
         "arbitrum": 42161,
         "optimism": 10,
         "base": 8453,
+        "gnosis": 100,
     }
     return mapping.get(c)
 
@@ -1858,6 +1859,7 @@ def main() -> int:
         "base": "BASE_RPC_URL",
         "arbitrum": "ARBITRUM_RPC_URL",
         "optimism": "OPTIMISM_RPC_URL",
+        "gnosis": "GNOSIS_RPC_URL",
     }
     rpc_url = args.rpc_url or os.environ.get(env_by_chain.get(chain, ""), "")
     if not rpc_url:
