@@ -21,7 +21,7 @@ def _pick_rpc(name):
     return ARCHIVE_RPCS[hash(name) % len(ARCHIVE_RPCS)]
 WORKERS = int(sys.argv[1]) if len(sys.argv) > 1 else 4
 CASE_LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else None
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-215c7b2026074da1b847b9e0a31d5848")
+API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-2afbc20ad8544e66a6194363f917d8a7")
 ETHERSCAN_KEY = os.environ.get("ETHERSCAN_API_KEY", "ZFNNGRNEUNGRH3XHGE5A61Q3MVGIEVF31K")
 
 os.environ["DEEPSEEK_API_KEY"] = API_KEY
