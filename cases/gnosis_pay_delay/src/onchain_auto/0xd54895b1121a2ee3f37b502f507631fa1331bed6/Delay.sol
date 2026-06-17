@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-only
 pragma solidity >=0.8.0;
 
-import "@gnosis.pm/zodiac/contracts/core/Modifier.sol";
+import {Enum, Modifier} from "@gnosis.pm/zodiac/contracts/core/Modifier.sol";
 
 contract Delay is Modifier {
     event DelaySetup(
@@ -10,6 +10,9 @@ contract Delay is Modifier {
         address indexed avatar,
         address target
     );
+    event TxCooldownSet(uint256 cooldown);
+    event TxExpirationSet(uint256 expiration);
+    event TxNonceSet(uint256 nonce);
     event TransactionAdded(
         uint256 indexed queueNonce,
         bytes32 indexed txHash,
@@ -51,7 +54,7 @@ contract Delay is Modifier {
         setUp(initParams);
     }
 
-    function setUp(bytes memory initParams) public override {
+    function setUp(bytes memory initParams) public override initializer {
         (
             address _owner,
             address _avatar,
@@ -62,62 +65,57 @@ contract Delay is Modifier {
                 initParams,
                 (address, address, address, uint256, uint256)
             );
-        __Ownable_init();
         require(_avatar != address(0), "Avatar can not be zero address");
         require(_target != address(0), "Target can not be zero address");
         require(
             _expiration == 0 || _expiration >= 60,
-            "Expiratition must be 0 or at least 60 seconds"
+            "Expiration must be 0 or at least 60 seconds"
         );
 
+        _transferOwnership(_owner);
         avatar = _avatar;
         target = _target;
         txExpiration = _expiration;
         txCooldown = _cooldown;
-
-        transferOwnership(_owner);
         setupModules();
 
         emit DelaySetup(msg.sender, _owner, _avatar, _target);
-    }
-
-    function setupModules() internal {
-        require(
-            modules[SENTINEL_MODULES] == address(0),
-            "setUpModules has already been called"
-        );
-        modules[SENTINEL_MODULES] = SENTINEL_MODULES;
+        emit AvatarSet(address(0), _avatar);
+        emit TargetSet(address(0), _target);
     }
 
     /// @dev Sets the cooldown before a transaction can be executed.
-    /// @param cooldown Cooldown in seconds that should be required before the transaction can be executed
+    /// @param _txCooldown Cooldown in seconds that should be required before the transaction can be executed
     /// @notice This can only be called by the owner
-    function setTxCooldown(uint256 cooldown) public onlyOwner {
-        txCooldown = cooldown;
+    function setTxCooldown(uint256 _txCooldown) public onlyOwner {
+        txCooldown = _txCooldown;
+        emit TxCooldownSet(_txCooldown);
     }
 
     /// @dev Sets the duration for which a transaction is valid.
-    /// @param expiration Duration that a transaction is valid in seconds (or 0 if valid forever) after the cooldown
+    /// @param _txExpiration Duration that a transaction is valid in seconds (or 0 if valid forever) after the cooldown
     /// @notice There need to be at least 60 seconds between end of cooldown and expiration
     /// @notice This can only be called by the owner
-    function setTxExpiration(uint256 expiration) public onlyOwner {
+    function setTxExpiration(uint256 _txExpiration) public onlyOwner {
         require(
-            expiration == 0 || expiration >= 60,
-            "Expiratition must be 0 or at least 60 seconds"
+            _txExpiration == 0 || _txExpiration >= 60,
+            "Expiration must be 0 or at least 60 seconds"
         );
-        txExpiration = expiration;
+        txExpiration = _txExpiration;
+        emit TxExpirationSet(_txExpiration);
     }
 
     /// @dev Sets transaction nonce. Used to invalidate or skip transactions in queue.
-    /// @param _nonce New transaction nonce
+    /// @param _txNonce New transaction nonce
     /// @notice This can only be called by the owner
-    function setTxNonce(uint256 _nonce) public onlyOwner {
+    function setTxNonce(uint256 _txNonce) public onlyOwner {
         require(
-            _nonce > txNonce,
+            _txNonce > txNonce,
             "New nonce must be higher than current txNonce"
         );
-        require(_nonce <= queueNonce, "Cannot be higher than queueNonce");
-        txNonce = _nonce;
+        require(_txNonce <= queueNonce, "Cannot be higher than queueNonce");
+        txNonce = _txNonce;
+        emit TxNonceSet(_txNonce);
     }
 
     /// @dev Adds a transaction to the queue (same as avatar interface so that this can be placed between other modules and the avatar).
