@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import gc, ctypes
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -265,6 +266,7 @@ def tool_run_shell(command: str, workdir: str | Path,
             LAST_FORGE_TEST_OUTPUT = output
         if result.returncode != 0:
             output = f"Exit code: {result.returncode}\n{output}"
+        _cleanup_memory()
         return _truncate(output, 16_000)
     except subprocess.TimeoutExpired:
         return "Command timed out after 180 seconds."
@@ -1138,6 +1140,8 @@ def run_agent_loop(
             remaining_min = (time_budget_seconds - elapsed) / 60
             _log(f"progress: step={step} elapsed={elapsed_min:.0f}min remaining={remaining_min:.0f}min")
 
+        if step > 0 and step % 8 == 0:
+            _cleanup_memory()
         _log(f"agent step {step}")
 
         # ---- API call ----
